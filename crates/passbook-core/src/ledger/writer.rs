@@ -80,16 +80,16 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, B256, U256};
 
-    fn ledger() -> crate::ledger::Ledger {
-        let p = std::env::temp_dir().join(format!("pb-{}.db", rand_suffix()));
-        crate::ledger::Ledger::open(&p, 1).unwrap()
+    fn ledger() -> (crate::ledger::Ledger, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("pb.db");
+        let l = crate::ledger::Ledger::open(&p, 1).unwrap();
+        (l, dir)
     }
-    fn rand_suffix() -> u64 { std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64 }
 
     #[test]
     fn write_block_is_idempotent() {
-        let mut l = ledger();
+        let (mut l, _tmp) = ledger();
         let bh = B256::repeat_byte(7);
         let batch = BlockBatch {
             chain_id: 1, block_number: 100, block_hash: bh,
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn delete_by_block_hash_removes_all_categories() {
-        let mut l = ledger();
+        let (mut l, _tmp) = ledger();
         let bh = B256::repeat_byte(9);
         let batch = BlockBatch { chain_id:1, block_number:5, block_hash:bh,
             eth: vec![EthTransferRow { chain_id:1, block_number:5, block_hash:bh,
