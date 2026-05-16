@@ -1,13 +1,29 @@
 name: CI
 
-# Gate every push and PR on the EXACT commands run locally in Task 9.2:
+# Gate `main` and same-repo pull requests on the EXACT commands run locally
+# in Task 9.2:
 #   cargo fmt --all --check
 #   cargo clippy --workspace --all-targets --locked -- -D warnings
 #   cargo test --workspace --locked
 # plus the multi-stage Docker image builds + in-image smokes (Task 9.1).
+#
+# Trigger policy (this repo is public):
+#   * push      — only `main`. Feature-branch pushes do NOT build; CI starts
+#                  when a pull request is opened.
+#   * pull_request — triggers the workflow, but every job carries the
+#                  `is-internal` guard below. PRs from FORKS (external
+#                  contributors) match no job condition, so all jobs are
+#                  skipped: no untrusted code runs and no Actions minutes are
+#                  spent. Only branches pushed to THIS repo build on PR.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# Least privilege. Fork-PR tokens are already read-only with no secret access;
+# stating it explicitly also constrains internal-PR and main runs.
+permissions:
+  contents: read
 
 # `.vendor/` and `.cargo/` are gitignored: every cargo invocation MUST be
 # preceded by `bash scripts/seed-vendor.sh`, which shallow-clones the pinned
@@ -20,6 +36,13 @@ env:
 jobs:
   test:
     name: fmt + clippy + test
+    # is-internal guard: run for push (main only, per `on:`) and for pull
+    # requests whose head repo IS this repo. Fork PRs have a different
+    # `head.repo.full_name`, so this is false and the whole job is skipped —
+    # untrusted PR code is never checked out or executed.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -64,6 +87,11 @@ jobs:
 
   images:
     name: docker images + smokes
+    # Same is-internal guard as `test` (see above): fork PRs skip this job, so
+    # no untrusted Dockerfile/build script ever runs on a runner.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
