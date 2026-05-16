@@ -206,6 +206,24 @@ fn build_block(
     timestamp: u64,
     txs: Vec<TransactionSigned>,
 ) -> RecoveredBlock<Block<TransactionSigned>> {
+    build_block_with_beneficiary(
+        chain_spec,
+        number,
+        parent_hash,
+        timestamp,
+        Address::ZERO,
+        txs,
+    )
+}
+
+fn build_block_with_beneficiary(
+    chain_spec: &Arc<ChainSpec>,
+    number: u64,
+    parent_hash: B256,
+    timestamp: u64,
+    beneficiary: Address,
+    txs: Vec<TransactionSigned>,
+) -> RecoveredBlock<Block<TransactionSigned>> {
     let genesis_header = chain_spec.genesis_header().clone();
     let header = Header {
         parent_hash,
@@ -213,7 +231,7 @@ fn build_block(
         gas_limit: 30_000_000,
         base_fee_per_gas: Some(7),
         timestamp,
-        beneficiary: Address::ZERO,
+        beneficiary,
         difficulty: U256::ZERO,
         mix_hash: B256::ZERO,
         gas_used: 0,
@@ -608,6 +626,557 @@ async fn parent_state_readonly_two_block_chain_zero_residual() {
         .query_row("SELECT COUNT(*) FROM unattributed_deltas", [], |r| r.get(0))
         .unwrap();
     assert_eq!(unattributed, 0, "ZERO unattributed residual expected");
+}
+
+// ── Task 6.5 — fault-stall, reorg-replace, restart-resume ───────────────
+
+/// Drive `run_passbook` through the test ExEx harness against a custom
+/// chain spec. Returns the spawned driver task + the handle so the test can
+/// send notifications and observe events / the ledger.
+async fn spawn_driver(
+    chain_spec: &Arc<ChainSpec>,
+    cfg: &PassbookConfig,
+    ledger: &Arc<Mutex<Ledger>>,
+) -> (
+    tokio::task::JoinHandle<eyre::Result<()>>,
+    reth_exex_test_utils::TestExExHandle,
+) {
+    let (mut ctx, handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let driver = tokio::spawn(passbook_core::exex::run_passbook(
+        ctx,
+        cfg.clone(),
+        ledger.clone(),
+        || L1Adapter,
+    ));
+    (driver, handle)
+}
+
+/// Block-fee credit to the coinbase: a tx that pays priority fee with the
+/// WATCHED address as the block beneficiary. The watched account receives a
+/// real post-state balance delta (the priority fee) that has NO captured
+/// CALL/SELFDESTRUCT frame and is NOT a recognised `system_credits` entry
+/// for the L1 adapter — `reconcile_account` therefore yields a residual.
+fn coinbase_fee_block(
+    chain_spec: &Arc<ChainSpec>,
+    number: u64,
+    parent_hash: B256,
+    timestamp: u64,
+    watched: Address,
+    s_signer: &PrivateKeySigner,
+    s_nonce: u64,
+    chain_id: u64,
+) -> (
+    RecoveredBlock<Block<TransactionSigned>>,
+    Chain,
+) {
+    // A plain value transfer S -> sink. The 21000-gas tx pays a priority
+    // fee (gas_price 1 gwei vs base_fee 7 wei) to the beneficiary = W.
+    let sink = Address::repeat_byte(0x51);
+    let tx = sign_legacy(
+        s_signer,
+        chain_id,
+        s_nonce,
+        TxKind::Call(sink),
+        U256::from(1u64),
+        100_000,
+        1_000_000_000u128,
+        Bytes::new(),
+    );
+    let recovered = build_block_with_beneficiary(
+        chain_spec,
+        number,
+        parent_hash,
+        timestamp,
+        watched,
+        vec![tx],
+    );
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let state_db = genesis_state(chain_spec);
+    let exec_out = evm_config
+        .executor(state_db)
+        .execute(&recovered)
+        .expect("block execution");
+    let outcome = ExecutionOutcome::single(number, exec_out);
+    let chain = Chain::new(
+        vec![recovered.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+    (recovered, chain)
+}
+
+/// 1. A deterministic reconciliation residual MUST halt indexing: the loop
+///    never emits `FinishedHeight`, never advances `meta.last_block`, writes
+///    the diagnostic `unattributed_deltas` row, and keeps retrying (the task
+///    is still alive — it did not return or panic).
+#[tokio::test(flavor = "multi_thread")]
+async fn fault_injected_residual_stalls_without_advancing() {
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address();
+    let watched = w_signer.address(); // W = block beneficiary (coinbase)
+
+    let chain_id = 0xFA17u64;
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    // W starts with zero balance and no code: its ONLY balance change this
+    // block is the uncaptured coinbase fee credit ⇒ guaranteed residual.
+    alloc.insert(watched, acct(U256::ZERO, None));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    let (recovered, chain) = coinbase_fee_block(
+        &chain_spec,
+        1,
+        chain_spec.genesis_hash(),
+        12,
+        watched,
+        &s_signer,
+        0,
+        chain_id,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
+        .expect("cfg");
+
+    // Deterministic core check: the pure pipeline against the real genesis
+    // provider MUST surface an UnexplainedResidual for W (proves the
+    // scenario genuinely yields a residual, not just "no error").
+    let (mut ctx, handle0) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let parent_state: StateProviderBox = handle0
+        .provider_factory
+        .history_by_block_hash(handle0.genesis.hash())
+        .expect("genesis state provider");
+    let direct = passbook_core::exex::process_committed_block_inner(
+        chain_id,
+        chain_spec.clone(),
+        &chain,
+        &recovered,
+        &cfg,
+        &L1Adapter,
+        parent_state,
+    );
+    match direct {
+        Err(passbook_core::exex::ProcessingError::UnexplainedResidual {
+            address,
+            ..
+        }) => assert_eq!(address, watched, "residual must be for W"),
+        other => panic!(
+            "expected an UnexplainedResidual for the uncaptured coinbase \
+             fee credit to W, got {other:?}"
+        ),
+    }
+    drop(ctx);
+    drop(handle0);
+
+    // End-to-end: drive run_passbook and prove it STALLS.
+    let ledger = Arc::new(Mutex::new(
+        Ledger::open(&db_path, chain_id).expect("ledger open"),
+    ));
+    let (driver, mut handle) = spawn_driver(&chain_spec, &cfg, &ledger).await;
+    handle
+        .send_notification_chain_committed(chain)
+        .await
+        .expect("send committed");
+
+    // Wait long enough for several retry iterations (BACKOFF_START=200ms),
+    // then assert the loop did NOT advance.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // (a) NO FinishedHeight was ever emitted.
+    let mut emitted_finished = false;
+    while let Ok(ev) = handle.events_rx.try_recv() {
+        if matches!(ev, reth_ethereum::exex::ExExEvent::FinishedHeight(_)) {
+            emitted_finished = true;
+        }
+    }
+    assert!(
+        !emitted_finished,
+        "run_passbook MUST NOT emit FinishedHeight for an unreconciled block"
+    );
+
+    // (b) the diagnostic unattributed_deltas row exists for block 1 / W.
+    {
+        let g = ledger.lock().unwrap();
+        let w_lc = format!("{watched:#x}");
+        let n: i64 = g
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM unattributed_deltas \
+                 WHERE block_number=1 AND address=?1",
+                [&w_lc],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "expected the diagnostic unattributed_deltas row for the stalled block"
+        );
+
+        // (c) meta.last_block was NOT advanced to 1 (no successful block
+        //     write happened — it is either absent or < 1).
+        let last: Option<String> = g
+            .conn()
+            .query_row(
+                "SELECT v FROM meta WHERE k='last_block'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        assert!(
+            last.is_none() || last.as_deref() != Some("1"),
+            "meta.last_block must NOT advance to the unreconciled block (got {last:?})"
+        );
+
+        // No durable transfer/gas rows for the stalled block.
+        for table in ["eth_transfers", "erc20_transfers", "gas_payments"] {
+            let c: i64 = g
+                .conn()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE block_number=1"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(c, 0, "no {table} rows for the stalled block 1");
+        }
+    }
+
+    // (d) the loop is still alive / retrying — it did not return or panic.
+    assert!(
+        !driver.is_finished(),
+        "run_passbook must keep retrying the unreconciled block, not exit"
+    );
+
+    driver.abort();
+}
+
+/// 2. A reorg replaces rows: block at hash A (watched activity → rows,
+///    FinishedHeight A) then a reorg reverting A and committing an
+///    ALTERNATE block at hash B (same height, different watched activity).
+///    A's rows MUST be gone, B's present, no duplicates, meta consistent.
+#[tokio::test(flavor = "multi_thread")]
+async fn reorg_replaces_rows_no_dup() {
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address();
+    let watched = w_signer.address(); // codeless EOA
+
+    let chain_id = 0x9001u64;
+
+    let gas_price = 1_000_000_000u128;
+    let amt_a = U256::from(4_000_000_000_000_000u64); // chain A → W
+    let amt_b = U256::from(6_000_000_000_000_000u64); // chain B → W (differs)
+
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    alloc.insert(watched, acct(funded, None));
+    // SELFDESTRUCT forwarder → W (reliable internal inbound credit).
+    let fwd = Address::repeat_byte(0xF0);
+    alloc.insert(fwd, acct(U256::ZERO, Some(selfdestruct_forwarder_code(watched))));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    // Build chain A: block 1 (parent = genesis, a PERSISTED block in the
+    // harness provider) — S -> fwd with value, forwarded to W.
+    let build = |nonce: u64, value: U256, ts: u64| {
+        let tx = sign_legacy(
+            &s_signer,
+            chain_id,
+            nonce,
+            TxKind::Call(fwd),
+            value,
+            200_000,
+            gas_price,
+            Bytes::new(),
+        );
+        let recovered = build_block(&chain_spec, 1, chain_spec.genesis_hash(), ts, vec![tx]);
+        let evm_config = EthEvmConfig::new(chain_spec.clone());
+        let state_db = genesis_state(&chain_spec);
+        let exec_out = evm_config
+            .executor(state_db)
+            .execute(&recovered)
+            .expect("block execution");
+        let outcome = ExecutionOutcome::single(1, exec_out);
+        let chain = Chain::new(
+            vec![recovered.clone()],
+            outcome,
+            std::collections::BTreeMap::new(),
+        );
+        (recovered, chain)
+    };
+    // Distinct timestamps ⇒ distinct block hashes A != B.
+    let (block_a, chain_a) = build(0, amt_a, 12);
+    let (block_b, chain_b) = build(0, amt_b, 24);
+    let hash_a = block_a.hash();
+    let hash_b = block_b.hash();
+    assert_ne!(hash_a, hash_b, "A and B must be distinct block hashes");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
+        .expect("cfg");
+    let ledger = Arc::new(Mutex::new(
+        Ledger::open(&db_path, chain_id).expect("ledger open"),
+    ));
+    let (driver, mut handle) = spawn_driver(&chain_spec, &cfg, &ledger).await;
+
+    // Commit chain A.
+    handle
+        .send_notification_chain_committed(chain_a.clone())
+        .await
+        .expect("send committed A");
+    wait_finished_height(&mut handle, 1).await;
+
+    let w_lc = format!("{watched:#x}");
+    let a_hex = format!("{hash_a:#x}");
+    let b_hex = format!("{hash_b:#x}");
+
+    // A's rows are present.
+    {
+        let g = ledger.lock().unwrap();
+        let a_rows: i64 = g
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM eth_transfers WHERE block_hash=?1",
+                [&a_hex],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(a_rows >= 1, "chain A must have written eth rows");
+        let a_amt: String = g
+            .conn()
+            .query_row(
+                "SELECT amount_wei FROM eth_transfers \
+                 WHERE block_hash=?1 AND address=?2 AND direction='in' AND kind='internal'",
+                rusqlite::params![&a_hex, &w_lc],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_amt, amt_a.to_string(), "A's inbound amount");
+    }
+
+    // Reorg: revert A, commit B at the same height.
+    handle
+        .send_notification_chain_reorged(chain_a.clone(), chain_b.clone())
+        .await
+        .expect("send reorg A->B");
+    wait_finished_height(&mut handle, 1).await;
+
+    {
+        let g = ledger.lock().unwrap();
+
+        // All rows keyed to A are GONE (reorg-first delete_blocks).
+        for table in ["eth_transfers", "erc20_transfers", "gas_payments", "unattributed_deltas"] {
+            let a_n: i64 = g
+                .conn()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE block_hash=?1"),
+                    [&a_hex],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(a_n, 0, "reverted chain A rows must be gone from {table}");
+        }
+
+        // B's rows are present.
+        let b_in: i64 = g
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM eth_transfers \
+                 WHERE block_hash=?1 AND address=?2 AND direction='in' AND kind='internal'",
+                rusqlite::params![&b_hex, &w_lc],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_in, 1, "chain B's inbound internal row must be present");
+        let b_amt: String = g
+            .conn()
+            .query_row(
+                "SELECT amount_wei FROM eth_transfers \
+                 WHERE block_hash=?1 AND address=?2 AND direction='in' AND kind='internal'",
+                rusqlite::params![&b_hex, &w_lc],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_amt, amt_b.to_string(), "B's inbound amount differs from A's");
+
+        // No duplicates: exactly one inbound internal eth row total (only B).
+        let total_in: i64 = g
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM eth_transfers \
+                 WHERE address=?1 AND direction='in' AND kind='internal'",
+                [&w_lc],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total_in, 1,
+            "exactly one inbound internal eth row after reorg (no A/B dup)"
+        );
+
+        // meta.last_block consistent at height 1.
+        let last: String = g
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(last, "1", "meta.last_block consistent at the reorged height");
+    }
+
+    driver.abort();
+}
+
+/// 3. Restart safety: process a block through a TEMP-FILE ledger, drop the
+///    loop/ledger, reopen `Ledger::open` on the SAME db path, re-deliver the
+///    LAST committed notification to a fresh `run_passbook`. Row counts and
+///    `last_block` MUST be unchanged (idempotent INSERT OR REPLACE on
+///    natural PKs) — no duplicates, no gap.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_resumes_no_gap_no_dup() {
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address();
+    let watched = w_signer.address();
+
+    let chain_id = 0x5237u64;
+    let gas_price = 1_000_000_000u128;
+    let amt = U256::from(2_500_000_000_000_000u64);
+
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    alloc.insert(watched, acct(funded, None));
+    let fwd = Address::repeat_byte(0xF0);
+    alloc.insert(fwd, acct(U256::ZERO, Some(selfdestruct_forwarder_code(watched))));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    let tx = sign_legacy(
+        &s_signer,
+        chain_id,
+        0,
+        TxKind::Call(fwd),
+        amt,
+        200_000,
+        gas_price,
+        Bytes::new(),
+    );
+    let recovered = build_block(&chain_spec, 1, chain_spec.genesis_hash(), 12, vec![tx]);
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let exec_out = evm_config
+        .executor(genesis_state(&chain_spec))
+        .execute(&recovered)
+        .expect("block execution");
+    let outcome = ExecutionOutcome::single(1, exec_out);
+    let chain = Chain::new(
+        vec![recovered.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    // Persistent temp-FILE db (NOT in-memory) so it survives the restart.
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
+        .expect("cfg");
+
+    // ── Run 1: process block 1 through run_passbook, then drop everything.
+    let (n_eth, n_erc20, n_gas, n_unattr, last_block_1) = {
+        let ledger = Arc::new(Mutex::new(
+            Ledger::open(&db_path, chain_id).expect("ledger open 1"),
+        ));
+        let (driver, mut handle) = spawn_driver(&chain_spec, &cfg, &ledger).await;
+        handle
+            .send_notification_chain_committed(chain.clone())
+            .await
+            .expect("send committed run1");
+        wait_finished_height(&mut handle, 1).await;
+        driver.abort();
+        let _ = driver.await;
+
+        let g = ledger.lock().unwrap();
+        let count = |t: &str| -> i64 {
+            g.conn()
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        let last: String = g
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
+            .unwrap();
+        let snap = (
+            count("eth_transfers"),
+            count("erc20_transfers"),
+            count("gas_payments"),
+            count("unattributed_deltas"),
+            last,
+        );
+        // ledger (and its only connection) dropped here.
+        drop(g);
+        snap
+    };
+    assert!(n_eth >= 1, "run 1 must have written at least one eth row");
+    assert_eq!(last_block_1, "1", "run 1 advanced last_block to 1");
+
+    // ── Run 2: reopen the SAME db file, re-deliver the LAST committed
+    //    notification to a FRESH run_passbook. Must be idempotent.
+    {
+        let ledger = Arc::new(Mutex::new(
+            Ledger::open(&db_path, chain_id).expect("ledger reopen 2"),
+        ));
+        // Sanity: the reopened ledger already has run 1's durable state.
+        {
+            let g = ledger.lock().unwrap();
+            let e: i64 = g
+                .conn()
+                .query_row("SELECT COUNT(*) FROM eth_transfers", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(e, n_eth, "reopened ledger retains run 1's eth rows");
+        }
+        let (driver, mut handle) = spawn_driver(&chain_spec, &cfg, &ledger).await;
+        handle
+            .send_notification_chain_committed(chain.clone())
+            .await
+            .expect("re-deliver committed run2");
+        wait_finished_height(&mut handle, 1).await;
+        driver.abort();
+        let _ = driver.await;
+
+        let g = ledger.lock().unwrap();
+        let count = |t: &str| -> i64 {
+            g.conn()
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("eth_transfers"), n_eth, "no duplicate eth rows after restart");
+        assert_eq!(
+            count("erc20_transfers"),
+            n_erc20,
+            "no duplicate erc20 rows after restart"
+        );
+        assert_eq!(count("gas_payments"), n_gas, "no duplicate gas rows after restart");
+        assert_eq!(
+            count("unattributed_deltas"),
+            n_unattr,
+            "no duplicate unattributed rows after restart"
+        );
+        let last: String = g
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(last, "1", "last_block unchanged (no gap, no regression) after restart");
+    }
 }
 
 /// TOKEN bytecode: emit `LOG3(Transfer, from, to)` with `amount` as data.
