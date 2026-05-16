@@ -41,11 +41,11 @@ test:
 seed:
 	bash scripts/seed-vendor.sh
 
-# Post-bump fast check: regenerate the gitignored mirror/config, then run the
-# spike co-resolution gate. The integration test is enabled after Task 6.5.
+# Post-bump correctness check: regenerate the gitignored mirror/config, run the
+# spike co-resolution gate, then the full passbook-core suite (unit +
+# `exex_integration` integration tests) so a rev bump is validated end-to-end.
 verify-pin:
-	bash scripts/seed-vendor.sh && $(CARGO_ENV) cargo build -p spike --locked
-	# cargo test -p passbook-core --test exex_integration --locked  # (enabled after Task 6.5)
+	bash scripts/seed-vendor.sh && $(CARGO_ENV) cargo build -p spike --locked && $(CARGO_ENV) cargo test -p passbook-core --locked
 
 # Lockstep reth/op-reth rev bump. Pass both revs via ARGS, e.g.:
 #   make bump ARGS='--optimism-rev <opt-sha> --reth-rev <reth-sha>'
