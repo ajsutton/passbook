@@ -1,6 +1,7 @@
 use crate::model::*;
 use rusqlite::Connection;
 
+#[derive(Debug)]
 pub struct BlockBatch {
     pub chain_id: u64, pub block_number: u64,
     pub block_hash: alloy_primitives::B256,
