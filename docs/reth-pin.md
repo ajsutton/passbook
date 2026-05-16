@@ -976,3 +976,145 @@ these three branches and no other exit. Full workspace still green:
 `cargo test -p passbook-core --locked` = 31 unit + 5 integration passed;
 `cargo build -p spike --locked` green. **Cargo.lock / Cargo.toml unchanged**
 (all deps were pre-wired in Task 0.3 — zero dependency delta).
+
+## Task 8.5 — `op-reth-passbook` + shared `ChainExec` seam (L1/OP)
+
+How the OP binary + the L1/OP chain-abstraction seam were wired against
+pinned op-reth (`reth-op 1.11.3`, optimism monorepo `27bf9194…`) and reth
+v2.2.0 (`paradigmxyz/reth` `88505c7…`). The spec's hard requirement — ONE
+workspace producing BOTH `reth-passbook` (L1) and `op-reth-passbook` (OP)
+driving the SAME capture core — is met by a single trait seam; the pure
+core is shared, never forked.
+
+### The seam: `passbook_core::exex::ChainExec`
+
+```rust
+pub trait ChainExec: Send + Sync + 'static {
+    type Primitives: NodePrimitives;                 // EthPrimitives | OpPrimitives
+    type ChainSpec: EthChainSpec + Send + Sync + 'static; // ChainSpec | OpChainSpec
+    fn process_committed_block(
+        &self,
+        chain_id: u64,
+        chain_spec: Arc<Self::ChainSpec>,
+        chain: &Chain<Self::Primitives>,
+        block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
+        cfg: &PassbookConfig,
+        parent_state: StateProviderBox,
+    ) -> Result<BlockBatch, ProcessingError>;
+}
+
+pub async fn run_passbook<Node, C>(
+    ctx: ExExContext<Node>, cfg, ledger, chain_exec: C,
+) -> eyre::Result<()>
+where C: ChainExec,
+      Node: FullNodeComponents,
+      Node::Types: NodeTypes<Primitives = C::Primitives, ChainSpec = C::ChainSpec>;
+```
+
+- **Chain-AGNOSTIC core stays shared & unchanged**: `process_block`
+  (pure orchestrator), `reconcile`, `ledger`, `erc20`,
+  `inspector::ValueInspector`, `attribution`, and the `run_passbook`
+  safety contract (reorg-first delete, retry-until-success,
+  FinishedHeight-only-after-durable-write) are SINGLE-sourced in
+  `passbook-core` and **invoked** by every arm — never duplicated. The
+  parent-state acquisition (`ctx.provider().history_by_block_hash(
+  chain.first().parent_hash)`) is also generic in the shared loop
+  (`Node::Provider: FullProvider: StateProviderFactory` holds for ANY
+  primitive set — no extra bound).
+- **Shared inspector + pre-state overlay**: extracted to
+  `passbook_core::reexec` (new `pub` module). `TaggingInspector`
+  (EVM-`CTX`-generic `revm::Inspector`), `Captured`/`TaggedFrame`, and
+  `build_prestate_cache::<N: NodePrimitives>` (parent-state +
+  in-chain-`BundleState` overlay; the overlay touches only the
+  primitive-agnostic `BundleState`, so L1 and OP get IDENTICAL pre-state
+  semantics, never `EmptyDB`). Both arms reuse these verbatim — the
+  value-attribution inspector is NOT forked.
+- **L1 arm** = `passbook_core::chain::EthChainExec` (lives in
+  `passbook-core`; `reth-ethereum` only ⇒ core stays OP-free). It
+  delegates to the **unchanged** Task 6.4
+  `process_committed_block_inner` (still `pub`, still called verbatim by
+  the 5 integration tests). An ergonomic blanket
+  `impl<S: StackAdapter, F: Fn()->S> ChainExec for F` (assoc types =
+  `EthPrimitives`/`ChainSpec`) keeps the established `|| L1Adapter` /
+  `|| EthereumStack::default()` call-shape working, so the 5 Task
+  6.4/6.5 integration tests pass **unchanged** (proof the L1 path is
+  behaviour-identical: 31 unit + 5 integration still green). The two L1
+  impls (`EthChainExec` struct, `Fn` blanket) are distinct types — no
+  coherence overlap; a downstream concrete `OpChainExec` (not an `Fn`)
+  also cannot overlap.
+- **OP arm** = `passbook_stack_optimism::OpChainExec` (lives in
+  `passbook-stack-optimism`, which now depends on `reth-op` — keeping
+  `passbook-core` free of `reth-op`/`reth-optimism-*` as default deps,
+  matching the existing crate layout). It re-expresses the per-block
+  extraction for OP concrete types and invokes the SHARED
+  `process_block`.
+
+### OP re-exec / `OpEvmConfig` / primitives API used (verified, pinned)
+
+| Concern | API | Source / delta |
+|---|---|---|
+| OP node | `reth_op::node::OpNode::new(RollupArgs)` (`reth_op::node = reth_optimism_node::*`). **No `Default`** — constructed with the flattened `RollupArgs`. `OpNode: NodeTypes<Primitives = OpPrimitives, ChainSpec = OpChainSpec>` (`node/src/node.rs:360`) | delta vs L1 `EthereumNode::default()` |
+| OP EVM config | `reth_optimism_evm::OpEvmConfig::optimism(Arc<OpChainSpec>)` (`evm/src/lib.rs:112`; analogue of `EthEvmConfig::new`). `impl ConfigureEvm for OpEvmConfig` (`evm/src/lib.rs:190`) ⇒ same `evm_env`/`context_for_block`/`create_executor`/`evm_with_env`/`evm_factory().create_tracer().try_trace_many().commit_last_tx()` surface as the L1 driver | only the constructor + concrete type differ; tracer machinery identical |
+| OP primitives | `reth_op::{OpPrimitives, OpBlock}` (`OpBlock = Block<OpTransactionSigned>`); `reth_op::provider::Chain` / `reth_op::primitives::RecoveredBlock` / `reth_op::storage::StateProviderBox` — these are the SAME `reth_provider`/`reth_primitives_traits`/`reth_storage_api` types as the L1 facade re-exports (co-resolution: one reth rev), so `passbook_core::reexec`'s generic helpers accept the OP types unchanged | — |
+| OP receipt | `OpReceipt` is an **enum** (`op_alloy_consensus::OpReceipt`, via `reth_op::OpReceipt`); use the `alloy_consensus::TxReceipt` trait (`.status()`, `.logs()`, `.cumulative_gas_used()`) — NOT the L1 `Receipt`'s public struct fields (`success`/`logs`/`cumulative_gas_used`) | delta vs L1 |
+| OP tx | `OpTransactionSigned = OpTxEnvelope`; deposit detection via the **inherent** `OpTxEnvelope::is_deposit(&self) -> bool` (`op-alloy-consensus envelope.rs:356`; the `OpTransaction` trait method is `pub(super)` on the reth wrapper so the inherent is used). `tx.tx_hash()` yields `[u8;32]` by value here (NOT `&B256` like L1) ⇒ wrap `B256::from(*tx.tx_hash())`. `tx.encoded_2718()` via `alloy_eips::eip2718::Encodable2718` (`primitives/src/transaction/signed.rs:266`). `tx.effective_gas_price(base_fee)` via `alloy_consensus::Transaction` | deltas vs L1 |
+| OP L1 data fee | `reth_optimism_evm::extract_l1_info(block.body()) -> Result<L1BlockInfo, OpBlockExecutionError>` ONCE per L2 block (`evm/src/l1.rs:25`; `Err` only on an empty block ⇒ all-`None` table), then per-tx `RethL1BlockInfo::l1_tx_data_fee(&mut self, chain_spec: impl OpHardforks, timestamp, input: &[u8], is_deposit) -> Result<U256, BlockExecutionError>` (`l1.rs:295/325`). Fed through Task 8.2's `build_block_l1_fee_table(txs:(is_deposit,raw_2718), fee_of)` → `OptimismStack`. `fee_of = |raw| l1_info.l1_tx_data_fee(chain_spec.as_ref(), ts, raw, false).ok().filter(|v| !v.is_zero())` (deposits already `None` by the table; a zero fee ⇒ `None`, not `Some(0)`) | as Task 8.2 predicted; `chain_spec.as_ref(): &OpChainSpec` satisfies `impl OpHardforks` |
+| `make_adapter` shape | The OP L1-fee table is INHERENTLY per-block (L1 base/blob scalars change every L2 block), so the OP arm FOLDS L1-fee extraction into the seam (`process_committed_block` builds the `OptimismStack` itself) rather than the old `make_adapter: impl Fn()->S`. The L1 arm keeps the `Fn`-based shape via the blanket impl; the L1 binary unchanged in behaviour | resolves the spec's "evolve the `make_adapter` shape" note |
+
+### OP `Cli` / parser / `RollupArgs` specifics (verified, pinned)
+
+| Concern | API | Source |
+|---|---|---|
+| CLI type | `reth_op::cli::Cli::<C, Ext>` (`reth_op::cli = reth_cli_util::{..} + reth_optimism_cli::*`; `Cli` from `reth_optimism_cli`) | `optimism/cli/src/lib.rs:66` |
+| Chain-spec parser | `reth_op::cli::chainspec::OpChainSpecParser` (the OP analogue of L1's `EthereumChainSpecParser`; `reth_optimism_cli` has `pub mod chainspec`) | `optimism/cli/src/chainspec.rs` |
+| `Cli::run` | `L: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>, Ext) -> Fut`, `C: ChainSpecParser<ChainSpec = OpChainSpec>` — **identical shape to L1**; used as `async move |builder, ext: OpExt| {…}` | `optimism/cli/src/lib.rs:122-138` |
+| Default `Ext` is `RollupArgs` | `Cli<Spec = OpChainSpecParser, Ext = RollupArgs>` (`optimism/cli/src/lib.rs:67`). To preserve `--rollup.*` AND add `--passbook.*`, the binary defines `struct OpExt { #[command(flatten)] passbook: PassbookArgs, #[command(flatten)] rollup: RollupArgs }` and passes `ext.rollup` to `OpNode::new` | `reth_op::node::args::RollupArgs` (`node/src/args.rs:22`, `#[derive(clap::Args)]`) |
+| chain id | `builder.config().chain` = `Arc<OpChainSpec>`; `OpChainSpec: EthChainSpec` (`optimism/chainspec/src/lib.rs:247`) ⇒ `.chain_id()` with `use reth_op::chainspec::EthChainSpec;` in scope (same trait-in-scope rule as L1) | — |
+| RPC / ExEx hooks | `.extend_rpc_modules(...).merge_configured(...)` and `.install_exex("passbook", |ctx| async move { Ok(run_passbook(ctx, cfg, ledger, OpChainExec)) })` — IDENTICAL to L1 (the builder API is node-generic) | matches Task 8.4 verbatim |
+
+Drop-in safety (3 cases) is realised by the SAME early-return /
+`?`-propagation control flow as L1 (Task 8.4): no/empty addresses ⇒
+stock `OpNode::new(rollup)` with no ExEx/RPC; malformed ⇒ `from_parts`
+`Err` aborts before launch; valid ⇒ one shared `Arc<Mutex<Ledger>>` +
+RPC namespace + ExEx with `OpChainExec`.
+
+### What OP testing was / was not realized
+
+- **Realized**: `op-reth-passbook` **compiles clean against pinned
+  op-reth** (zero warnings); the 3 smoke checks pass —
+  `node --help` shows `--passbook.addresses` (FLAG-ON-NODE),
+  top-level `--help` lists the stock op-reth subcommand set
+  (STOCK-SUBCOMMANDS), and `--rollup.*` survives on `node --help`
+  (RollupArgs preserved). OP unit tests: a type-level proof that
+  `OpChainExec: ChainExec` with `Primitives = OpPrimitives` /
+  `ChainSpec = OpChainSpec` (so `run_passbook`'s `OpNode` bound is
+  satisfiable), and a test of the OP backend's per-block L1-fee table
+  (deposit→`None`, positive→`Some`, zero→`None`, out-of-range→`None`).
+- **Not realized** (honest bar): a full OP `reth_exex_test_utils`
+  end-to-end integration test (an executed OP `Chain<OpPrimitives>` with
+  an L1-info deposit tx + an ERC20/value tx, asserting
+  `gas_payments.l1_fee_wei` populated + zero residual). The pinned
+  `reth-exex-test-utils` harness in this workspace's dev-deps is
+  Eth-typed (`test_exex_context_with_chain_spec` over `ChainSpec`); an
+  OP equivalent + an OP signed-block/genesis builder would require NEW
+  dev-dependencies, mutating `Cargo.lock` with new packages (outside the
+  additive-only constraint for this task). What IS proven for the OP
+  path: the binary compiles+wires against real pinned op-reth; the OP
+  L1-fee logic is unit-tested; and the deep re-exec/reconcile pipeline
+  is the **same shared code** the 5 L1 integration tests exercise
+  green — the OP driver differs only in the concrete `OpEvmConfig` +
+  receipt/tx accessors, reusing `passbook_core::reexec`'s
+  `TaggingInspector` / `build_prestate_cache` and the pure
+  `process_block` verbatim.
+
+### Cargo.lock delta
+
+**Additive dep-edges only, zero package/version/source change.** Adding
+`reth-op`, `alloy-eips`, `revm`, `eyre`, `tracing` (all already in the
+graph at the pinned versions/revs) as deps of `passbook-stack-optimism`
+adds exactly 5 lines to that crate's `dependencies` array in
+`Cargo.lock` (`alloy-eips 2.0.4`, `eyre`, `reth-op`, `revm`, `tracing`).
+Package count unchanged (998 → 998); no `version`/`source` line changed.
+Structurally required so the OP `ChainExec` arm can live in the OP stack
+crate (keeping `passbook-core` OP-free), consistent with the existing
+per-stack crate boundary.

@@ -7,5 +7,7 @@ pub mod attribution;
 pub mod reconcile;
 pub mod ledger;
 pub mod exex;
+pub mod reexec;
+pub mod chain;
 pub mod rpc;
 pub mod cli;

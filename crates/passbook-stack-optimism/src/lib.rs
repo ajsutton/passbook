@@ -43,6 +43,9 @@
 //! committed `Cargo.lock` must not change), and they are reachable at the
 //! Task 8.5 call site where the concrete chain-spec type is known.
 
+mod op_chain;
+pub use op_chain::OpChainExec;
+
 use passbook_core::stack::StackAdapter;
 use alloy_primitives::U256;
 

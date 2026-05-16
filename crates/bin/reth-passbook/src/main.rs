@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use passbook_core::config::PassbookConfig;
 use passbook_core::cli::PassbookArgs;
+use passbook_core::chain::EthChainExec;
 use passbook_core::exex::run_passbook;
 use passbook_core::ledger::Ledger;
 use passbook_core::rpc::{PassbookApiServer, PassbookRpc};
@@ -101,9 +102,13 @@ fn main() -> eyre::Result<()> {
                 })
                 // The Passbook ExEx writer. The `install_exex` closure
                 // returns `Ok(fut)` where `fut` is the long-running
-                // `run_passbook` future; `make_adapter` is the established
-                // `|| EthereumStack::default()` (L1: a fresh stateless
-                // adapter per block — see `exex.rs`).
+                // `run_passbook` future. The chain-specific seam is the
+                // L1 arm `EthChainExec`, carrying the established
+                // `|| EthereumStack::default()` per-block adapter factory
+                // (L1: a fresh stateless adapter per block — see
+                // `exex.rs` / `chain.rs`). The SAME generic
+                // `run_passbook` serves both this L1 binary and the OP
+                // binary; only the `ChainExec` arm differs.
                 .install_exex("passbook", move |ctx| {
                     let cfg = exex_cfg.clone();
                     let ledger = exex_ledger.clone();
@@ -112,7 +117,7 @@ fn main() -> eyre::Result<()> {
                             ctx,
                             cfg,
                             ledger,
-                            || EthereumStack::default(),
+                            EthChainExec::new(|| EthereumStack::default()),
                         ))
                     }
                 })
