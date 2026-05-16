@@ -10,11 +10,15 @@ name: CI
 # Trigger policy (this repo is public):
 #   * push      — only `main`. Feature-branch pushes do NOT build; CI starts
 #                  when a pull request is opened.
-#   * pull_request — triggers the workflow, but every job carries the
-#                  `is-internal` guard below. PRs from FORKS (external
-#                  contributors) match no job condition, so all jobs are
-#                  skipped: no untrusted code runs and no Actions minutes are
-#                  spent. Only branches pushed to THIS repo build on PR.
+#   * pull_request — builds the PR. Safety against untrusted fork PRs is
+#                  enforced OUTSIDE this file by the repository setting
+#                  Settings → Actions → General → "Fork pull request workflows
+#                  from outside collaborators" = "Require approval for all
+#                  outside collaborators". With that set, a fork PR's workflow
+#                  does not run at all until a maintainer approves it, so no
+#                  untrusted code executes and no Actions minutes are spent.
+#                  (Do NOT add per-job `if` fork guards here — a job skipped by
+#                  `if` reports as a PASSING required status check.)
 on:
   push:
     branches: [main]
@@ -36,13 +40,6 @@ env:
 jobs:
   test:
     name: fmt + clippy + test
-    # is-internal guard: run for push (main only, per `on:`) and for pull
-    # requests whose head repo IS this repo. Fork PRs have a different
-    # `head.repo.full_name`, so this is false and the whole job is skipped —
-    # untrusted PR code is never checked out or executed.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -87,11 +84,6 @@ jobs:
 
   images:
     name: docker images + smokes
-    # Same is-internal guard as `test` (see above): fork PRs skip this job, so
-    # no untrusted Dockerfile/build script ever runs on a runner.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
