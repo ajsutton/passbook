@@ -58,6 +58,23 @@ pub fn write_block(conn: &mut Connection, b: &BlockBatch) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Reorg handling: drop every row for the reverted block hashes.
+pub fn delete_blocks(
+    conn: &mut Connection, chain_id: u64, hashes: &[alloy_primitives::B256],
+) -> eyre::Result<()> {
+    let tx = conn.transaction()?;
+    for bh in hashes {
+        let hs = h(bh);
+        for table in ["eth_transfers","erc20_transfers","gas_payments","unattributed_deltas"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE chain_id=?1 AND block_hash=?2"),
+                rusqlite::params![chain_id, hs])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +109,23 @@ mod tests {
         let last: String = l.conn().query_row(
             "SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0)).unwrap();
         assert_eq!(last, "100");
+    }
+
+    #[test]
+    fn delete_by_block_hash_removes_all_categories() {
+        let mut l = ledger();
+        let bh = B256::repeat_byte(9);
+        let batch = BlockBatch { chain_id:1, block_number:5, block_hash:bh,
+            eth: vec![EthTransferRow { chain_id:1, block_number:5, block_hash:bh,
+                tx_hash:Some(B256::repeat_byte(2)), trace_path:"0".into(),
+                address:Address::repeat_byte(1), direction:Direction::Out,
+                counterparty:Address::repeat_byte(2), amount_wei:U256::from(1),
+                kind:EthKind::TopLevel, reverted:false }],
+            erc20:vec![], gas:vec![], unattributed:vec![] };
+        write_block(l.conn_mut(), &batch).unwrap();
+        delete_blocks(l.conn_mut(), 1, &[bh]).unwrap();
+        let n: i64 = l.conn().query_row(
+            "SELECT count(*) FROM eth_transfers", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
     }
 }
