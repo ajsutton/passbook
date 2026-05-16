@@ -377,7 +377,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-evm"
 version = "0.32.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -394,7 +394,7 @@ dependencies = [
 [[package]]
 name = "alloy-op-hardforks"
 version = "0.5.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-chains",
  "alloy-hardforks",
@@ -5170,7 +5170,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "op-alloy"
 version = "2.0.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "op-alloy-consensus",
  "op-alloy-network",
@@ -5182,7 +5182,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-consensus"
 version = "2.0.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -5211,7 +5211,7 @@ checksum = "a79f352fc3893dcd670172e615afef993a41798a1d3fc0db88a3e60ef2e70ecc"
 [[package]]
 name = "op-alloy-network"
 version = "2.0.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
@@ -5224,7 +5224,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-provider"
 version = "2.0.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -5238,7 +5238,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-jsonrpsee"
 version = "2.0.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-primitives",
  "jsonrpsee",
@@ -5247,7 +5247,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types"
 version = "2.0.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -5268,7 +5268,7 @@ dependencies = [
 [[package]]
 name = "op-alloy-rpc-types-engine"
 version = "2.0.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -5288,7 +5288,7 @@ dependencies = [
 [[package]]
 name = "op-revm"
 version = "20.0.0"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "auto_impl",
  "revm",
@@ -7868,7 +7868,7 @@ dependencies = [
 [[package]]
 name = "reth-op"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-primitives",
  "reth-chainspec",
@@ -7909,7 +7909,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-chainspec"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -7937,7 +7937,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-cli"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -7987,7 +7987,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-consensus"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -8012,7 +8012,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-evm"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -8041,7 +8041,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-exex"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -8059,7 +8059,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-flashblocks"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -8097,7 +8097,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-forks"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-op-hardforks",
  "alloy-primitives",
@@ -8108,7 +8108,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-node"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8160,7 +8160,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-payload-builder"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -8200,7 +8200,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-primitives"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -8215,7 +8215,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-rpc"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -8286,7 +8286,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-storage"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "reth-optimism-primitives",
@@ -8296,7 +8296,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-trie"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-eips 2.0.4",
  "alloy-primitives",
@@ -8330,7 +8330,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-txpool"
 version = "1.11.3"
-source = "git+file:///Users/aj/Documents/code/passbook/.vendor/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
+source = "git+https://github.com/ethereum-optimism/optimism?rev=27bf9194a08aef70f3fdbff6b3d04bdd70af62ff#27bf9194a08aef70f3fdbff6b3d04bdd70af62ff"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",

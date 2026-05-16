@@ -1,7 +1,0 @@
-# Use the system `git` binary for fetching git dependencies. This is
-# required so cargo honors the blobless promisor pack of the local
-# optimism monorepo mirror at .vendor/optimism (cargo's built-in libgit2
-# fetcher does not understand the partial-clone promisor and would
-# otherwise force a full fat clone of the multi-GB monorepo).
-[net]
-git-fetch-with-cli = true

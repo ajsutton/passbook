@@ -6,9 +6,15 @@ members = ["crates/spike"]
 # Co-resolution strategy (see docs/reth-pin.md):
 #
 #   * The OP facade `reth-op` (v1.11.3) is NOT published to crates.io yet. We
-#     pull it from the ethereum-optimism/optimism monorepo via a LOCAL blobless
-#     sparse mirror at .vendor/optimism (a `file://` git source). Cargo locates
-#     the crate `reth-op` by name inside that repo's `rust/` workspace.
+#     pull it from the ethereum-optimism/optimism monorepo at a pinned rev,
+#     declared here against the STABLE REMOTE url so a clean checkout is
+#     correct with no local state. The monorepo full clone is multi-GB; for
+#     speed `scripts/seed-vendor.sh` creates a shallow depth-1 local mirror at
+#     `.vendor/optimism` and writes a GITIGNORED `.cargo/config.local.toml`
+#     that source-replaces the whole optimism git source onto that mirror
+#     (covers `reth-op` AND its sibling monorepo crates). The mirror is a pure
+#     optimization, not a correctness requirement. Cargo locates the crate
+#     `reth-op` by name inside that repo's `rust/` workspace.
 #   * The L1 facade `reth-ethereum` is pinned to paradigmxyz/reth at the EXACT
 #     SAME rev (88505c7…) that the monorepo's `rust/Cargo.toml` pins all of its
 #     upstream reth crates to. Because both facades resolve their shared
@@ -20,7 +26,7 @@ members = ["crates/spike"]
 # op-reth is not yet on crates.io — migrate `reth-op` to the published crate
 # when it exists (drop the local mirror + `.vendor/` machinery then).
 [workspace.dependencies]
-reth-op = { git = "file:///Users/aj/Documents/code/passbook/.vendor/optimism", rev = "27bf9194a08aef70f3fdbff6b3d04bdd70af62ff", default-features = false, features = ["node", "cli"] }
+reth-op = { git = "https://github.com/ethereum-optimism/optimism", rev = "27bf9194a08aef70f3fdbff6b3d04bdd70af62ff", default-features = false, features = ["node", "cli"] }
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", features = ["full", "cli"] }
 
 revm = "38.0.0"

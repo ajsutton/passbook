@@ -7,11 +7,18 @@ toolchain, minimal-checkout mechanism, and verified facade module paths.
 matching `paradigmxyz/reth` `rev` must move together, plus the committed
 `Cargo.lock`.
 
+> **Bootstrap (every fresh machine / CI / Docker stage):** run
+> `scripts/seed-vendor.sh` once, then build with `--locked`. The script
+> creates the local mirror and the gitignored `.cargo/config.toml`. A clean
+> checkout that skips the script still builds correctly — cargo just clones
+> the full multi-GB monorepo from the remote (slow). The mirror is a pure
+> optimization, never a correctness requirement.
+
 ## Locked sources
 
 | Facade | Source | Rev | Version |
 |--------|--------|-----|---------|
-| `reth-op` (OP) | `ethereum-optimism/optimism` monorepo, via local mirror `file:///Users/aj/Documents/code/passbook/.vendor/optimism` (branch `develop`) | `27bf9194a08aef70f3fdbff6b3d04bdd70af62ff` | `reth-op 1.11.3` |
+| `reth-op` (OP) | `https://github.com/ethereum-optimism/optimism` monorepo (declared against this stable remote in `Cargo.toml`; source-replaced onto a gitignored local mirror at `<repo>/.vendor/optimism` by `scripts/seed-vendor.sh` for speed) | `27bf9194a08aef70f3fdbff6b3d04bdd70af62ff` | `reth-op 1.11.3` |
 | `reth-ethereum` (L1) | `https://github.com/paradigmxyz/reth` | `88505c7fcbfdebfd3b56d88c86b62e950043c6c4` | `reth-ethereum 2.2.0` (reth v2.2.0) |
 
 Date locked: 2026-05-16 (monorepo `develop` @ 2026-05-15).
@@ -21,8 +28,8 @@ Toolchain channel: `1.95.0` (see Toolchain).
 > dependency into the `ethereum-optimism/optimism` monorepo (cargo locates
 > the crate `reth-op` by name within the repo's `rust/` workspace, at
 > `rust/op-reth/crates/reth/`). **Migrate `reth-op` to the published crate
-> when it exists**, and at that point drop the `.vendor/` mirror and the
-> `.cargo/config.toml` git-fetch-with-cli machinery.
+> when it exists**, and at that point drop the `.vendor/` mirror, the
+> generated `.cargo/config.toml`, and `scripts/seed-vendor.sh`.
 
 ## Why co-resolution works
 
@@ -40,7 +47,10 @@ identical upstream rev**:
   single dependency graph: the OP crates from the monorepo and our L1 facade
   resolve their common reth dependencies to one rev. Verified in
   `Cargo.lock`: every `paradigmxyz/reth` entry is at `88505c7…` (one rev),
-  `reth-op 1.11.3` from the local monorepo mirror, `reth-ethereum 2.2.0`.
+  `reth-op 1.11.3` from the canonical
+  `git+https://github.com/ethereum-optimism/optimism?rev=27bf9194…` source
+  (source-replaced onto the local mirror at build time),
+  `reth-ethereum 2.2.0`.
 - The shared revm / alloy-evm stack also unifies because we pin
   `revm = "38.0.0"`, `revm-inspectors = "0.39.0"`, `alloy-evm = "0.34.0"`
   in our pin table — the exact crates.io versions the monorepo's
@@ -50,57 +60,100 @@ If the monorepo rev and the `paradigmxyz/reth` rev ever drift apart,
 co-resolution breaks (two reth revs ⇒ duplicate, incompatible types). They
 **must stay in lockstep**.
 
-## Minimal-checkout mechanism
+## Minimal-checkout mechanism (portable)
 
-The optimism monorepo full history is multi-GB (Go/Solidity/TS/etc). We
-must not let cargo fat-clone it. Mechanism that works:
+The optimism monorepo full history is multi-GB (Go/Solidity/TS/etc). We do
+not want cargo to fat-clone it. The mechanism is **portable** — nothing
+machine-specific or absolute is committed — and the minimal checkout is a
+**pure optimization** delivered entirely via gitignored, runtime-generated
+state.
 
-1. **Local mirror** — a *shallow depth-1* clone of the EXACT rev only (no
-   history, no tags, no remote-tracking refs, no promisor). This is the key:
-   a blobless+sparse promisor mirror does NOT work because cargo's
-   `git fetch '+refs/heads/*' '+HEAD'` makes the mirror act as an
-   upload-pack server that must serve a full pack, which forces server-side
-   lazy blob fetches that are disabled ⇒ "could not fetch … from promisor
-   remote / bad pack header". A shallow depth-1 clone is self-contained:
+### Committed, portable
 
-   ```sh
-   M=/Users/aj/Documents/code/passbook/.vendor/optimism
-   mkdir -p "$M" && git -C "$M" init -q
-   git -C "$M" remote add origin https://github.com/ethereum-optimism/optimism.git
-   git -C "$M" -c protocol.version=2 fetch --depth 1 --no-tags origin \
-     27bf9194a08aef70f3fdbff6b3d04bdd70af62ff
-   git -C "$M" branch -f develop FETCH_HEAD
-   git -C "$M" symbolic-ref HEAD refs/heads/develop
-   git -C "$M" remote remove origin   # fully detach; no promisor, no lazy fetch
-   ```
+- **Root `Cargo.toml`** declares the OP facade against the **stable remote
+  URL**:
 
-   Result: ~45 MB `.git`, single commit `27bf9194`, single `develop`
-   branch, `fsck --connectivity-only` clean, no promisor config. Cargo can
-   clone it entirely offline.
+  ```toml
+  reth-op = { git = "https://github.com/ethereum-optimism/optimism",
+              rev = "27bf9194a08aef70f3fdbff6b3d04bdd70af62ff",
+              default-features = false, features = ["node", "cli"] }
+  ```
 
-2. **`.cargo/config.toml`** — `[net] git-fetch-with-cli = true` so cargo
-   uses the system `git` binary (honors shallow/grafted clones and
-   recurses the monorepo's git submodules referenced by the workspace).
+  A clean checkout with **no** local mirror and **no** `.cargo/config.toml`
+  is therefore still correct: cargo clones the full monorepo from the remote
+  (slow, but produces an identical, `--locked`-consistent graph).
 
-3. **Root `Cargo.toml`** references the OP facade from this local git
-   source:
+- **`Cargo.lock`** is committed and records the canonical remote source
+  `git+https://github.com/ethereum-optimism/optimism?rev=27bf9194…` for
+  `reth-op` and every sibling monorepo crate. This is the correct, portable
+  form: cargo's source replacement keys off this canonical URL, so the same
+  lockfile validates with `--locked` whether or not the mirror is present.
+  (`.vendor/` and `.cargo/` are gitignored and hold **no** committed state.)
+
+### Gitignored, generated by `scripts/seed-vendor.sh`
+
+`scripts/seed-vendor.sh` is the documented bootstrap for every fresh
+machine / CI runner / Docker stage. It is **idempotent** (running it twice
+is a no-op), derives the repo root from its own location (no hardcoded
+path), and does two things:
+
+1. **Local mirror** — a *shallow depth-1* clone of the EXACT rev only into
+   `<repo>/.vendor/optimism`. This is the key technique: a blobless+sparse
+   promisor mirror does NOT work because cargo's `git fetch` makes the
+   mirror act as an upload-pack server that must serve a full pack, forcing
+   disabled server-side lazy blob fetches ⇒ "could not fetch … from
+   promisor remote / bad pack header". A shallow depth-1 clone is
+   self-contained. The clone keeps an inert `origin` remote — that is
+   harmless: the "no promisor / no lazy fetch" property comes from the
+   shallow depth-1 fetch (the pack is self-contained), **not** from removing
+   the remote. `origin` is retained so a future re-seed/bump can fetch a new
+   rev without re-adding it. Result: ~45 MB `.git`, single commit, single
+   `develop` branch, cargo can clone it entirely offline.
+
+2. **Gitignored `<repo>/.cargo/config.toml`** — generated with the
+   absolute mirror path computed at runtime. It sets
+   `[net] git-fetch-with-cli = true` (system `git` binary clones the
+   shallow mirror correctly; cargo's libgit2 mishandles grafted/shallow
+   clones) and a **`[source]` replacement** that redirects the *entire*
+   `https://github.com/ethereum-optimism/optimism` git source onto the
+   local mirror:
 
    ```toml
-   reth-op = { git = "file:///Users/aj/Documents/code/passbook/.vendor/optimism",
-               rev = "27bf9194a08aef70f3fdbff6b3d04bdd70af62ff",
-               default-features = false, features = ["node", "cli"] }
+   [source."git+https://github.com/ethereum-optimism/optimism?rev=27bf9194…"]
+   git = "https://github.com/ethereum-optimism/optimism"
+   rev = "27bf9194…"
+   replace-with = "optimism-local-mirror"
+
+   [source.optimism-local-mirror]
+   git = "file://<repo>/.vendor/optimism"
+   rev = "27bf9194…"
    ```
 
-4. `.vendor/` is git-ignored (local mirror, not source). Always set
-   `CARGO_NET_GIT_FETCH_WITH_CLI=true` for builds (also configured in
-   `.cargo/config.toml`).
+   The replacement is keyed on the whole git source, so it covers `reth-op`
+   **and every sibling monorepo crate** (`reth-optimism-evm`,
+   `reth-optimism-node`, …) that `reth-op`'s workspace pulls from the same
+   source — none of them touch the remote.
 
-   > If a `file://` git dep ever proves problematic, the documented
-   > fallback is a submodule / sparse worktree + a `path =` dep to
-   > `rust/op-reth/crates/reth` — but a path dep pulls the crate out of its
-   > workspace and may break `.workspace = true` resolution in the monorepo
-   > crates, so the shallow-local-git-source approach above is preferred and
-   > is what is in use.
+> **Why source replacement, not a `file://` dep in `Cargo.toml`:** the old
+> approach put an absolute `file:///Users/...` URL straight into the
+> committed `Cargo.toml`, which broke on every other machine / CI / Docker.
+> Source replacement keeps `Cargo.toml`/`Cargo.lock` on the portable remote
+> URL while a gitignored, regenerated config does the local redirection.
+> Verified: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p spike
+> --locked` finishes clean using the 45 MB local mirror (cargo logs
+> `Updating git repository file://…/.vendor/optimism`; no multi-GB clone).
+>
+> One known cargo quirk: `cargo generate-lockfile` refuses to run while the
+> source replacement is active ("requires a lock file to be present
+> first … remove the source replacement, generate a lock file, then
+> restore it"). The committed `Cargo.lock` already exists, so normal
+> `--locked` builds are unaffected. Only a **rev bump** needs the lockfile
+> regenerated — see the bump procedure (move the `.cargo/config.toml`
+> aside, regenerate against the remote, restore).
+
+> `edition = "2021"` for the spike crate (`crates/spike/Cargo.toml`) is
+> **intentional** — it matches the reth ecosystem's edition. Do not
+> "upgrade" it to 2024.
 
 ## Required facade features
 
@@ -126,9 +179,11 @@ These match the plan's v2.2.0 assumptions
 reth v2.2.0, exactly what the plan's code was written against, so no facade
 deltas are expected for later tasks.
 
-Confirmed by a clean `cargo build -p spike --locked` (Finished dev profile;
-the only diagnostic is the expected `dead_code` warning for the unused
-compile-only `exex` fn) and `./target/debug/spike` exiting 0.
+Confirmed by a clean `cargo build -p spike --locked` (Finished dev profile,
+**zero warnings**) and `./target/debug/spike` exiting 0. The compile-only
+`exex` fn carries an explicit `#[allow(dead_code)]` with a doc comment
+stating it is a never-called compile gate, so there is no warning to
+explain away.
 
 ## Key dependency versions (from `Cargo.lock` / `cargo tree`)
 
@@ -156,8 +211,11 @@ op-alloy-network `E0119` duplicate `NetworkWallet` impl). Mitigation if they
 recur: seed the shared-crate versions from the monorepo's own tested
 lockfile at `.vendor/optimism/rust/Cargo.lock` (it pins revm/alloy/vergen to
 the set the monorepo CI validated), or pin the offending crates in our
-`[workspace.dependencies]`. The committed `Cargo.lock` here was produced by
-`cargo generate-lockfile` against the pinned sources (976 packages); if a
+`[workspace.dependencies]`. The committed `Cargo.lock` here was originally
+produced by `cargo generate-lockfile` against the pinned sources
+(976 packages) and its `reth-op`/sibling source strings were retargeted to
+the canonical remote URL when the portable source-replacement mechanism
+landed (see "Minimal-checkout mechanism"); it is `--locked`-consistent. If a
 build skew is found it is recorded here with the applied pin.
 
 ## Toolchain
@@ -176,25 +234,55 @@ The two revs MUST move together (they share the upstream reth graph):
    `rust/Cargo.toml` and note the `paradigmxyz/reth` `rev` it pins ALL
    upstream reth crates to, plus its `revm` / `revm-inspectors` /
    `alloy-evm` versions.
-2. Re-seed the local mirror at the new SHA (rerun the shallow-clone
-   commands in "Minimal-checkout mechanism" with the new rev; delete the
-   old `.vendor/optimism` first).
-3. In root `Cargo.toml`: update `reth-op` `rev` to the new monorepo SHA AND
-   `reth-ethereum` `rev` to the new matching `paradigmxyz/reth` SHA (they
-   must stay identical to what the monorepo uses), and update
+2. Update the rev in **both** places that hold it: `reth-op` `rev` in root
+   `Cargo.toml` (set to the new monorepo SHA) and the `OPTIMISM_REV` default
+   in `scripts/seed-vendor.sh`. Also set `reth-ethereum` `rev` to the new
+   matching `paradigmxyz/reth` SHA (must stay identical to what the
+   monorepo's `rust/Cargo.toml` uses), and update
    `revm`/`revm-inspectors`/`alloy-evm` to the monorepo's versions.
-4. Clear cargo's git cache for the source
-   (`rm -rf ~/.cargo/git/db/optimism-* ~/.cargo/git/checkouts/optimism-*`),
-   then `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo generate-lockfile` to
-   re-seed `Cargo.lock`. If a transitive skew appears, seed the affected
-   crates from `.vendor/optimism/rust/Cargo.lock` and document here.
+3. Re-seed the local mirror: `rm -rf .vendor/optimism` then
+   `scripts/seed-vendor.sh` (it shallow-clones the new rev and regenerates
+   the gitignored `.cargo/config.toml`). The script is idempotent.
+4. Regenerate `Cargo.lock`. Because cargo's source replacement blocks
+   `generate-lockfile`, do the documented dance:
+   ```sh
+   mv .cargo/config.toml /tmp/cc.bak                 # disable replacement
+   rm -rf ~/.cargo/git/db/optimism-* ~/.cargo/git/checkouts/optimism-*
+   CARGO_NET_GIT_FETCH_WITH_CLI=true cargo generate-lockfile  # full remote clone, slow
+   mv /tmp/cc.bak .cargo/config.toml                 # restore replacement
+   ```
+   The resulting `Cargo.lock` correctly records the canonical remote source
+   URL. (If you only changed the rev and want to avoid the multi-GB clone,
+   you may instead rewrite the old rev's source strings to the new rev in
+   `Cargo.lock` by hand and validate with `--locked` — that is how the
+   I2 fix produced the current lock.) If a transitive skew appears, seed the
+   affected crates from `.vendor/optimism/rust/Cargo.lock` and document here.
 5. Re-run the spike gate:
    `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p spike --locked`
-   then `./target/debug/spike`.
-6. Re-run the integration test (added in later tasks).
+   then `./target/debug/spike`. Confirm it logs
+   `Updating git repository file://…/.vendor/optimism` (mirror used, no
+   multi-GB clone).
+6. Re-run the integration test *(once Task 6.5 lands; skip until then —
+   no integration test exists yet)*.
 7. Update the version table, toolchain row, and facade-path table in this
    file; re-check facade module paths against the new facade `lib.rs` if
    anything moved.
 8. When `reth-op` is published to crates.io: replace the git dep with the
-   published version, delete `.vendor/`, drop the `.cargo/config.toml`
-   git-fetch-with-cli net section, and update steps 1–7 accordingly.
+   published version, delete `.vendor/`, delete `scripts/seed-vendor.sh`,
+   stop generating `.cargo/config.toml`, and update steps 1–7 accordingly.
+
+## Known constraints
+
+- **op-reth is not yet on crates.io.** We depend on it via a git dep into
+  the `ethereum-optimism/optimism` monorepo. Migrate to the published crate
+  when it exists (see bump-procedure step 8), then drop all `.vendor/` +
+  `seed-vendor.sh` machinery.
+- **The `.vendor/` mirror and the generated `.cargo/config.toml` are
+  gitignored and hold no committed state.** They are a per-environment
+  optimization and **must be regenerated on every fresh machine, CI runner,
+  and Docker build stage** by running `scripts/seed-vendor.sh` before
+  `cargo build --locked`. Task 9.1 (Dockerfile) and Task 9.2 (CI) must
+  invoke `scripts/seed-vendor.sh` as an explicit build step.
+- A clean checkout that skips `seed-vendor.sh` is still *correct* — cargo
+  clones the full multi-GB monorepo from the stable remote URL in
+  `Cargo.toml` (slow). Correctness never depends on the mirror.

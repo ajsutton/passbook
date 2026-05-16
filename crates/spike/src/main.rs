@@ -6,6 +6,9 @@ use reth_ethereum::{
 };
 use futures::TryStreamExt;
 
+/// Compile-gate only: never called. Proves one generic ExEx signature
+/// type-checks against both EthereumNode and OpNode at the locked revs.
+#[allow(dead_code)]
 async fn exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) -> eyre::Result<()> {
     while let Some(n) = ctx.notifications.try_next().await? {
         if let Some(c) = n.committed_chain() {
