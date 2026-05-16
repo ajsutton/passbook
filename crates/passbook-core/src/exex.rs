@@ -198,16 +198,22 @@ where
 /// Per-committed-block pipeline: assemble `BlockInputs` from the committed
 /// block's execution (ERC20 logs + receipts, per-block BundleState deltas,
 /// gas, and — gated on a watched balance/nonce change — `ValueInspector`
-/// frames from a self-contained re-execution) and run the pure
-/// `process_block`. Wired and asserted by integration test Task 6.4.
+/// frames from a re-execution) and run the pure `process_block`. Wired and
+/// asserted by integration test Task 6.4.
 ///
-/// Re-execution is **self-contained**: it rebuilds the exact pre-block
-/// account/storage/bytecode state from the committed chain's own
-/// `BundleState` (`original_info`, `previous_or_original_value`,
-/// `contracts`) into an in-memory `CacheDB<EmptyDB>`, so it is
-/// pruning-independent and needs no historical state provider. The
-/// production binary (Tasks 8.4/8.5) re-uses this body unchanged; the
-/// chain spec for the EVM is taken from `ctx.config.chain` (NOT
+/// Re-execution runs against the **real historical post-state of the
+/// committed chain's parent block** (a `reth` `StateProvider` obtained from
+/// the node provider via `history_by_block_hash(chain.first().parent_hash)`
+/// and wrapped in `StateProviderDatabase`), with the earlier in-chain
+/// blocks' `BundleState` writes layered on top so block N re-executes
+/// against `(parent-of-chain state + in-chain blocks < N)`. Crucially the
+/// READ fallback always reaches real state (never `EmptyDB`): any account /
+/// slot / contract code a production tx merely *reads* but the block does
+/// not modify is served from the real parent provider, so re-execution
+/// cannot diverge from canonical. This is pruning-independent and needs no
+/// archive node — the parent of the just-committed tip is the previous
+/// committed block, which `reth` keeps in plain/latest state on any full
+/// node. The chain spec for the EVM is taken from `ctx.config.chain` (NOT
 /// `ctx.evm_config()`, which is a panicking no-op under the ExEx test
 /// harness — see docs/reth-pin.md, Task 6.4 section).
 ///
@@ -226,8 +232,27 @@ where
     Node::Types: NodeTypes<Primitives = EthPrimitives, ChainSpec = ChainSpec>,
     S: StackAdapter,
 {
+    use alloy_consensus::BlockHeader;
     use reth_ethereum::chainspec::EthChainSpec;
+    use reth_ethereum::storage::StateProviderFactory;
     let chain_id = ctx.config.chain.chain_id();
+
+    // Real historical post-state of the committed chain's parent block =
+    // pre-state of the chain's first block. On a full node this is the
+    // previous committed block, retained in plain/latest state (no archive
+    // node, pruning-independent). The re-exec layers earlier in-chain
+    // blocks' writes for blocks > the chain's first.
+    let parent_hash = chain.first().header().parent_hash();
+    let parent_state = ctx
+        .provider()
+        .history_by_block_hash(parent_hash)
+        .map_err(|e| {
+            tracing::error!(error = %e, %parent_hash, "no historical state at chain parent");
+            ProcessingError::Decode {
+                block: block.header().number(),
+            }
+        })?;
+
     process_committed_block_inner(
         chain_id,
         ctx.config.chain.clone(),
@@ -235,16 +260,25 @@ where
         block,
         cfg,
         &make_adapter(),
+        parent_state,
     )
 }
 
 /// Node-agnostic core of [`process_one_committed_block`]: takes the
-/// resolved `chain_id` + chain spec explicitly so it is unit-testable
+/// resolved `chain_id` + chain spec + the **real parent-block state
+/// provider** explicitly so it is unit-testable / integration-testable
 /// without an `ExExContext` (and re-usable verbatim by Tasks 8.4/8.5).
+///
+/// `parent_state` MUST be the historical post-state of the committed
+/// chain's parent block (`chain.first().parent_hash`) — i.e. the pre-state
+/// of the chain's first block. Re-execution wraps it in
+/// `StateProviderDatabase` and layers in-chain blocks `< block.number` on
+/// top; the READ fallback always reaches this real state, never `EmptyDB`.
 #[doc(hidden)]
-// Faithful per-block pipeline signature (resolved chain id + spec passed
-// explicitly so it is unit-testable without an ExExContext); grouping
-// these into a struct would only obscure the call site.
+// Faithful per-block pipeline signature (resolved chain id + spec + parent
+// state provider passed explicitly so it is testable without an
+// ExExContext); grouping these into a struct would only obscure the call
+// site.
 #[allow(clippy::too_many_arguments)]
 pub fn process_committed_block_inner<S: StackAdapter>(
     chain_id: u64,
@@ -253,6 +287,7 @@ pub fn process_committed_block_inner<S: StackAdapter>(
     block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
     cfg: &PassbookConfig,
     adapter: &S,
+    parent_state: reth_ethereum::storage::StateProviderBox,
 ) -> Result<BlockBatch, ProcessingError> {
     use alloy_consensus::{BlockHeader, Transaction};
 
@@ -326,8 +361,9 @@ pub fn process_committed_block_inner<S: StackAdapter>(
     if any_watched_changed {
         let captured = reexec::reexecute_block_frames(
             chain_spec.clone(),
-            &outcome,
+            chain,
             block,
+            parent_state,
         )
         .map_err(|e| {
             tracing::error!(error = %e, block = block_number, "re-execution failed");
@@ -405,21 +441,29 @@ pub fn process_committed_block_inner<S: StackAdapter>(
     })
 }
 
-/// Self-contained block re-execution for `ValueInspector` frame capture.
+/// Block re-execution against the **real parent-block state** for
+/// `ValueInspector` frame capture.
 ///
-/// Rebuilds the exact pre-block account/storage/bytecode state from the
-/// committed `ExecutionOutcome`'s own `BundleState` (`original_info`,
-/// `previous_or_original_value`, `contracts`) into an in-memory
-/// `CacheDB<EmptyDB>` — pruning-independent, needs no historical state
-/// provider — then replays each transaction through the EVM's
-/// **per-transaction inspector tracer** (`EvmFactoryExt::create_tracer` →
+/// The pre-block state is the historical post-state of the committed
+/// chain's parent block — a `reth` `StateProvider` wrapped in
+/// `StateProviderDatabase` — with the earlier in-chain blocks' `BundleState`
+/// post-writes layered on top so block N re-executes against
+/// `(parent-of-chain state + in-chain blocks < N)`. The CacheDB overlay
+/// holds only the in-chain writes; every other account / slot / contract a
+/// tx merely **reads** falls through to the real provider (never `EmptyDB`),
+/// so re-execution cannot diverge from canonical (contract code a tx calls
+/// but the block does not modify is present, etc).
+///
+/// Each transaction is replayed through the EVM's **per-transaction
+/// inspector tracer** (`EvmFactoryExt::create_tracer` →
 /// `TxTracer::try_trace_many`). This is the same primitive reth's own
 /// `trace_block` uses; unlike the `BlockExecutor::execute_block` path
 /// (whose `transact` does **not** drive inspector hooks for nested call
-/// frames), the tracer's `transact_commit` routes through revm's
-/// `inspect_run` so every internal value-bearing CALL/CREATE/SELFDESTRUCT
-/// fires `Inspector::call`/`create`/`selfdestruct` (see docs/reth-pin.md,
-/// Task 6.4 section, "internal-frame capture").
+/// frames), the tracer's `transact` routes through revm's `inspect_run` so
+/// every internal value-bearing CALL/CALLCODE/CREATE/CREATE2/SELFDESTRUCT
+/// frame — including a plain value `CALL` to a codeless EOA — fires
+/// `Inspector::call`/`create`/`selfdestruct` (see docs/reth-pin.md, Task
+/// 6.4 section, "internal-frame capture").
 mod reexec {
     use super::*;
     use alloy_consensus::BlockHeader;
@@ -428,10 +472,17 @@ mod reexec {
     use reth_ethereum::evm::primitives::tracing::TracingCtx;
     use reth_ethereum::evm::primitives::ConfigureEvm;
     use reth_ethereum::evm::EthEvmConfig;
+    use reth_ethereum::evm::revm::database::StateProviderDatabase;
     use reth_ethereum::chainspec::ChainSpec;
-    use revm::database::{CacheDB, EmptyDB, State};
+    use reth_ethereum::storage::StateProviderBox;
+    use revm::database::{CacheDB, State};
     use revm::state::AccountInfo;
     use std::sync::Arc;
+
+    /// Pre-state database: real parent-block `StateProvider` (read
+    /// fallthrough — never `EmptyDB`) with in-chain blocks' writes layered
+    /// on top in the `CacheDB`.
+    type PreStateDb = CacheDB<StateProviderDatabase<StateProviderBox>>;
 
     pub(super) struct TaggedFrame {
         pub frame: CapturedFrame,
@@ -529,26 +580,49 @@ mod reexec {
 
     pub(super) fn reexecute_block_frames(
         chain_spec: Arc<ChainSpec>,
-        outcome: &reth_ethereum::provider::ExecutionOutcome,
+        chain: &reth_ethereum::provider::Chain,
         block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
+        parent_state: StateProviderBox,
     ) -> eyre::Result<Captured> {
-        // 1. Rebuild the exact pre-block state from the bundle.
-        let bundle = outcome.state();
-        let mut cache: CacheDB<EmptyDB> = CacheDB::new(EmptyDB::default());
-        for (addr, acct) in bundle.state.iter() {
-            if let Some(orig) = &acct.original_info {
-                let mut info: AccountInfo = orig.clone();
-                if info.code.is_none() && info.code_hash != revm::primitives::KECCAK_EMPTY {
-                    if let Some(bc) = bundle.contracts.get(&info.code_hash) {
-                        info.code = Some(bc.clone());
+        let block_number = block.header().number();
+
+        // 1. Pre-block state = REAL post-state of the committed chain's
+        //    parent block (the `parent_state` provider) wrapped so that any
+        //    account / slot / contract code a tx merely READS but the block
+        //    does not modify is served from real state — never `EmptyDB`.
+        let mut cache: PreStateDb = CacheDB::new(StateProviderDatabase::new(parent_state));
+
+        // 1a. Layer the earlier in-chain blocks' writes on top: for a
+        //     multi-block committed `Chain`, block N must re-exec against
+        //     (parent-of-chain state + in-chain blocks < N). The cumulative
+        //     `BundleState` up to `block_number - 1` is exactly those
+        //     writes; `execution_outcome_at_block` returns `None` when the
+        //     current block is the chain's first (parent == real provider,
+        //     no overlay needed).
+        if block_number > 0 {
+            if let Some(prior) = chain.execution_outcome_at_block(block_number - 1) {
+                let bundle = prior.state();
+                for (addr, acct) in bundle.state.iter() {
+                    // Post-state account info (`acct.info`); pull bytecode
+                    // out of `bundle.contracts` when only the hash is set.
+                    if let Some(post) = &acct.info {
+                        let mut info: AccountInfo = post.clone();
+                        if info.code.is_none()
+                            && info.code_hash != revm::primitives::KECCAK_EMPTY
+                        {
+                            if let Some(bc) = bundle.contracts.get(&info.code_hash) {
+                                info.code = Some(bc.clone());
+                            }
+                        }
+                        cache.insert_account_info(*addr, info);
+                    }
+                    // Post-state storage (`present_value`).
+                    for (slot, sv) in acct.storage.iter() {
+                        cache
+                            .insert_account_storage(*addr, *slot, sv.present_value)
+                            .ok();
                     }
                 }
-                cache.insert_account_info(*addr, info);
-            }
-            for (slot, sv) in acct.storage.iter() {
-                cache
-                    .insert_account_storage(*addr, *slot, sv.previous_or_original_value)
-                    .ok();
             }
         }
 
@@ -575,8 +649,11 @@ mod reexec {
 
         // 3. Per-tx inspector tracer (drives nested-frame inspector hooks,
         //    unlike BlockExecutor::execute_block's plain `transact`).
-        let bn = block.header().number();
-        let receipts = outcome.receipts_by_block(bn);
+        //    This-block receipts give per-tx reverted status.
+        let this_outcome = chain
+            .execution_outcome_at_block(block_number)
+            .ok_or_else(|| eyre::eyre!("no execution outcome for block {block_number}"))?;
+        let receipts = this_outcome.receipts_by_block(block_number);
         let mut frames: Vec<TaggedFrame> = Vec::new();
         let mut tx_hashes: Vec<Option<B256>> = Vec::new();
         let mut tx_reverted: Vec<bool> = Vec::new();

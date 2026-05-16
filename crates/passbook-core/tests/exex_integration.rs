@@ -1,26 +1,37 @@
-//! Task 6.4 ExEx integration test.
+//! Task 6.4 ExEx integration test (reworked).
 //!
-//! Builds a *genuinely executed* synthetic committed chain (so its
+//! Builds *genuinely executed* synthetic committed chains (so their
 //! `BundleState` + receipts are internally consistent by construction —
 //! they come from a real `EthEvmConfig` block execution, not hand-authored
-//! numbers), drives `run_passbook` through the pinned
-//! `reth_exex_test_utils` harness, and asserts the durable ledger rows
-//! plus a ZERO unattributed residual for the watched address.
+//! numbers), drives the per-block pipeline + `run_passbook` through the
+//! pinned `reth_exex_test_utils` harness, and asserts the durable ledger
+//! rows plus a ZERO unattributed residual for the watched address.
 //!
-//! The single watched address `W` is exercised across all three capture
-//! paths in one block:
-//!   * tx0: `S -> TOKEN` — `TOKEN` emits an ERC20 `Transfer(S, W, amt)`
-//!     log (topic0 = Transfer hash, topic2 = W) ⇒ `erc20_transfers` row.
-//!   * tx1: `S -> FORWARDER` with ETH value — `FORWARDER` performs an
-//!     internal `CALL` forwarding the whole `msg.value` to `W` ⇒ a
-//!     non-top-level `eth_transfers` row of kind `internal`.
-//!   * tx2: `W -> SINK` plain value transfer — `tx.from == W` ⇒ a
-//!     `gas_payments` row (and a top-level eth transfer out of W).
+//! Two scenarios:
 //!
-//! Reconciliation must net to zero for `W`: ΔW = (erc20 is token units,
-//! not wei, so it does NOT affect the wei balance) + (internal ETH in) -
-//! (tx2 value out) - (gas paid by W). All wei flows are produced by the
-//! real EVM, so Σ(attribution) == observed BundleState delta exactly.
+//! 1. `erc20_internal_gas_capture_zero_residual` — single block (parent =
+//!    genesis). The watched `W` is exercised across every capture path in
+//!    one block:
+//!      * tx0: `S -> TOKEN` — ERC20 `Transfer(S, W, amt)` log ⇒ erc20 row.
+//!      * tx1: `S -> SDFWD` w/ value — internal `SELFDESTRUCT` forwards the
+//!        whole balance to `W` ⇒ internal inbound eth row.
+//!      * tx2: `S -> CFWD` w/ value — internal plain value **`CALL`** to
+//!        the *codeless EOA* `W` ⇒ a second internal inbound eth row
+//!        (proves nested value-CALL frames to codeless EOAs are captured).
+//!      * tx3: `W -> SINK` plain value transfer — `tx.from == W` ⇒ a
+//!        `gas_payments` row + a top-level eth out of W.
+//!    Reconciliation nets to zero for `W`.
+//!
+//! 2. `parent_state_readonly_two_block_chain_zero_residual` — a 2-block
+//!    committed chain. Block 1 **deploys** a CALL-forwarder contract via a
+//!    CREATE tx (its runtime code lives only in block 1's `BundleState`,
+//!    NOT in genesis). Block 2 calls that contract with value; the
+//!    contract — whose code block 2 only READS and never modifies —
+//!    forwards the ETH to the codeless watched EOA `W`. This MUST fail
+//!    under the old `CacheDB<EmptyDB>` reconstruction (block 2's own bundle
+//!    has no code for the deployed contract → the call is a 21000-gas
+//!    no-op → residual) and pass against the real parent-state provider
+//!    with in-chain block-1 writes layered on top.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,6 +48,7 @@ use reth_ethereum::evm::primitives::ConfigureEvm;
 use reth_ethereum::evm::EthEvmConfig;
 use reth_ethereum::primitives::RecoveredBlock;
 use reth_ethereum::provider::{Chain, ExecutionOutcome};
+use reth_ethereum::storage::StateProviderBox;
 use reth_ethereum::TransactionSigned;
 use reth_exex_test_utils::test_exex_context_with_chain_spec;
 
@@ -64,43 +76,60 @@ fn addr32(a: Address) -> [u8; 32] {
     b
 }
 
-/// FORWARDER bytecode: forward its entire received balance to `dst` via
-/// SELFDESTRUCT. `73<dst:20> FF` = PUSH20 dst ; SELFDESTRUCT.
-///
-/// Why SELFDESTRUCT, not a value `CALL`: in revm 38 a plain value `CALL`
-/// to a *codeless* account (an EOA wallet like our watched `W`) is
-/// resolved without surfacing a nested `Inspector::call` frame, so an
-/// internal ETH credit to an EOA via `CALL` is not observable from a
-/// re-execution inspector at this stack version. `SELFDESTRUCT`'s value
-/// transfer DOES reliably fire `Inspector::selfdestruct` regardless of
-/// the beneficiary having code — it is exactly the value-bearing internal
-/// frame the production attribution path also captures. (Documented in
-/// docs/reth-pin.md, Task 6.4 "internal-frame capture".)
-fn forwarder_code(dst: Address) -> Bytes {
+/// SELFDESTRUCT-FORWARDER: forward its entire received balance to `dst`.
+/// `73<dst:20> FF` = PUSH20 dst ; SELFDESTRUCT. Reliably fires
+/// `Inspector::selfdestruct` regardless of `dst` having code.
+fn selfdestruct_forwarder_code(dst: Address) -> Bytes {
     let mut c = vec![0x73];
     c.extend_from_slice(dst.as_slice());
     c.push(0xff);
     Bytes::from(c)
 }
 
-/// TOKEN bytecode: emit `LOG3(Transfer, from, to)` with `amount` as data.
-///   PUSH32 amount ; PUSH0 ; MSTORE                  (mem[0..32] = amount)
-///   PUSH32 to ; PUSH32 from ; PUSH32 TOPIC0 ;
-///   PUSH1 0x20 ; PUSH0 ; LOG3 ; STOP
-/// LOG3 pops (offset, length, topic0, topic1, topic2): with the pushes
-/// above topic0=Transfer, topic1=from, topic2=to.
-fn token_code(from: Address, to: Address, amount: U256) -> Bytes {
+/// CALL-FORWARDER runtime: forward the entire received balance to `dst`
+/// via a plain value `CALL` (`dst` is a codeless EOA). Stack for CALL (top
+/// first): gas, addr, value, argsOff, argsLen, retOff, retLen.
+///   PUSH1 0 (retLen);PUSH1 0 (retOff);PUSH1 0 (argLen);PUSH1 0 (argOff);
+///   SELFBALANCE (value);PUSH20 dst (addr);GAS (gas);CALL;STOP
+fn call_forwarder_code(dst: Address) -> Bytes {
     let mut c = Vec::new();
-    c.push(0x7f);
-    c.extend_from_slice(&amount.to_be_bytes::<32>());
-    c.extend_from_slice(&[0x5f, 0x52]); // PUSH0 ; MSTORE
-    c.push(0x7f);
-    c.extend_from_slice(&addr32(to));
-    c.push(0x7f);
-    c.extend_from_slice(&addr32(from));
-    c.push(0x7f);
-    c.extend_from_slice(&TRANSFER_TOPIC0);
-    c.extend_from_slice(&[0x60, 0x20, 0x5f, 0xa3, 0x00]); // PUSH1 0x20;PUSH0;LOG3;STOP
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 retLen
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 retOff
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 argsLen
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 argsOff
+    c.push(0x47); // SELFBALANCE -> value
+    c.push(0x73); // PUSH20 dst
+    c.extend_from_slice(dst.as_slice());
+    c.push(0x5a); // GAS
+    c.push(0xf1); // CALL
+    c.push(0x00); // STOP
+    Bytes::from(c)
+}
+
+/// CREATE init code that returns `runtime` as the deployed contract's
+/// code: copy `runtime` into memory then `RETURN`. Prologue:
+///   PUSH2 len(3) ; PUSH1 off(2) ; PUSH1 0(2) ; CODECOPY(1) ;
+///   PUSH2 len(3) ; PUSH1 0(2) ; RETURN(1)  = 14 bytes ⇒ off = 0x0e
+/// followed by `<runtime...>`.
+fn deploy_initcode(runtime: &Bytes) -> Bytes {
+    const PROLOGUE_LEN: u8 = 14;
+    let len = runtime.len() as u16;
+    let mut c = Vec::new();
+    c.push(0x61); // PUSH2 len
+    c.extend_from_slice(&len.to_be_bytes());
+    c.extend_from_slice(&[0x60, PROLOGUE_LEN]); // PUSH1 off (runtime offset)
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 (dest)
+    c.push(0x39); // CODECOPY
+    c.push(0x61); // PUSH2 len
+    c.extend_from_slice(&len.to_be_bytes());
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0
+    c.push(0xf3); // RETURN
+    debug_assert_eq!(
+        c.len(),
+        PROLOGUE_LEN as usize,
+        "initcode prologue length must match the runtime offset"
+    );
+    c.extend_from_slice(runtime);
     Bytes::from(c)
 }
 
@@ -109,7 +138,7 @@ fn sign_legacy(
     signer: &PrivateKeySigner,
     chain_id: u64,
     nonce: u64,
-    to: Address,
+    to: TxKind,
     value: U256,
     gas_limit: u64,
     gas_price: u128,
@@ -120,7 +149,7 @@ fn sign_legacy(
         nonce,
         gas_price,
         gas_limit,
-        to: TxKind::Call(to),
+        to,
         value,
         input,
     };
@@ -128,25 +157,10 @@ fn sign_legacy(
     TransactionSigned::from(tx.into_signed(sig))
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn erc20_internal_gas_capture_zero_residual() {
-    // ── Actors ──────────────────────────────────────────────────────────
-    let s_signer = PrivateKeySigner::random();
-    let w_signer = PrivateKeySigner::random();
-    let sender = s_signer.address(); // S
-    let watched = w_signer.address(); // W
-    let forwarder = Address::repeat_byte(0xF0);
-    let token = Address::repeat_byte(0x70);
-    let sink = Address::repeat_byte(0x51);
-
-    let chain_id = 0x1234u64;
-    let gas_price = 1_000_000_000u128; // 1 gwei
-    let erc20_amount = U256::from(123_456_789u64);
-    let fwd_value = U256::from(7_000_000_000_000_000u64); // 0.007 ETH → W
-    let w_send_value = U256::from(1_000_000_000_000_000u64); // 0.001 ETH W → SINK
-
-    // ── Genesis: Paris (post-merge, pre-Shanghai → no withdrawals) ──────
-    let config = ChainConfig {
+/// Paris+Shanghai genesis config (Shanghai @0 so PUSH0/SELFBALANCE in our
+/// hand-written bytecode are valid).
+fn base_chain_config(chain_id: u64) -> ChainConfig {
+    ChainConfig {
         chain_id,
         homestead_block: Some(0),
         eip150_block: Some(0),
@@ -160,27 +174,17 @@ async fn erc20_internal_gas_capture_zero_residual() {
         london_block: Some(0),
         terminal_total_difficulty: Some(U256::ZERO),
         terminal_total_difficulty_passed: true,
-        // Shanghai at genesis so PUSH0 (0x5f) in our hand-written
-        // forwarder/token bytecode is a valid opcode.
         shanghai_time: Some(0),
         ..Default::default()
-    };
-    let funded = U256::from(10u64).pow(U256::from(18u64)); // 1 ETH
-    let acct = |balance: U256, code: Option<Bytes>| GenesisAccount {
-        balance,
-        code,
-        ..Default::default()
-    };
-    let mut alloc = std::collections::BTreeMap::new();
-    alloc.insert(sender, acct(funded, None));
-    alloc.insert(watched, acct(funded, None));
-    alloc.insert(forwarder, acct(U256::ZERO, Some(forwarder_code(watched))));
-    alloc.insert(
-        token,
-        acct(U256::ZERO, Some(token_code(sender, watched, erc20_amount))),
-    );
-    let genesis = Genesis {
-        config,
+    }
+}
+
+fn make_genesis(
+    chain_id: u64,
+    alloc: std::collections::BTreeMap<Address, GenesisAccount>,
+) -> Genesis {
+    Genesis {
+        config: base_chain_config(chain_id),
         nonce: 0,
         timestamp: 0,
         extra_data: Bytes::new(),
@@ -192,49 +196,111 @@ async fn erc20_internal_gas_capture_zero_residual() {
         base_fee_per_gas: Some(7),
         number: Some(0),
         ..Default::default()
-    };
+    }
+}
 
-    let chain_spec: Arc<ChainSpec> = Arc::new(ChainSpec::from_genesis(genesis));
-
-    // ── Build the block's three transactions ───────────────────────────
-    let gas_limit = 200_000u64;
-    let tx0 = sign_legacy(
-        &s_signer, chain_id, 0, token, U256::ZERO, gas_limit, gas_price, Bytes::new(),
-    );
-    let tx1 = sign_legacy(
-        &s_signer, chain_id, 1, forwarder, fwd_value, gas_limit, gas_price, Bytes::new(),
-    );
-    let tx2 = sign_legacy(
-        &w_signer, chain_id, 0, sink, w_send_value, gas_limit, gas_price, Bytes::new(),
-    );
-
+fn build_block(
+    chain_spec: &Arc<ChainSpec>,
+    number: u64,
+    parent_hash: B256,
+    timestamp: u64,
+    txs: Vec<TransactionSigned>,
+) -> RecoveredBlock<Block<TransactionSigned>> {
     let genesis_header = chain_spec.genesis_header().clone();
     let header = Header {
-        parent_hash: chain_spec.genesis_hash(),
-        number: 1,
+        parent_hash,
+        number,
         gas_limit: 30_000_000,
         base_fee_per_gas: Some(7),
-        timestamp: 12,
+        timestamp,
         beneficiary: Address::ZERO,
         difficulty: U256::ZERO,
         mix_hash: B256::ZERO,
         gas_used: 0,
-        // Shanghai: empty withdrawals set.
         withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
         ..genesis_header
     };
     let body = BlockBody {
-        transactions: vec![tx0, tx1, tx2],
+        transactions: txs,
         ommers: vec![],
         withdrawals: Some(Default::default()),
     };
-    let block: Block<TransactionSigned> = Block::new(header, body);
-    let recovered: RecoveredBlock<Block<TransactionSigned>> =
-        RecoveredBlock::try_recover(block).expect("recover senders");
+    RecoveredBlock::try_recover(Block::new(header, body)).expect("recover senders")
+}
+
+fn acct(balance: U256, code: Option<Bytes>) -> GenesisAccount {
+    GenesisAccount {
+        balance,
+        code,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn erc20_internal_gas_capture_zero_residual() {
+    // ── Actors ──────────────────────────────────────────────────────────
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address(); // S
+    let watched = w_signer.address(); // W (codeless EOA)
+    let sdfwd = Address::repeat_byte(0xF0); // SELFDESTRUCT forwarder
+    let cfwd = Address::repeat_byte(0xCF); // plain-CALL forwarder
+    let token = Address::repeat_byte(0x70);
+    let sink = Address::repeat_byte(0x51);
+
+    let chain_id = 0x1234u64;
+    let gas_price = 1_000_000_000u128; // 1 gwei
+    let erc20_amount = U256::from(123_456_789u64);
+    let sd_value = U256::from(7_000_000_000_000_000u64); // 0.007 ETH → W via SELFDESTRUCT
+    let call_value = U256::from(3_000_000_000_000_000u64); // 0.003 ETH → W via CALL
+    let w_send_value = U256::from(1_000_000_000_000_000u64); // 0.001 ETH W → SINK
+
+    let funded = U256::from(10u64).pow(U256::from(18u64)); // 1 ETH
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    alloc.insert(watched, acct(funded, None));
+    alloc.insert(
+        sdfwd,
+        acct(U256::ZERO, Some(selfdestruct_forwarder_code(watched))),
+    );
+    alloc.insert(cfwd, acct(U256::ZERO, Some(call_forwarder_code(watched))));
+    alloc.insert(
+        token,
+        acct(U256::ZERO, Some(token_code(sender, watched, erc20_amount))),
+    );
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    // ── Build the block's transactions ─────────────────────────────────
+    let gas_limit = 200_000u64;
+    let tx0 = sign_legacy(
+        &s_signer, chain_id, 0, TxKind::Call(token), U256::ZERO, gas_limit, gas_price,
+        Bytes::new(),
+    );
+    let tx1 = sign_legacy(
+        &s_signer, chain_id, 1, TxKind::Call(sdfwd), sd_value, gas_limit, gas_price,
+        Bytes::new(),
+    );
+    let tx2 = sign_legacy(
+        &s_signer, chain_id, 2, TxKind::Call(cfwd), call_value, gas_limit, gas_price,
+        Bytes::new(),
+    );
+    let tx3 = sign_legacy(
+        &w_signer, chain_id, 0, TxKind::Call(sink), w_send_value, gas_limit, gas_price,
+        Bytes::new(),
+    );
+
+    let recovered = build_block(
+        &chain_spec,
+        1,
+        chain_spec.genesis_hash(),
+        12,
+        vec![tx0, tx1, tx2, tx3],
+    );
 
     // ── Genuinely execute the block to obtain a consistent outcome ──────
     let evm_config = EthEvmConfig::new(chain_spec.clone());
-    let state_db = reexec_pre_state(&chain_spec);
+    let state_db = genesis_state(&chain_spec);
     let exec_out = evm_config
         .executor(state_db)
         .execute(&recovered)
@@ -251,9 +317,21 @@ async fn erc20_internal_gas_capture_zero_residual() {
     let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
         .expect("cfg");
 
-    // ── Deterministic core check: run the per-block pipeline directly so
-    //    a residual / re-exec failure surfaces as a concrete error rather
-    //    than being swallowed by run_passbook's retry-forever loop. ──────
+    // ── Harness first: we need a REAL parent (= genesis) state provider
+    //    for the deterministic direct check below. ──────────────────────
+    let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let genesis_hash = handle.genesis.hash();
+
+    // ── Deterministic core check: run the per-block pipeline directly
+    //    against the real genesis-state provider so a residual / re-exec
+    //    failure surfaces as a concrete error. ──────────────────────────
+    let parent_state: StateProviderBox = handle
+        .provider_factory
+        .history_by_block_hash(genesis_hash)
+        .expect("genesis state provider");
     let res = passbook_core::exex::process_committed_block_inner(
         chain_id,
         chain_spec.clone(),
@@ -261,6 +339,7 @@ async fn erc20_internal_gas_capture_zero_residual() {
         &recovered,
         &cfg,
         &L1Adapter,
+        parent_state,
     );
     let batch = res.expect("per-block processing must reconcile to zero residual");
     assert!(
@@ -268,45 +347,37 @@ async fn erc20_internal_gas_capture_zero_residual() {
         "zero unattributed residual expected from the pure orchestrator"
     );
     assert_eq!(
-        batch
-            .erc20
-            .iter()
-            .filter(|r| r.address == watched)
-            .count(),
+        batch.erc20.iter().filter(|r| r.address == watched).count(),
         1,
         "one ERC20 row for W"
     );
+    let internal_in: Vec<&_> = batch
+        .eth
+        .iter()
+        .filter(|r| r.address == watched
+            && matches!(r.direction, passbook_core::model::Direction::In)
+            && matches!(r.kind, passbook_core::model::EthKind::Internal))
+        .collect();
     assert_eq!(
-        batch
-            .eth
-            .iter()
-            .filter(|r| r.address == watched
-                && matches!(r.direction, passbook_core::model::Direction::In)
-                && matches!(r.kind, passbook_core::model::EthKind::Internal))
-            .count(),
-        1,
-        "one internal inbound ETH row for W"
+        internal_in.len(),
+        2,
+        "two internal inbound ETH rows for W (SELFDESTRUCT + plain CALL)"
     );
+    let mut got: Vec<U256> = internal_in.iter().map(|r| r.amount_wei).collect();
+    got.sort();
+    let mut want = [sd_value, call_value];
+    want.sort();
+    assert_eq!(got, want, "internal-in amounts = SELFDESTRUCT + CALL values");
     assert_eq!(
         batch.gas.iter().filter(|r| r.address == watched).count(),
         1,
-        "one gas row for W (tx2)"
+        "one gas row for W (tx3)"
     );
 
     // ── End-to-end: drive run_passbook via the test ExEx harness ───────
-    let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
-        .await
-        .expect("test exex ctx");
-    // The harness builds `ctx.config` from `NodeConfig::test()` (default
-    // mainnet spec), NOT from the chain spec passed above; point it at our
-    // synthetic spec so `run_passbook`'s `ctx.config.chain` (chain id +
-    // EVM hardforks for the gated re-execution) matches the committed
-    // block. In production `ctx.config.chain` is already the node's spec.
-    ctx.config.chain = chain_spec.clone();
     let ledger = Arc::new(Mutex::new(
         Ledger::open(&db_path, chain_id).expect("ledger open"),
     ));
-
     let driver = tokio::spawn(passbook_core::exex::run_passbook(
         ctx,
         cfg,
@@ -319,29 +390,12 @@ async fn erc20_internal_gas_capture_zero_residual() {
         .await
         .expect("send committed");
 
-    // Wait for FinishedHeight(1) → block durably written.
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Ok(ev) = handle.events_rx.try_recv() {
-            if matches!(
-                ev,
-                reth_ethereum::exex::ExExEvent::FinishedHeight(h) if h.number == 1
-            ) {
-                break;
-            }
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for run_passbook to emit FinishedHeight(1)"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_finished_height(&mut handle, 1).await;
     driver.abort();
 
     // ── Assert the durable ledger ──────────────────────────────────────
     let g = ledger.lock().unwrap();
     let conn = g.conn();
-
     let w_lc = format!("{watched:#x}");
 
     let erc20_count: i64 = conn
@@ -370,8 +424,176 @@ async fn erc20_internal_gas_capture_zero_residual() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(internal_in, 1, "expected one internal inbound ETH row for W");
+    assert_eq!(
+        internal_in, 2,
+        "expected two internal inbound ETH rows for W (SELFDESTRUCT + CALL)"
+    );
 
+    let internal_sum: String = conn
+        .query_row(
+            "SELECT CAST(SUM(CAST(amount_wei AS INTEGER)) AS TEXT) FROM eth_transfers \
+             WHERE address=?1 AND direction='in' AND kind='internal'",
+            [&w_lc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(internal_sum, (sd_value + call_value).to_string());
+
+    let gas_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM gas_payments WHERE address=?1",
+            [&w_lc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(gas_rows, 1, "expected one gas_payments row for W (tx3)");
+
+    let unattributed: i64 = conn
+        .query_row("SELECT COUNT(*) FROM unattributed_deltas", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(unattributed, 0, "ZERO unattributed residual expected");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parent_state_readonly_two_block_chain_zero_residual() {
+    // Block 1 DEPLOYS a CALL-forwarder via CREATE (its runtime code lives
+    // only in block 1's BundleState — NOT genesis). Block 2 calls that
+    // contract with value; block 2 only READS the deployed code (never
+    // modifies it). The forwarder sends the ETH to the codeless watched
+    // EOA `W`. Old EmptyDB reconstruction (block 2's own bundle has no
+    // code for the deployed contract) ⇒ 21000-gas no-op ⇒ residual. The
+    // real parent-state provider + in-chain block-1 overlay ⇒ zero.
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address();
+    let watched = w_signer.address(); // W (codeless EOA)
+
+    let chain_id = 0x4321u64;
+    let gas_price = 1_000_000_000u128;
+    let fwd_value = U256::from(5_000_000_000_000_000u64); // 0.005 ETH → W
+
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    alloc.insert(watched, acct(funded, None));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    // Deployed contract address = CREATE(sender, nonce=0).
+    let deployed = sender.create(0);
+    let runtime = call_forwarder_code(watched);
+    let initcode = deploy_initcode(&runtime);
+
+    let gas_limit = 300_000u64;
+    // Block 1: deploy the forwarder (CREATE).
+    let b1_tx = sign_legacy(
+        &s_signer, chain_id, 0, TxKind::Create, U256::ZERO, gas_limit, gas_price, initcode,
+    );
+    let b1 = build_block(&chain_spec, 1, chain_spec.genesis_hash(), 12, vec![b1_tx]);
+
+    // Block 2: call the deployed forwarder with value (its code is read,
+    // not modified, by block 2).
+    let b2_tx = sign_legacy(
+        &s_signer, chain_id, 1, TxKind::Call(deployed), fwd_value, gas_limit, gas_price,
+        Bytes::new(),
+    );
+    let b2 = build_block(&chain_spec, 2, b1.hash(), 24, vec![b2_tx]);
+
+    // Genuinely execute both blocks against the same evolving state so the
+    // committed Chain's BundleState/receipts are consistent by
+    // construction.
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let state_db = genesis_state(&chain_spec);
+    let outcome = evm_config
+        .batch_executor(state_db)
+        .execute_batch([&b1, &b2])
+        .expect("2-block batch execution");
+    let chain = Chain::new(
+        vec![b1.clone(), b2.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
+        .expect("cfg");
+
+    let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let genesis_hash = handle.genesis.hash();
+
+    // Deterministic direct check for BLOCK 2 specifically: its parent is
+    // block 1 (in-chain). The chain's parent is genesis; block 2 must
+    // re-exec against (genesis provider + block 1 writes). Block 1's
+    // BundleState carries the deployed runtime code; block 2 reads it.
+    let parent_state: StateProviderBox = handle
+        .provider_factory
+        .history_by_block_hash(genesis_hash)
+        .expect("genesis state provider");
+    let batch2 = passbook_core::exex::process_committed_block_inner(
+        chain_id,
+        chain_spec.clone(),
+        &chain,
+        &b2,
+        &cfg,
+        &L1Adapter,
+        parent_state,
+    )
+    .expect("block 2 must reconcile against parent-state + in-chain overlay");
+    assert!(
+        batch2.unattributed.is_empty(),
+        "zero residual for block 2 (read-only parent/in-chain state)"
+    );
+    let b2_internal_in: Vec<&_> = batch2
+        .eth
+        .iter()
+        .filter(|r| r.address == watched
+            && matches!(r.direction, passbook_core::model::Direction::In)
+            && matches!(r.kind, passbook_core::model::EthKind::Internal))
+        .collect();
+    assert_eq!(
+        b2_internal_in.len(),
+        1,
+        "block 2: one internal inbound ETH row for W via the block-1-deployed forwarder"
+    );
+    assert_eq!(b2_internal_in[0].amount_wei, fwd_value);
+
+    // End-to-end: the whole 2-block chain through run_passbook.
+    let ledger = Arc::new(Mutex::new(
+        Ledger::open(&db_path, chain_id).expect("ledger open"),
+    ));
+    let driver = tokio::spawn(passbook_core::exex::run_passbook(
+        ctx,
+        cfg,
+        ledger.clone(),
+        || L1Adapter,
+    ));
+    handle
+        .send_notification_chain_committed(chain)
+        .await
+        .expect("send committed");
+    wait_finished_height(&mut handle, 2).await;
+    driver.abort();
+
+    let g = ledger.lock().unwrap();
+    let conn = g.conn();
+    let w_lc = format!("{watched:#x}");
+
+    let internal_in: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM eth_transfers \
+             WHERE address=?1 AND direction='in' AND kind='internal'",
+            [&w_lc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        internal_in, 1,
+        "expected one internal inbound ETH row for W (block 2 via block-1 contract)"
+    );
     let internal_amt: String = conn
         .query_row(
             "SELECT amount_wei FROM eth_transfers \
@@ -382,36 +604,62 @@ async fn erc20_internal_gas_capture_zero_residual() {
         .unwrap();
     assert_eq!(internal_amt, fwd_value.to_string());
 
-    let gas_rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM gas_payments WHERE address=?1",
-            [&w_lc],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(gas_rows, 1, "expected one gas_payments row for W (tx2)");
-
     let unattributed: i64 = conn
         .query_row("SELECT COUNT(*) FROM unattributed_deltas", [], |r| r.get(0))
         .unwrap();
     assert_eq!(unattributed, 0, "ZERO unattributed residual expected");
 }
 
-/// In-memory pre-block state = the genesis allocation, so the real
-/// execution above is consistent with `process_one_committed_block`'s own
-/// self-contained re-execution (which rebuilds the identical pre-state
-/// from the resulting `BundleState`).
-fn reexec_pre_state(
+/// TOKEN bytecode: emit `LOG3(Transfer, from, to)` with `amount` as data.
+fn token_code(from: Address, to: Address, amount: U256) -> Bytes {
+    let mut c = Vec::new();
+    c.push(0x7f);
+    c.extend_from_slice(&amount.to_be_bytes::<32>());
+    c.extend_from_slice(&[0x5f, 0x52]); // PUSH0 ; MSTORE
+    c.push(0x7f);
+    c.extend_from_slice(&addr32(to));
+    c.push(0x7f);
+    c.extend_from_slice(&addr32(from));
+    c.push(0x7f);
+    c.extend_from_slice(&TRANSFER_TOPIC0);
+    c.extend_from_slice(&[0x60, 0x20, 0x5f, 0xa3, 0x00]); // PUSH1 0x20;PUSH0;LOG3;STOP
+    Bytes::from(c)
+}
+
+async fn wait_finished_height(
+    handle: &mut reth_exex_test_utils::TestExExHandle,
+    n: u64,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Ok(ev) = handle.events_rx.try_recv() {
+            if matches!(
+                ev,
+                reth_ethereum::exex::ExExEvent::FinishedHeight(h) if h.number == n
+            ) {
+                return;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for run_passbook to emit FinishedHeight({n})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// In-memory genesis-allocation state, used only to *produce* a consistent
+/// synthetic committed `Chain` by genuinely executing the blocks (the
+/// pipeline under test re-executes against the harness's real parent-state
+/// provider, not this).
+fn genesis_state(
     chain_spec: &Arc<ChainSpec>,
 ) -> revm::database::State<revm::database::CacheDB<revm::database::EmptyDB>> {
     use revm::database::{CacheDB, EmptyDB};
     use revm::state::AccountInfo;
     let mut cache: CacheDB<EmptyDB> = CacheDB::new(EmptyDB::default());
     for (addr, acct) in chain_spec.genesis().alloc.iter() {
-        let code = acct
-            .code
-            .clone()
-            .map(revm::bytecode::Bytecode::new_raw);
+        let code = acct.code.clone().map(revm::bytecode::Bytecode::new_raw);
         let mut info = AccountInfo {
             balance: acct.balance,
             nonce: acct.nonce.unwrap_or(0),

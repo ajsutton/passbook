@@ -572,8 +572,17 @@ async fn process_one_committed_block<Node, S>(
 where Node: FullNodeComponents,
       Node::Types: NodeTypes<Primitives = EthPrimitives, ChainSpec = ChainSpec>,
       S: StackAdapter;
+// ^ obtains the REAL parent-block state provider itself, from the node
+//   provider, and threads it into the inner fn:
+//     use reth_ethereum::storage::StateProviderFactory;          // trait
+//     let parent_hash  = chain.first().header().parent_hash();   // BlockHeader
+//     let parent_state = ctx.provider()
+//         .history_by_block_hash(parent_hash)?;   // -> StateProviderBox
+//   `Node::Provider: FullProvider: StateProviderFactory` already, so NO new
+//   trait bound is needed (just `use ...StateProviderFactory;` in scope).
 
-// Node-agnostic, ExExContext-free core (unit-testable; reused by 8.x):
+// Node-agnostic, ExExContext-free core (unit/integration-testable; reused
+// verbatim by 8.4/8.5). NEW trailing arg `parent_state`:
 #[doc(hidden)]
 pub fn process_committed_block_inner<S: StackAdapter>(
     chain_id: u64,
@@ -582,7 +591,14 @@ pub fn process_committed_block_inner<S: StackAdapter>(
     block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
     cfg: &PassbookConfig,
     adapter: &S,
+    parent_state: reth_ethereum::storage::StateProviderBox, // NEW (Task 6.4 rework)
 ) -> Result<BlockBatch, ProcessingError>;
+// `parent_state` MUST be the historical post-state of the committed
+// chain's parent block (`chain.first().parent_hash`) = the pre-state of
+// the chain's first block. Re-exec wraps it in `StateProviderDatabase` and
+// layers in-chain blocks `< block.number` on top (see "parent-state
+// re-execution" below). 8.4/8.5 obtain it exactly as `process_one_..`
+// does (the call site there is the canonical example).
 ```
 
 - **`make_adapter` refined** from the Task 6.3 placeholder to
@@ -611,41 +627,71 @@ pub fn process_committed_block_inner<S: StackAdapter>(
 | header accessors | `block.header().number()` etc | need `use alloy_consensus::{BlockHeader, Transaction};` in scope — `.number()`, `.base_fee_per_gas()`, `tx.effective_gas_price(base_fee)` are trait methods (`E0599` without the import). |
 | tx hash / sender | — | `block.body().transactions[i].tx_hash()`; `block.transactions_with_sender() -> (&Address, &TxSigned)` (recovered senders). |
 | re-exec EVM config | use `ctx`'s `ConfigureEvm` | **CRITICAL DELTA**: under the ExEx **test harness** `ctx.evm_config()` / the node's `ConfigureEvm` is `MockEvmConfig = NoopEvmConfig<EthEvmConfig>` whose `inner()` is `unimplemented!()` — calling it panics. Re-execution therefore builds a **fresh real `EthEvmConfig::new(ctx.config.chain.clone())`** from the chain spec, never `ctx.evm_config()`. (Production `ctx.evm_config()` would work but the chain-spec path is correct for both and harness-safe.) |
-| pre-state for re-exec | state provider at `block.parent_hash()` via `StateProviderDatabase` | **DELTA / improvement**: re-execution is made **self-contained** — the pre-block account/storage/bytecode state is rebuilt from the committed `ExecutionOutcome`'s own `BundleState` (`bundle.state[*].original_info`, per-slot `previous_or_original_value`, `bundle.contracts[code_hash]`) into a `revm::database::CacheDB<EmptyDB>` wrapped in `revm::database::State::builder().with_database(..).with_bundle_update().build()`. Pruning-independent, needs **no** historical `StateProviderFactory` — and works identically in the test harness (whose provider only has genesis) and production. |
-| inspector-driven block exec | `evm_config.create_executor(evm_with_env_and_inspector(..), context_for_block(..)).execute_block(block.transactions_recovered())` | **CRITICAL DELTA**: that `BlockExecutor::execute_block` path uses `EthEvm::transact` whose nested call frames do **NOT** fire `Inspector::call`/`create` — only the top-level tx call is inspected, so **internal value transfers are never captured**. The correct primitive is reth's own block-trace path: `evm_config.evm_factory().create_tracer(&mut state, evm_env, inspector).try_trace_many(block.transactions_recovered(), |ctx| …).commit_last_tx()` (`EvmFactoryExt`/`TxTracer` from `reth_ethereum::evm::primitives::{evm::EvmFactoryExt, tracing::TracingCtx}`). `TxTracer`'s `transact_commit` routes through revm's `inspect_run` so every nested CALL/CREATE/SELFDESTRUCT frame fires the inspector. Pre-execution system changes (Cancun beacon root etc.) are applied first via `evm_config.create_executor(evm_with_env(&mut state, evm_env.clone()), context_for_block(block.sealed_block())?).apply_pre_execution_changes()`. `ConfigureEvm`/`EvmFactory`/`BlockExecutor`/`Executor` traits must be in scope. |
+| pre-state for re-exec | state provider at `block.parent_hash()` via `StateProviderDatabase` | **EXACT (Task 6.4 rework — the research idiom was right; the earlier `CacheDB<EmptyDB>`-from-own-bundle "improvement" was a CRITICAL DEFECT — see "parent-state re-execution" below). `reth`'s `BundleState` (revm-database 13.0.1) contains ONLY accounts/slots the block WROTE; an account/contract a tx merely READS produces no transition. Rebuilding pre-state from the block's own bundle therefore leaves every read-only account at `EmptyDB` default (balance 0 / empty code / zero storage) ⇒ re-exec diverges ⇒ wrong frames/gas ⇒ residual ⇒ ExEx stalls on ~every real block. Fix: pre-state = the REAL historical post-state of the committed chain's parent block — `ctx.provider().history_by_block_hash(chain.first().parent_hash())? -> StateProviderBox`, wrapped `revm::database::State::builder().with_database(StateProviderDatabase::new(parent_state)) .with_bundle_update().build()`. Pruning-independent / no archive node (the parent of the just-committed tip is the previous committed block, kept in plain/latest state on any full node). For a multi-block committed `Chain`, block N's `CacheDB` is overlaid with the cumulative `chain.execution_outcome_at_block(N-1)` BundleState **post**-values (`acct.info`, slot `present_value`, `bundle.contracts`) so it re-execs vs `(parent-of-chain state + in-chain blocks < N)`; the READ fallback always reaches the real provider, never `EmptyDB`. `StateProviderDatabase` ∈ `reth_ethereum::evm::revm::database`; `StateProviderBox`/`StateProviderFactory` ∈ `reth_ethereum::storage`.** |
+| inspector-driven block exec | `evm_config.create_executor(evm_with_env_and_inspector(..), context_for_block(..)).execute_block(block.transactions_recovered())` | **CRITICAL DELTA**: that `BlockExecutor::execute_block` path uses `EthEvm::transact` whose nested call frames do **NOT** fire `Inspector::call`/`create` — only the top-level tx call is inspected, so **internal value transfers are never captured**. The correct primitive is reth's own block-trace path: `evm_config.evm_factory().create_tracer(&mut state, evm_env, inspector).try_trace_many(block.transactions_recovered(), |ctx| …).commit_last_tx()` (`EvmFactoryExt`/`TxTracer` from `reth_ethereum::evm::primitives::{evm::EvmFactoryExt, tracing::TracingCtx}`). `TxTracer`'s per-tx `evm.transact` routes through `EthEvm::transact_raw → inspect_tx` (the tracer's evm is built with `create_evm_with_inspector → activate_inspector`, i.e. `inspect=true`) → `MainnetHandler::inspect_run` → `inspect_run_exec_loop` → `inspect_frame_init` calls `frame_start` (→ `inspector.call`) for **every** frame, **before** `frame_init`'s empty-bytecode `Stop` short-circuit (`revm-handler 18.1.0 frame.rs:227-229`, `revm-inspector 19.0.0 traits.rs:99-107`). So nested CALL/CALLCODE/CREATE/CREATE2/SELFDESTRUCT frames — incl. a plain value `CALL` to a codeless EOA — DO fire the inspector. (The earlier "only top-level fires" was an artifact of the `CacheDB<EmptyDB>` pre-state above: with the contract's code missing, the top-level call hit empty bytecode and never produced the nested CALL at all — fixed by the real parent-state pre-state.) Pre-execution system changes (Cancun beacon root etc.) are applied first via `evm_config.create_executor(evm_with_env(&mut state, evm_env.clone()), context_for_block(block.sealed_block())?).apply_pre_execution_changes()`. `ConfigureEvm`/`EvmFactory`/`BlockExecutor`/`Executor` traits must be in scope. |
 | inspector `Clone` | — | `ValueInspector` + the `TaggingInspector` wrapper must be `Clone` (the tracer clones/fuses the inspector between txs; per-tx index is known from `try_trace_many`, so the wrapper only tracks per-tx call depth to mark top-level vs internal). |
 | frame tagging | mark `tx:<i>` top-level, seq path internal | top-level (tx depth-0) frame's `trace_path` rewritten to `"tx:<i>"` (→ attribution `EthKind::TopLevel`); nested frames keep the `ValueInspector` seq path (→ `EthKind::Internal`). |
 
-### revm 38 internal-frame capture caveat (load-bearing)
+### revm 38 internal-frame capture — internal value CALLs (incl. to codeless EOA) ARE captured (load-bearing)
 
-A plain value-bearing `CALL` to a **codeless account** (an ordinary EOA
-wallet) is resolved by revm 38 without surfacing a nested
-`Inspector::call` frame — even via the correct `inspect_run`/tracer path
-(empirically: only the top-level tx call fires; `revm-handler 14.1.0`
-`make_call_frame` early-returns `Stop` for empty bytecode). Consequences:
+**Correction (Task 6.4 rework).** An earlier note here claimed a plain
+value `CALL` to a codeless EOA does not surface a nested `Inspector::call`
+frame at this stack version (citing `revm-handler 14.1.0`). That is
+**FALSE** — the project pins `revm-handler 18.1.0` / `revm-inspector
+19.0.0` / `revm-interpreter 35.0.1`, and the pinned source shows the
+opposite, **confirmed empirically** by the Task 6.4 integration test
+(contract → watched-EOA plain value `CALL` produces an `eth_transfers`
+`kind=internal, direction=in` row with zero residual):
 
-- **CREATE / CREATE2 / SELFDESTRUCT value transfers, and CALLs whose
-  target has code, ARE captured** (their frames carry an interpreter /
-  fire `selfdestruct`). Contract→contract internal ETH and
-  selfdestruct-to-EOA are fully attributed.
-- A bare contract→EOA value `CALL` is *not* individually surfaced as an
-  internal frame at this stack version. Net wei still reconciles (the
-  BundleState delta is exact); it would land as residual only if it were
-  the *sole* unexplained flow. **Tasks 6.5 / 8.x must treat
-  internal-ETH-to-EOA-via-plain-CALL as a known revm-38 limitation**; if
-  precise attribution of that case is later required, revisit on a revm
-  bump or add a balance-diff fallback attributor.
-- The Task 6.4 integration test therefore exercises the internal-ETH leg
-  via a `SELFDESTRUCT`-forwarding contract (reliably fires
-  `Inspector::selfdestruct` with the beneficiary = watched `W`), which is
-  a genuine value-bearing internal frame end-to-end.
+- `revm-interpreter 35.0.1 src/instructions/contract.rs:135-185`: the
+  `CALL` opcode emits `FrameInput::Call{ value: CallValue::Transfer(v) }`
+  **unconditionally** — no codeless-target check.
+- `revm-inspector 19.0.0 src/traits.rs:99-107` (`inspect_frame_init`)
+  calls `frame_start` (→ `inspector.call`) for **every** frame init
+  (top-level and nested), **before** `self.frame_init`.
+- The empty-bytecode `Stop` short-circuit is in `revm-handler 18.1.0
+  src/frame.rs:227-229`, i.e. **downstream** of that inspector hook.
+- The tracer's per-tx `evm.transact` reaches this via `EthEvm::transact_raw
+  → inspect_tx → MainnetHandler::inspect_run → inspect_run_exec_loop`
+  (the tracer evm is built `create_evm_with_inspector → activate_inspector`
+  ⇒ `inspect=true`).
+
+So `Inspector::call` DOES fire for an internal value CALL to a codeless
+EOA. The previous "only top-level fires" symptom was **not** a revm
+limitation — it was an artifact of the (now-removed) `CacheDB<EmptyDB>`
+pre-state: with the forwarding contract's code absent from the rebuilt
+pre-state, the top-level call hit empty bytecode (21000-gas no-op) and the
+nested CALL was never produced. Re-executing against the real
+parent-block state provider (see the table row above) makes the code
+present, the nested CALL executes, and the hook fires.
+
+- **CALL / CALLCODE / CREATE / CREATE2 / SELFDESTRUCT value transfers —
+  including contract→EOA plain `CALL` — ARE all captured** as internal
+  frames. No "known limitation"; **no balance-diff fallback** is used or
+  needed (reconciliation is not weakened).
+- The Task 6.4 integration test exercises BOTH a `SELFDESTRUCT` forwarder
+  AND a plain-`CALL` forwarder to the codeless watched EOA `W`, plus a
+  2-block chain where block 2 calls a contract **deployed in block 1**
+  (its runtime code lives only in block 1's `BundleState`, read but not
+  modified by block 2) and still reconciles to zero — proving the
+  read-only parent/in-chain-overlay state path.
 
 ### `reth_exex_test_utils` API used (pinned v2.2.0)
 
 - `test_exex_context_with_chain_spec(Arc<ChainSpec>) -> (ExExContext<Adapter>, TestExExHandle)`
   (and `test_exex_context()` = mainnet). The harness EVM is
-  `MockEvmConfig` (see CRITICAL DELTA above) and `init_genesis` only
-  seeds genesis — re-execution must be self-contained (it is).
+  `MockEvmConfig` (see CRITICAL DELTA above). `init_genesis` seeds genesis
+  into the harness `BlockchainProvider`, so `ctx.provider()
+  .history_by_block_hash(genesis_hash)` returns a **real** genesis-state
+  provider — exactly the parent-state pre-state the Task 6.4 rework
+  re-executes against. `TestExExHandle::provider_factory
+  .history_by_block_hash(genesis_hash)? -> StateProviderBox` gives the
+  same provider for the deterministic direct `process_committed_block_inner`
+  check. The default test-utils notification stream is `WithoutHead` (no
+  backfill), so the synthetic committed chain need not be in the provider
+  DB — its blocks are parented at genesis (single-block: parent = genesis;
+  2-block: block 1 parent = genesis, block 2 re-execs vs genesis provider +
+  block 1's in-chain BundleState overlay).
 - **`ctx.config` is built from `NodeConfig::test()` (default mainnet
   spec), NOT from the `chain_spec` argument.** For an end-to-end
   `run_passbook` drive against a custom chain spec the test sets
