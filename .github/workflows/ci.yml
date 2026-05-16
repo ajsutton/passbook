@@ -89,6 +89,15 @@ jobs:
 
   images:
     name: docker images + smokes + publish
+    # Gate on the fmt/clippy/test job: nothing here (build, smoke, OR publish)
+    # runs unless `test` passed first. This means no image is ever published
+    # from a commit whose Rust suite failed. Cost: this job no longer runs in
+    # parallel with `test`, so total CI wall-clock ~= test + images (both
+    # contain the long reth compile). `needs:` is job-level only — there is no
+    # step-level `needs`, so gating publish on `test` requires gating the whole
+    # job. (Build+smoke already gate publish intrinsically: publish steps run
+    # after them in this job and a failed step aborts before publish.)
+    needs: test
     runs-on: ubuntu-latest
     # Job-level permissions REPLACE the top-level block, so contents:read must
     # be restated. packages:write lets GITHUB_TOKEN push to this repo's GHCR
@@ -149,7 +158,10 @@ jobs:
 
       # Version selection (per spec):
       #   * tag push       → image tag = the git tag name (release version)
-      #   * push to `main` → image tag = the full commit SHA
+      #   * push to `main` → image tags = the full commit SHA, plus a moving
+      #                      `latest` that always points at the newest main
+      #                      build. `latest` is NOT applied to release tags so
+      #                      it never silently jumps backward to an old tag.
       - name: Publish images to GHCR
         if: github.event_name == 'push'
         env:
@@ -159,14 +171,16 @@ jobs:
           # GHCR namespaces must be lowercase.
           owner_lc="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            version="${{ github.ref_name }}"
+            versions="${{ github.ref_name }}"
           else
-            version="${{ github.sha }}"
+            versions="${{ github.sha }} latest"
           fi
-          echo "Publishing version: ${version}"
+          echo "Publishing tags: ${versions}"
           for bin in reth-passbook op-reth-passbook; do
             img="ghcr.io/${owner_lc}/${bin}"
-            docker tag "${bin}:ci" "${img}:${version}"
-            docker push "${img}:${version}"
-            echo "pushed ${img}:${version}"
+            for v in ${versions}; do
+              docker tag "${bin}:ci" "${img}:${v}"
+              docker push "${img}:${v}"
+              echo "pushed ${img}:${v}"
+            done
           done
