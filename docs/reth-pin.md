@@ -359,3 +359,81 @@ script cannot be used:
 - A clean checkout that skips `seed-vendor.sh` is still *correct* — cargo
   clones the full multi-GB monorepo from the stable remote URL in
   `Cargo.toml` (slow). Correctness never depends on the mirror.
+
+## revm 38 API deltas
+
+How the `revm::Inspector` impl for `ValueInspector`
+(`crates/passbook-core/src/inspector.rs`, Task 3.1) differed from the plan's
+candidate, verified against the pinned stack: `revm 38.0.0` →
+`revm-inspector 19.0.0` (the `Inspector` trait), `revm-interpreter 35.0.1`
+(`CallInputs`/`CallValue`/`CallScheme`/`CreateInputs`/`CreateOutcome`),
+`revm-context-interface 17.0.1` (`CreateScheme`). **Load-bearing for Task
+6.4** (wiring the inspector into the ExEx execution path).
+
+Exact trait shape in revm-inspector 19.0.0:
+
+```rust
+#[auto_impl(&mut, Box)]
+pub trait Inspector<CTX, INTR: InterpreterTypes = EthInterpreter,
+                    FI = FrameInput, FR = FrameResult> {
+    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs)
+        -> Option<CallOutcome> { ... }
+    fn create_end(&mut self, context: &mut CTX, inputs: &CreateInputs,
+                  outcome: &mut CreateOutcome) { ... }
+    fn selfdestruct(&mut self, contract: Address, target: Address,
+                    value: U256) { ... }
+    // plus initialize_interp/step/step_end/log/log_full/
+    // frame_start/frame_end/call_end/create defaulted hooks
+}
+```
+
+Deltas vs. the candidate:
+
+- **Trait generics.** The trait is
+  `Inspector<CTX, INTR: InterpreterTypes = EthInterpreter, FI = FrameInput,
+  FR = FrameResult>`, not `Inspector<CTX>`. The three extra params all have
+  defaults, so the candidate's `impl<CTX> Inspector<CTX> for ValueInspector`
+  still compiles unchanged via the `EthInterpreter`/`FrameInput`/
+  `FrameResult` defaults. Kept as-is. (If a future caller needs a non-Eth
+  interpreter type, the impl must become generic over `INTR`/`FI`/`FR`.)
+- **`call` / `create_end` / `selfdestruct` signatures matched the candidate
+  exactly** — same parameter order, mutability, and `&mut CTX`/`&CreateInputs`/
+  `&mut CreateOutcome` shapes. `selfdestruct(contract, target, value: U256)`
+  is verbatim.
+- **`CreateInputs` fields are PRIVATE** (`caller`, `scheme`, `value`,
+  `init_code`, … are non-`pub`). The candidate's direct field access
+  (`i.value`, `i.caller`, `i.scheme`) does **not** compile. Switched to the
+  accessor methods: `inputs.value() -> U256`, `inputs.caller() -> Address`,
+  `inputs.scheme() -> CreateScheme`. (`CreateInputs` also exposes
+  `created_address(nonce)`, `init_code()`, `gas_limit()`, `reservoir()`.)
+- **`CreateScheme` import path moved.** It is **not** in `revm::interpreter`;
+  it lives in `revm::context_interface::CreateScheme` (defined in
+  `revm-context-interface 17.0.1` `src/cfg.rs`). Candidate imported it from
+  `revm::interpreter::CreateScheme` — corrected. Variants:
+  `Create`, `Create2 { salt: U256 }`, `Custom { address: Address }`. The
+  candidate's `CreateScheme::Create2 { .. }` match arm is correct (the new
+  `Custom` variant falls through the `_ => Create` arm, which is acceptable —
+  it is not CREATE2).
+- **`CallInputs` shape matched the candidate.** `value: CallValue` (public
+  field), `caller: Address`, `target_address: Address`, `scheme: CallScheme`
+  are all public. `CallValue::Transfer(U256)` / `CallValue::Apparent(U256)` —
+  only `Transfer` carries real transferable value; `Apparent` is what
+  DELEGATECALL/STATICCALL surface, so matching only `Transfer` correctly
+  excludes them (the candidate's `if let CallValue::Transfer(v)` is right).
+  `CallScheme::{Call, CallCode, DelegateCall, StaticCall}` — candidate's
+  `CallScheme::CallCode` arm is correct.
+- **`CreateOutcome.address` is `pub: Option<Address>`** — `outcome.address`
+  works as the candidate assumed.
+- **Import paths.** `CallInputs`, `CallOutcome`, `CallScheme`, `CallValue`,
+  `CreateInputs`, `CreateOutcome` are all re-exported from
+  `revm::interpreter::*` (revm 38 `pub use interpreter;` → revm-interpreter
+  35.0.1 `pub use interpreter_action::{...}`). `CreateScheme` is the only one
+  that comes from `revm::context_interface` instead.
+
+Net: the **pure capture core (`ValueInspector::push_frame` + `FrameKind`/
+`FrameMove`/`CapturedFrame`)** is verbatim per the plan and unchanged. The
+trait glue required exactly two corrections — `CreateInputs` accessor methods
+instead of private-field access, and the `CreateScheme` import path
+(`context_interface`, not `interpreter`) — plus awareness that the trait
+carries three defaulted generic params. Task 6.4 should expect to pass an
+`EthInterpreter`-typed context for the default impl to apply.
