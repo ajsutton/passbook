@@ -8,9 +8,13 @@ name: CI
 # plus the multi-stage Docker image builds + in-image smokes (Task 9.1).
 #
 # Trigger policy (this repo is public):
-#   * push      — only `main`. Feature-branch pushes do NOT build; CI starts
-#                  when a pull request is opened.
-#   * pull_request — builds the PR. Safety against untrusted fork PRs is
+#   * push to `main`  — full CI; images published to GHCR tagged with the
+#                  commit SHA.
+#   * push of a tag   — full CI; images published to GHCR tagged with the
+#                  git tag name (release version).
+#   * other branch pushes — do NOT build; CI starts when a PR is opened.
+#   * pull_request — builds + smokes only, never publishes. Safety against
+#                  untrusted fork PRs is
 #                  enforced OUTSIDE this file by the repository setting
 #                  Settings → Actions → General → "Fork pull request workflows
 #                  from outside collaborators" = "Require approval for all
@@ -22,6 +26,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['*']
   pull_request:
 
 # Least privilege. Fork-PR tokens are already read-only with no secret access;
@@ -83,8 +88,16 @@ jobs:
         run: cargo test --workspace --locked
 
   images:
-    name: docker images + smokes
+    name: docker images + smokes + publish
     runs-on: ubuntu-latest
+    # Job-level permissions REPLACE the top-level block, so contents:read must
+    # be restated. packages:write lets GITHUB_TOKEN push to this repo's GHCR
+    # namespace — no external registry secret needed. (On pull_request the
+    # token is read-only regardless; the publish steps are also `if`-gated to
+    # push events, so PRs never attempt a push.)
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -121,3 +134,39 @@ jobs:
 
       - name: Smoke — op-reth-passbook drop-in safety (runtime)
         run: bash scripts/smoke-dropin.sh op-reth-passbook:ci
+
+      # --- Publish (only after every build + smoke above has passed) ---------
+      # Runs ONLY on push events (push to `main` or a tag); never on
+      # pull_request. The images were already built+smoked above as
+      # `<bin>:ci`; we just retag and push them — no rebuild.
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Version selection (per spec):
+      #   * tag push       → image tag = the git tag name (release version)
+      #   * push to `main` → image tag = the full commit SHA
+      - name: Publish images to GHCR
+        if: github.event_name == 'push'
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # GHCR namespaces must be lowercase.
+          owner_lc="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${{ github.ref_name }}"
+          else
+            version="${{ github.sha }}"
+          fi
+          echo "Publishing version: ${version}"
+          for bin in reth-passbook op-reth-passbook; do
+            img="ghcr.io/${owner_lc}/${bin}"
+            docker tag "${bin}:ci" "${img}:${version}"
+            docker push "${img}:${version}"
+            echo "pushed ${img}:${version}"
+          done
