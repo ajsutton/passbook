@@ -89,14 +89,18 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
     let mut eth_in: std::collections::HashMap<Address, U256> = Default::default();
     let mut eth_out: std::collections::HashMap<Address, U256> = Default::default();
     for (tx, reverted, f) in &i.frames {
-        let fr = [f.clone()];
+        // Each frame carries its OWN (tx_hash, reverted), and
+        // `attribute_eth_frames` takes a single tx_hash/reverted for the
+        // whole slice, so we still attribute one frame at a time — but
+        // borrow it as a 1-element slice (`from_ref`) instead of cloning
+        // the `CapturedFrame` into a fresh array (issue #13).
         let rows = crate::attribution::attribute_eth_frames(
             i.chain_id,
             i.block_number,
             i.block_hash,
             *tx,
             *reverted,
-            &fr,
+            std::slice::from_ref(f),
             &i.watched,
         );
         for r in &rows {
