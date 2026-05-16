@@ -281,7 +281,22 @@ where
                 // Scope the MutexGuard so it is dropped BEFORE the await
                 // below (a guard held across `.await` is `!Send` and would
                 // also needlessly hold the ledger lock during the backoff).
-                let res = delete_blocks(ledger.lock().unwrap().conn_mut(), chain_id, &hashes);
+                //
+                // A POISONED mutex (some other holder — e.g. an RPC reader,
+                // issue #8 — panicked) must NOT panic the writer: that would
+                // crash the ExEx task with no retry/stall (spec lines
+                // 211-213) and let an RPC failure kill block processing
+                // (spec line 216). The single `Connection` is the only
+                // shared state and a SQLite write is one atomic
+                // `INSERT OR REPLACE`/`DELETE` transaction — a panicked
+                // reader leaves no half-applied writer state — so the guard
+                // is safely recovered (`into_inner`) and the loop continues
+                // exactly as for any other transient fault.
+                let res = delete_blocks(
+                    ledger.lock().unwrap_or_else(|e| e.into_inner()).conn_mut(),
+                    chain_id,
+                    &hashes,
+                );
                 match res {
                     Ok(()) => break,
                     Err(e) => {
@@ -338,7 +353,12 @@ where
                             // on natural PKs makes the replay idempotent.
                             // Scope the MutexGuard so it is dropped BEFORE
                             // any await below (held-across-await is `!Send`).
-                            let res = write_block(ledger.lock().unwrap().conn_mut(), &batch);
+                            // A poisoned mutex is recovered, never panicked
+                            // on — see the reorg-delete site above (#8).
+                            let res = write_block(
+                                ledger.lock().unwrap_or_else(|e| e.into_inner()).conn_mut(),
+                                &batch,
+                            );
                             match res {
                                 Ok(()) => break,
                                 Err(e) => {
@@ -372,9 +392,11 @@ where
                             // very block we are meant to be stalling on);
                             // just log and fall through to the same stall
                             // (sleep + retry) as the residual itself.
-                            if let Err(e) =
-                                write_unattributed(ledger.lock().unwrap().conn_mut(), &row)
-                            {
+                            // Poisoned mutex recovered, not panicked (#8).
+                            if let Err(e) = write_unattributed(
+                                ledger.lock().unwrap_or_else(|e| e.into_inner()).conn_mut(),
+                                &row,
+                            ) {
                                 tracing::error!(
                                     error = %e,
                                     block = bn,
@@ -765,6 +787,29 @@ mod tests {
                 format!("system:deposit_mint:{tx_b:#x}:{w:#x}"),
             ]
         );
+    }
+
+    /// Issue #8 (I4): a POISONED ledger mutex must NOT panic the writer.
+    /// `run_passbook` accesses the shared `Mutex<Ledger>` exclusively via
+    /// `lock().unwrap_or_else(|e| e.into_inner())` so a panicked OTHER
+    /// holder (e.g. an RPC reader) cannot crash the ExEx task — the guard
+    /// is recovered and the connection is still usable. Pre-fix the writer
+    /// used `lock().unwrap()` which panics here.
+    #[test]
+    fn poisoned_ledger_lock_recovers_instead_of_panicking() {
+        let m: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("holder panicked while holding the lock");
+        })
+        .join();
+        assert!(m.lock().is_err(), "precondition: the mutex is poisoned");
+        // The exact idiom run_passbook uses for every ledger access: it
+        // must yield a usable guard, never panic, on a poisoned mutex.
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        *g += 1;
+        assert_eq!(*g, 1, "recovered guard is fully usable");
     }
 
     #[test]

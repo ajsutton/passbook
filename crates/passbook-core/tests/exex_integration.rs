@@ -2040,6 +2040,142 @@ async fn fault_injected_db_write_error_stalls_without_advancing() {
     driver.abort();
 }
 
+// ── Issue #8 (I4) — a POISONED ledger mutex must STALL/recover, not crash ──
+
+/// I4 PROOF: if some OTHER holder of the shared `Arc<Mutex<Ledger>>` (e.g. an
+/// RPC reader — rpc.rs — or any task) panics while holding the lock, the
+/// mutex becomes POISONED. Pre-fix the writer's `ledger.lock().unwrap()`
+/// panicked on the poison, terminating the ExEx task: indexing permanently
+/// dead with no retry/stall (violating spec lines 211-213) and an RPC
+/// failure thereby killing block processing (violating spec line 216).
+///
+/// Post-fix the writer recovers the poisoned guard (`into_inner`) and the
+/// durable write proceeds normally. The block is perfectly ordinary and
+/// fully reconciled (the real `|| L1Adapter` pipeline, ZERO residual): with
+/// the poison recovered the writer MUST durably write it and emit
+/// `FinishedHeight` exactly as if the mutex had never been poisoned — the
+/// RPC-side panic is fully isolated from the writer.
+#[tokio::test(flavor = "multi_thread")]
+async fn poisoned_ledger_mutex_does_not_crash_writer() {
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address();
+    let watched = w_signer.address();
+
+    let chain_id = 0x8417u64;
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    alloc.insert(watched, acct(U256::ZERO, None));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    // A perfectly ordinary, fully-explainable block (S -> sink): the real
+    // L1 pipeline reconciles it to ZERO residual, so the ONLY thing under
+    // test is whether a poisoned mutex crashes the writer.
+    let tx = sign_legacy(
+        &s_signer,
+        chain_id,
+        0,
+        TxKind::Call(Address::repeat_byte(0x51)),
+        U256::from(1u64),
+        100_000,
+        1_000_000_000u128,
+        Bytes::new(),
+    );
+    let recovered = build_block(&chain_spec, 1, chain_spec.genesis_hash(), 12, vec![tx]);
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let exec_out = evm_config
+        .executor(genesis_state(&chain_spec))
+        .execute(&recovered)
+        .expect("block execution");
+    let outcome = ExecutionOutcome::single(1, exec_out);
+    let chain = Chain::new(
+        vec![recovered.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
+
+    let ledger = Arc::new(Mutex::new(
+        Ledger::open(&db_path, chain_id).expect("ledger open"),
+    ));
+
+    // POISON the shared mutex BEFORE the writer ever runs: a panic in
+    // another thread while it holds the lock (faithful stand-in for a
+    // panicking RPC reader, rpc.rs, the issue #8 scenario).
+    let l2 = ledger.clone();
+    let _ = std::thread::spawn(move || {
+        let _g = l2.lock().unwrap();
+        panic!("RPC reader panicked while holding the ledger lock");
+    })
+    .join();
+    assert!(
+        ledger.lock().is_err(),
+        "precondition: the shared ledger mutex is poisoned"
+    );
+
+    let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let driver = tokio::spawn(passbook_core::exex::run_passbook(
+        ctx,
+        cfg.clone(),
+        ledger.clone(),
+        || L1Adapter,
+    ));
+    handle
+        .send_notification_chain_committed(chain)
+        .await
+        .expect("send committed");
+
+    // Give the (poison-recovered) writer time to durably write + advance.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // (a) the driver did NOT panic/exit on the poisoned mutex (pre-fix:
+    //     `lock().unwrap()` panicked, the task died here).
+    assert!(
+        !driver.is_finished(),
+        "run_passbook must NOT crash on a poisoned ledger mutex (#8)"
+    );
+
+    // (b) FinishedHeight WAS emitted — the poison was recovered and the
+    //     block durably written, so the writer advances normally. The
+    //     RPC-side panic is fully isolated from block processing
+    //     (spec line 216).
+    let mut emitted_finished = false;
+    while let Ok(ev) = handle.events_rx.try_recv() {
+        if matches!(ev, reth_ethereum::exex::ExExEvent::FinishedHeight(_)) {
+            emitted_finished = true;
+        }
+    }
+    assert!(
+        emitted_finished,
+        "writer must recover the poisoned mutex and emit FinishedHeight (#8)"
+    );
+
+    // (c) the block was actually durably written despite the poison.
+    {
+        let g = ledger.lock().unwrap_or_else(|e| e.into_inner());
+        let last: Option<String> = g
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
+            .ok();
+        assert_eq!(
+            last.as_deref(),
+            Some("1"),
+            "meta.last_block must advance to the durably-written block (got {last:?})"
+        );
+    }
+
+    driver.abort();
+}
+
 /// Issue #4 (C3): a single block where BOTH parties of an ERC20 transfer
 /// AND both parties of a native ETH transfer are watched.
 ///
