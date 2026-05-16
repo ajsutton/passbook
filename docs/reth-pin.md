@@ -811,3 +811,73 @@ by jsonrpsee 0.26, above). The `kind` filter still selects the *category*
 `kind` sub-values (`top_level`/`internal`/`system`) are surfaced verbatim in
 the output `kind` field and were never used as a filter value (behaviour
 preserved).
+
+## reth-optimism-evm L1-fee API (Task 8.2, for 8.5)
+
+Verified by reading the pinned source at optimism monorepo rev
+`27bf9194a08aef70f3fdbff6b3d04bdd70af62ff` (crate `reth-optimism-evm`,
+`reth-op 1.11.3`). File: `rust/op-reth/crates/evm/src/l1.rs`, accessed via
+the local mirror `.vendor/optimism/rust/op-reth/crates/evm/src/l1.rs` (also
+present at `~/.cargo/git/checkouts/optimism-*/.../crates/evm/src/l1.rs`).
+`lib.rs:56-57` does `pub mod l1; pub use l1::*;` so everything below is
+reachable as `reth_optimism_evm::<name>` (the `l1::` prefix is optional).
+
+**Extract L1 block info (once per L2 block):**
+
+```text
+// l1.rs:25
+pub fn reth_optimism_evm::extract_l1_info<B>(body: &B)
+    -> Result<op_revm::L1BlockInfo, reth_optimism_evm::OpBlockExecutionError>
+where B: reth_primitives_traits::BlockBody
+```
+
+Returns `Err(OpBlockExecutionError::L1BlockInfo(L1BlockInfoError::MissingTransaction))`
+on an empty block. The L1-info transaction is always tx index 0 of the L2
+block. Variant also available: `extract_l1_info_from_tx::<T: alloy_consensus::Transaction>(tx: &T)`
+(`l1.rs:37`) and `parse_l1_info(input: &[u8])` (`l1.rs:57`).
+
+**Per-tx L1 data fee (trait `RethL1BlockInfo`, `l1.rs:295`; impl for
+`op_revm::L1BlockInfo` at `l1.rs:325`):**
+
+```text
+fn reth_optimism_evm::RethL1BlockInfo::l1_tx_data_fee(
+    &mut self,
+    chain_spec: impl reth_optimism_forks::OpHardforks,
+    timestamp: u64,
+    input: &[u8],          // EIP-2718 encoded raw tx bytes (tx.encoded_2718())
+    is_deposit: bool,
+) -> Result<alloy_primitives::U256, reth_execution_errors::BlockExecutionError>
+```
+
+- `is_deposit == true` short-circuits to `Ok(U256::ZERO)` (`l1.rs:333`) —
+  so deposit txs (incl. the index-0 L1-info tx) have **zero** L1 data fee;
+  Passbook records these as `None` (not present), not `Some(0)`.
+- Receiver is `&mut self` (the call mutates cached state in `L1BlockInfo`),
+  so the extracted `L1BlockInfo` must be held `mut` and reused across the
+  block's txs.
+- `input` is the **2718-encoded** raw tx (confirmed by the crate's own test
+  `l1.rs:402-424`, which decodes a 2718 tx and feeds it through). Use
+  `alloy_eips::eip2718::Encodable2718::encoded_2718(&tx)`.
+- Sibling `l1_data_gas(&self, chain_spec, timestamp, input)` (`l1.rs:317`)
+  returns the data-gas component only — not needed for Passbook.
+
+**Inputs Task 8.5 must obtain:** the committed block (`block.body` for
+`extract_l1_info`, `block.header.timestamp` for `timestamp`, per-tx
+`tx.is_deposit()` + `tx.encoded_2718()`), and the OP chain spec (an
+`Arc<OpChainSpec>` from the node context; `OpChainSpec: OpHardforks`).
+
+**Why no compiling end-to-end helper in `passbook-stack-optimism`:** the
+fully-typed signature names `op_revm::L1BlockInfo`, `reth_optimism_forks::OpHardforks`
+and `reth_execution_errors::BlockExecutionError`. Those are NOT direct
+dependencies of `passbook-stack-optimism` (deps are only `passbook-core`,
+`reth-optimism-evm`, `alloy-primitives`, `alloy-consensus`), and adding them
+would mutate the committed `Cargo.lock` (forbidden for Task 8.2). They ARE
+reachable at the Task 8.5 OP-binary call site, where the concrete
+`OpChainSpec` type is in scope. Task 8.2 therefore ships:
+`passbook_stack_optimism::build_block_l1_fee_table(txs: impl IntoIterator<Item=(bool /*is_deposit*/, Vec<u8> /*raw_2718*/)>, fee_of: impl FnMut(&[u8]) -> Option<U256>) -> OptimismStack`
+— it owns the deposit→`None` rule and the positional-table construction;
+Task 8.5 only supplies `fee_of` as a closure wrapping
+`l1_block_info.l1_tx_data_fee(&chain_spec, ts, raw, false).ok()` (deposits
+are already filtered to `None` by `build_block_l1_fee_table`). Then
+`OptimismStack::from_fees`/`build_block_l1_fee_table` feeds
+`passbook_core::stack::StackAdapter`. No re-discovery needed for 8.5.
