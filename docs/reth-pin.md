@@ -200,6 +200,37 @@ These ARE the plan's predicted baseline (`revm 38.0.0`,
 revm inspector, Task 3.1, and EVM frame attribution, Task 4.3) are written
 against these exact APIs — no API-version delta vs the plan.
 
+## Workspace third-party pins
+
+Task 0.2 turned the root `Cargo.toml [workspace.dependencies]` into the
+single pin table for the whole project. The alloy / jsonrpsee versions are
+NOT floated — they are pinned to the **exact versions the reth v2.2.0 graph
+already resolved** in the committed `Cargo.lock`. A mismatched alloy/revm
+version causes `E0119` trait-coherence breakage, so these must track the
+locked graph.
+
+| Crate | Pinned in `[workspace.dependencies]` | Cargo.lock evidence |
+|-------|--------------------------------------|---------------------|
+| `alloy-primitives` | `1.6.0` | sole `alloy-primitives` entry in `Cargo.lock` is `1.6.0` |
+| `alloy-consensus` | `2.0.4` | sole `alloy-consensus` entry is `2.0.4` |
+| `alloy-eips` | `2.0.4` | `Cargo.lock` has `1.8.3` and `2.0.4`; the reth v2.2.0 / `alloy-consensus 2.0.4` graph uses the `2.x` line (`alloy-consensus 2.0.4` → `alloy-eips 2.0.4`), so we pin the `2.0.4` major |
+| `jsonrpsee` | `0.26.0` (features `server`, `macros`) | `jsonrpsee`, `jsonrpsee-server`, `jsonrpsee-core` all resolve to `0.26.0` |
+| `async-trait` | `0.1` | resolved `0.1.89` (kept loose `0.1`, semver-compatible) |
+| `clap` | `4` | resolved `4.6.1` |
+| `tokio` | `1` | resolved `1.52.3` |
+| `tracing` | `0.1` | resolved `0.1.44` |
+| `thiserror` | `2` | `Cargo.lock` has `1.0.69` and `2.0.18`; we pin the `2` major (`2.0.18` present) |
+| `serde` | `1` | resolved `1.0.228` |
+| `tempfile` | `3` (dev) | resolved `3.27.0` |
+| `rusqlite` | `0.37` (feature `bundled`) | NOT in `Cargo.lock` yet — no member depends on it until Task 1.x. Adding it to the pin table does not change resolution; it enters the lock when the first member uses it. `0.37` chosen as a conservative stable line. |
+| `reth-optimism-evm` | monorepo `27bf9194…` | already in `Cargo.lock` at `1.11.3` from the optimism git source (needed later by the OP stack adapter, Task 8.2) |
+| `reth-exex-test-utils` | paradigmxyz/reth `88505c7…` | NOT in `Cargo.lock` yet — dev-dep used by passbook-core integration tests (Task 6.5); enters the lock when that member uses it. Pinned to the same rev as `reth-ethereum` so it stays in the unified reth v2.2.0 graph. |
+
+Adding entries to `[workspace.dependencies]` that no current member uses
+does not alter resolution or the lockfile — `cargo build -p spike --locked`
+stays green and `Cargo.lock` is unchanged. Later tasks add the members that
+actually consume these pins.
+
 ## Resolution notes (committed `Cargo.lock`)
 
 `Cargo.lock` is committed and load-bearing — always build `--locked`.
