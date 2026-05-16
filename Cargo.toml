@@ -4,7 +4,14 @@ resolver = "2"
 # crates (passbook-core, the stack crates, the bin crates) and adds each one
 # to this list as it is created. Do NOT add members that do not exist yet —
 # listing a nonexistent member breaks `cargo metadata` / `--locked`.
-members = ["crates/spike"]
+members = [
+    "crates/spike",
+    "crates/passbook-core",
+    "crates/passbook-stack-ethereum",
+    "crates/passbook-stack-optimism",
+    "crates/bin/reth-passbook",
+    "crates/bin/op-reth-passbook",
+]
 
 [workspace.package]
 edition = "2021"
