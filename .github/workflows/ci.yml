@@ -48,12 +48,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Pinned toolchain — matches rust-toolchain.toml channel 1.95.0 and its
       # rustfmt + clippy components (the gates below need both).
       - name: Install pinned Rust 1.95.0
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: rustfmt, clippy
 
@@ -63,7 +63,7 @@ jobs:
       # `--locked` still fails the build if anything would change it. The
       # reth/optimism git compile is very long, so this materially speeds reruns.
       - name: Cache cargo registry + git
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index
@@ -109,7 +109,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # The Dockerfile self-seeds (its build stage runs scripts/seed-vendor.sh),
       # so no host seed step is needed for this job.
@@ -150,7 +150,7 @@ jobs:
       # `<bin>:ci`; we just retag and push them — no rebuild.
       - name: Log in to GitHub Container Registry
         if: github.event_name == 'push'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
