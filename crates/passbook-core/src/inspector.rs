@@ -17,7 +17,7 @@ pub struct CapturedFrame {
 /// Pure capture buffer. `push_frame` is called by the revm Inspector glue
 /// (Step 5) for every value-bearing sub-call; DELEGATECALL/STATICCALL never
 /// reach here because they carry no transferable value.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ValueInspector { seq: u64, frames: Vec<CapturedFrame> }
 
 impl ValueInspector {
@@ -29,6 +29,11 @@ impl ValueInspector {
             from: m.from, to: m.to, value: m.value, kind: m.kind, trace_path });
     }
     pub fn into_frames(self) -> Vec<CapturedFrame> { self.frames }
+
+    /// Number of frames captured so far (used by the ExEx re-execution
+    /// wrapper to detect whether a given `call`/`create`/`selfdestruct`
+    /// hook produced a value-bearing frame).
+    pub fn frame_count(&self) -> usize { self.frames.len() }
 }
 
 // ── revm 38 `Inspector` trait glue ─────────────────────────────────────────

@@ -90,6 +90,14 @@ eyre = "0.6"
 
 # ── dev-dependencies ────────────────────────────────────────────────────────
 tempfile = "3"
+# Pinned to the exact versions the reth v2.2.0 graph already resolved in
+# Cargo.lock (both are pulled transitively by reth-exex-test-utils' alloy
+# stack), so adding them as dev-deps does NOT change Cargo.lock. Used only
+# by the passbook-core ExEx integration test (Task 6.4) to build a real,
+# signed, executable synthetic block + genesis allocation.
+alloy-signer-local = "2.0.4"
+alloy-network = "2.0.4"
+alloy-genesis = "2.0.4"
 
 [profile.release]
 lto = "thin"

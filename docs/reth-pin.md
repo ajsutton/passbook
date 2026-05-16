@@ -539,3 +539,147 @@ replaces the stub: it will need to name the concrete reth types (likely
 `reth_ethereum::primitives` `RecoveredBlock`) and add the real trait
 bounds, plus thread the revm `ValueInspector` (see "revm 38 API deltas",
 `EthInterpreter`-typed context).
+
+## reth v2.2.0 re-execution / test-utils API (Task 6.4)
+
+How the real per-committed-block pipeline + integration harness were
+wired against pinned reth **v2.2.0** (`paradigmxyz/reth` `88505c7…`),
+and the deltas vs the research idioms. **Load-bearing for Tasks
+6.5 / 8.4 / 8.5** (the L1/OP binaries reuse this body verbatim; only the
+`make_adapter` closure differs).
+
+### Final signatures (confined to `crates/passbook-core/src/exex.rs`)
+
+```rust
+pub async fn run_passbook<Node, S>(
+    mut ctx: ExExContext<Node>,
+    cfg: PassbookConfig,
+    ledger: Arc<Mutex<Ledger>>,
+    make_adapter: impl Fn() -> S + Send + Sync + 'static,
+) -> eyre::Result<()>
+where
+    Node: FullNodeComponents,
+    Node::Types: NodeTypes<Primitives = EthPrimitives, ChainSpec = ChainSpec>,
+    S: StackAdapter;
+
+async fn process_one_committed_block<Node, S>(
+    ctx: &ExExContext<Node>,
+    chain: &reth_ethereum::provider::Chain,                              // = Chain<EthPrimitives>
+    block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
+    cfg: &PassbookConfig,
+    make_adapter: &(impl Fn() -> S + Send + Sync + 'static),
+) -> Result<BlockBatch, ProcessingError>
+where Node: FullNodeComponents,
+      Node::Types: NodeTypes<Primitives = EthPrimitives, ChainSpec = ChainSpec>,
+      S: StackAdapter;
+
+// Node-agnostic, ExExContext-free core (unit-testable; reused by 8.x):
+#[doc(hidden)]
+pub fn process_committed_block_inner<S: StackAdapter>(
+    chain_id: u64,
+    chain_spec: Arc<reth_ethereum::chainspec::ChainSpec>,
+    chain: &reth_ethereum::provider::Chain,
+    block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
+    cfg: &PassbookConfig,
+    adapter: &S,
+) -> Result<BlockBatch, ProcessingError>;
+```
+
+- **`make_adapter` refined** from the Task 6.3 placeholder to
+  `impl Fn() -> S + Send + Sync + 'static` (a fresh adapter per block).
+  The L1 binary (8.4) passes e.g. `|| EthereumStack`, the OP binary
+  (8.5) a closure producing an `OpStack`. Call site in `run_passbook`
+  unchanged except it now passes `chain.as_ref()` (committed_chain is
+  `Arc<Chain>`; the fn takes `&Chain`).
+- **Node bound narrowed**: `Node::Types: NodeTypes<Primitives =
+  EthPrimitives, ChainSpec = ChainSpec>`. `notification.committed_chain()`
+  is `Arc<Chain<E::Primitives>>`; naming the concrete `Chain`
+  (`= Chain<EthPrimitives>`) + `RecoveredBlock<reth_ethereum::Block>`
+  (research idiom #1 came true) requires fixing the primitives. The
+  node-generic ExEx-loop body itself is unchanged; this only constrains
+  the EVM/primitive set to the Ethereum one (the OP binary, 8.5, will
+  supply its own equivalent — the loop scaffold remains shared).
+
+### Verified provider / EVM / executor API + deltas vs research idioms
+
+| Concern | Research idiom | What v2.2.0 actually needs |
+|---|---|---|
+| chain id | `ctx.config.chain.chain().id()` | `ctx.config.chain.chain_id()` + `use reth_ethereum::chainspec::EthChainSpec;` (already recorded Task 6.3) |
+| per-block split | `chain.execution_outcome_at_block(n)` | **exact**: `reth_ethereum::provider::Chain::execution_outcome_at_block(n) -> Option<ExecutionOutcome>` (early-returns the full outcome when `n == tip`, else `clone().revert_to(n)`). Used verbatim. |
+| receipts/logs | `chain.blocks_and_receipts()` | `ExecutionOutcome::receipts_by_block(n) -> &[Receipt]`; `Receipt = alloy_consensus::EthereumReceipt` with **public** `cumulative_gas_used: u64`, `logs: Vec<alloy_primitives::Log>`, `success: bool`. `log.topics()` / `log.data.data`. |
+| bundle deltas / gate | `outcome.bundle_accounts_iter()` → `.original_info`/`.info` | **exact**: `bundle_accounts_iter() -> (Address, &BundleAccount)`; `BundleAccount.original_info` / `.info` are `Option<AccountInfo>` (revm-database 13.0.1); balance/nonce delta + gate from these. |
+| header accessors | `block.header().number()` etc | need `use alloy_consensus::{BlockHeader, Transaction};` in scope — `.number()`, `.base_fee_per_gas()`, `tx.effective_gas_price(base_fee)` are trait methods (`E0599` without the import). |
+| tx hash / sender | — | `block.body().transactions[i].tx_hash()`; `block.transactions_with_sender() -> (&Address, &TxSigned)` (recovered senders). |
+| re-exec EVM config | use `ctx`'s `ConfigureEvm` | **CRITICAL DELTA**: under the ExEx **test harness** `ctx.evm_config()` / the node's `ConfigureEvm` is `MockEvmConfig = NoopEvmConfig<EthEvmConfig>` whose `inner()` is `unimplemented!()` — calling it panics. Re-execution therefore builds a **fresh real `EthEvmConfig::new(ctx.config.chain.clone())`** from the chain spec, never `ctx.evm_config()`. (Production `ctx.evm_config()` would work but the chain-spec path is correct for both and harness-safe.) |
+| pre-state for re-exec | state provider at `block.parent_hash()` via `StateProviderDatabase` | **DELTA / improvement**: re-execution is made **self-contained** — the pre-block account/storage/bytecode state is rebuilt from the committed `ExecutionOutcome`'s own `BundleState` (`bundle.state[*].original_info`, per-slot `previous_or_original_value`, `bundle.contracts[code_hash]`) into a `revm::database::CacheDB<EmptyDB>` wrapped in `revm::database::State::builder().with_database(..).with_bundle_update().build()`. Pruning-independent, needs **no** historical `StateProviderFactory` — and works identically in the test harness (whose provider only has genesis) and production. |
+| inspector-driven block exec | `evm_config.create_executor(evm_with_env_and_inspector(..), context_for_block(..)).execute_block(block.transactions_recovered())` | **CRITICAL DELTA**: that `BlockExecutor::execute_block` path uses `EthEvm::transact` whose nested call frames do **NOT** fire `Inspector::call`/`create` — only the top-level tx call is inspected, so **internal value transfers are never captured**. The correct primitive is reth's own block-trace path: `evm_config.evm_factory().create_tracer(&mut state, evm_env, inspector).try_trace_many(block.transactions_recovered(), |ctx| …).commit_last_tx()` (`EvmFactoryExt`/`TxTracer` from `reth_ethereum::evm::primitives::{evm::EvmFactoryExt, tracing::TracingCtx}`). `TxTracer`'s `transact_commit` routes through revm's `inspect_run` so every nested CALL/CREATE/SELFDESTRUCT frame fires the inspector. Pre-execution system changes (Cancun beacon root etc.) are applied first via `evm_config.create_executor(evm_with_env(&mut state, evm_env.clone()), context_for_block(block.sealed_block())?).apply_pre_execution_changes()`. `ConfigureEvm`/`EvmFactory`/`BlockExecutor`/`Executor` traits must be in scope. |
+| inspector `Clone` | — | `ValueInspector` + the `TaggingInspector` wrapper must be `Clone` (the tracer clones/fuses the inspector between txs; per-tx index is known from `try_trace_many`, so the wrapper only tracks per-tx call depth to mark top-level vs internal). |
+| frame tagging | mark `tx:<i>` top-level, seq path internal | top-level (tx depth-0) frame's `trace_path` rewritten to `"tx:<i>"` (→ attribution `EthKind::TopLevel`); nested frames keep the `ValueInspector` seq path (→ `EthKind::Internal`). |
+
+### revm 38 internal-frame capture caveat (load-bearing)
+
+A plain value-bearing `CALL` to a **codeless account** (an ordinary EOA
+wallet) is resolved by revm 38 without surfacing a nested
+`Inspector::call` frame — even via the correct `inspect_run`/tracer path
+(empirically: only the top-level tx call fires; `revm-handler 14.1.0`
+`make_call_frame` early-returns `Stop` for empty bytecode). Consequences:
+
+- **CREATE / CREATE2 / SELFDESTRUCT value transfers, and CALLs whose
+  target has code, ARE captured** (their frames carry an interpreter /
+  fire `selfdestruct`). Contract→contract internal ETH and
+  selfdestruct-to-EOA are fully attributed.
+- A bare contract→EOA value `CALL` is *not* individually surfaced as an
+  internal frame at this stack version. Net wei still reconciles (the
+  BundleState delta is exact); it would land as residual only if it were
+  the *sole* unexplained flow. **Tasks 6.5 / 8.x must treat
+  internal-ETH-to-EOA-via-plain-CALL as a known revm-38 limitation**; if
+  precise attribution of that case is later required, revisit on a revm
+  bump or add a balance-diff fallback attributor.
+- The Task 6.4 integration test therefore exercises the internal-ETH leg
+  via a `SELFDESTRUCT`-forwarding contract (reliably fires
+  `Inspector::selfdestruct` with the beneficiary = watched `W`), which is
+  a genuine value-bearing internal frame end-to-end.
+
+### `reth_exex_test_utils` API used (pinned v2.2.0)
+
+- `test_exex_context_with_chain_spec(Arc<ChainSpec>) -> (ExExContext<Adapter>, TestExExHandle)`
+  (and `test_exex_context()` = mainnet). The harness EVM is
+  `MockEvmConfig` (see CRITICAL DELTA above) and `init_genesis` only
+  seeds genesis — re-execution must be self-contained (it is).
+- **`ctx.config` is built from `NodeConfig::test()` (default mainnet
+  spec), NOT from the `chain_spec` argument.** For an end-to-end
+  `run_passbook` drive against a custom chain spec the test sets
+  `ctx.config.chain = chain_spec` (field is `pub Arc<ChainSpec>`) so
+  `run_passbook`'s `ctx.config.chain.chain_id()` + re-exec hardforks
+  match the committed block. In production `ctx.config.chain` is already
+  the node's real spec; **8.4/8.5 need no such override**.
+- `TestExExHandle::send_notification_chain_committed(Chain)` (consumes a
+  `Chain`); `handle.events_rx: UnboundedReceiver<ExExEvent>` polled for
+  `ExExEvent::FinishedHeight(BlockNumHash)`.
+- The synthetic `Chain` is built by **genuinely executing** a hand-built
+  Shanghai block: `EthEvmConfig::new(spec).executor(state).execute(&recovered_block)`
+  → `BlockExecutionOutput`; `ExecutionOutcome::single(1, out)`;
+  `Chain::new(vec![recovered], outcome, BTreeMap::new())` (empty
+  `trie_data` is fine — `execution_outcome_at_block(tip)` early-returns
+  before touching it). Because BundleState + receipts come from one real
+  execution, reconciliation is consistent **by construction**.
+- Block built with `alloy_consensus::{Block, BlockBody, Header}` +
+  `RecoveredBlock::try_recover`; txs signed with
+  `alloy_signer_local::PrivateKeySigner` +
+  `alloy_network::TxSignerSync::sign_transaction_sync`; genesis via
+  `alloy_genesis::{Genesis, GenesisAccount, ChainConfig}` →
+  `ChainSpec::from_genesis`. The default test-utils notifications stream
+  is **`WithoutHead`** (no `with_head`), so it passes the committed
+  `Chain` straight through without backfill — the synthetic chain need
+  not be in the provider DB.
+
+### Dev-dependencies added (Cargo.lock impact: 3 lines, justified)
+
+`alloy-signer-local`, `alloy-network`, `alloy-genesis` (all `= "2.0.4"`,
+the exact versions the reth v2.2.0 graph already resolved — pulled
+transitively by `reth-exex-test-utils`' alloy stack). Added to the pin
+table + `passbook-core` `[dev-dependencies]`; `cargo update -p
+passbook-core --offline` locked **0 packages** (no version/rev change) —
+the only `Cargo.lock` change is the 3 new dependency-edge lines under the
+`passbook-core` package entry. `--locked` stays green; pinned reth/op
+revs untouched.

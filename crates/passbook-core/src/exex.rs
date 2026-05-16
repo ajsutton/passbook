@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use futures::TryStreamExt;
 use reth_ethereum::exex::{ExExContext, ExExEvent};
-use reth_ethereum::node::api::FullNodeComponents;
-use reth_ethereum::chainspec::EthChainSpec;
+use reth_ethereum::node::api::{FullNodeComponents, NodeTypes};
+use reth_ethereum::chainspec::{EthChainSpec, ChainSpec};
+use reth_ethereum::EthPrimitives;
 use crate::config::PassbookConfig;
 use crate::stack::StackAdapter;
 use crate::ledger::Ledger;
@@ -119,6 +120,7 @@ pub async fn run_passbook<Node, S>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
+    Node::Types: NodeTypes<Primitives = EthPrimitives, ChainSpec = ChainSpec>,
     S: StackAdapter,
 {
     let chain_id = ctx.config.chain.chain_id();
@@ -136,7 +138,7 @@ where
                 let mut backoff = BACKOFF_START;
                 loop {
                     match process_one_committed_block(
-                        &ctx, &chain, block, &cfg, &make_adapter,
+                        &ctx, chain.as_ref(), block, &cfg, &make_adapter,
                     )
                     .await
                     {
@@ -193,27 +195,432 @@ where
     Ok(())
 }
 
-/// Per-committed-block pipeline: assemble `BlockInputs` from the block's
-/// execution (inspector frames, ERC20 logs, gas, state deltas) and run the
-/// pure `process_block`. Wired and asserted by integration test Task 6.4.
+/// Per-committed-block pipeline: assemble `BlockInputs` from the committed
+/// block's execution (ERC20 logs + receipts, per-block BundleState deltas,
+/// gas, and — gated on a watched balance/nonce change — `ValueInspector`
+/// frames from a self-contained re-execution) and run the pure
+/// `process_block`. Wired and asserted by integration test Task 6.4.
 ///
-/// `C`/`B` are the reth `Chain<N>` / `RecoveredBlock<N::Block>` types as
-/// produced by `notification.committed_chain()` / `chain.blocks_iter()`;
-/// kept as inferred generics so the signature matches the call site at
-/// every node primitive set without naming the upstream generics here
-/// (the concrete bounds land in Task 6.4 when the body is written).
-async fn process_one_committed_block<Node, S, C, B>(
-    _ctx: &ExExContext<Node>,
-    _chain: &C,
-    _block: &B,
-    _cfg: &PassbookConfig,
-    _make_adapter: &(impl Fn() -> S + Send + Sync + 'static),
+/// Re-execution is **self-contained**: it rebuilds the exact pre-block
+/// account/storage/bytecode state from the committed chain's own
+/// `BundleState` (`original_info`, `previous_or_original_value`,
+/// `contracts`) into an in-memory `CacheDB<EmptyDB>`, so it is
+/// pruning-independent and needs no historical state provider. The
+/// production binary (Tasks 8.4/8.5) re-uses this body unchanged; the
+/// chain spec for the EVM is taken from `ctx.config.chain` (NOT
+/// `ctx.evm_config()`, which is a panicking no-op under the ExEx test
+/// harness — see docs/reth-pin.md, Task 6.4 section).
+///
+/// `chain` / `block` are the concrete reth v2.2.0 execution-types
+/// `Chain` (`EthPrimitives`) and `RecoveredBlock<Block>` produced by
+/// `notification.committed_chain()` / `chain.blocks_iter()`.
+async fn process_one_committed_block<Node, S>(
+    ctx: &ExExContext<Node>,
+    chain: &reth_ethereum::provider::Chain,
+    block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
+    cfg: &PassbookConfig,
+    make_adapter: &(impl Fn() -> S + Send + Sync + 'static),
 ) -> Result<BlockBatch, ProcessingError>
 where
     Node: FullNodeComponents,
+    Node::Types: NodeTypes<Primitives = EthPrimitives, ChainSpec = ChainSpec>,
     S: StackAdapter,
 {
-    todo!("wired + asserted by integration test Task 6.4")
+    use reth_ethereum::chainspec::EthChainSpec;
+    let chain_id = ctx.config.chain.chain_id();
+    process_committed_block_inner(
+        chain_id,
+        ctx.config.chain.clone(),
+        chain,
+        block,
+        cfg,
+        &make_adapter(),
+    )
+}
+
+/// Node-agnostic core of [`process_one_committed_block`]: takes the
+/// resolved `chain_id` + chain spec explicitly so it is unit-testable
+/// without an `ExExContext` (and re-usable verbatim by Tasks 8.4/8.5).
+#[doc(hidden)]
+// Faithful per-block pipeline signature (resolved chain id + spec passed
+// explicitly so it is unit-testable without an ExExContext); grouping
+// these into a struct would only obscure the call site.
+#[allow(clippy::too_many_arguments)]
+pub fn process_committed_block_inner<S: StackAdapter>(
+    chain_id: u64,
+    chain_spec: std::sync::Arc<ChainSpec>,
+    chain: &reth_ethereum::provider::Chain,
+    block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
+    cfg: &PassbookConfig,
+    adapter: &S,
+) -> Result<BlockBatch, ProcessingError> {
+    use alloy_consensus::{BlockHeader, Transaction};
+
+    let block_number = block.header().number();
+    let block_hash = block.hash();
+    let base_fee = block.header().base_fee_per_gas();
+    let watched = &cfg.watched;
+
+    // Per-block execution outcome (the committed `Chain` bundle is a
+    // MULTI-block aggregate; split to THIS block only so deltas/receipts
+    // are for this block).
+    let outcome = chain
+        .execution_outcome_at_block(block_number)
+        .ok_or(ProcessingError::Decode { block: block_number })?;
+
+    // ── (1) ERC20: receipts + logs for THIS block (always, no tracing).
+    let mut erc20_logs: Vec<(Option<B256>, u64, RawLog)> = Vec::new();
+    {
+        let receipts = outcome.receipts_by_block(block_number);
+        let mut log_index: u64 = 0;
+        for (tx_idx, receipt) in receipts.iter().enumerate() {
+            let tx_hash = block
+                .body()
+                .transactions
+                .get(tx_idx)
+                .map(|t| *t.tx_hash());
+            for log in &receipt.logs {
+                erc20_logs.push((
+                    tx_hash,
+                    log_index,
+                    RawLog {
+                        address: log.address,
+                        topics: log.topics().to_vec(),
+                        data: log.data.data.clone(),
+                    },
+                ));
+                log_index += 1;
+            }
+        }
+    }
+
+    // ── (2) Gate: per-block BundleState old/new balances for watched.
+    //   account_deltas := signed wei delta for every watched account that
+    //   changed this block; `changed` gates the re-execution path.
+    let mut account_deltas: Vec<(Address, i128)> = Vec::new();
+    let mut any_watched_changed = false;
+    for (addr, acct) in outcome.bundle_accounts_iter() {
+        if !watched.contains(&addr) {
+            continue;
+        }
+        let old_bal = acct
+            .original_info
+            .as_ref()
+            .map(|i| i.balance)
+            .unwrap_or(U256::ZERO);
+        let new_bal = acct.info.as_ref().map(|i| i.balance).unwrap_or(U256::ZERO);
+        let old_nonce = acct.original_info.as_ref().map(|i| i.nonce).unwrap_or(0);
+        let new_nonce = acct.info.as_ref().map(|i| i.nonce).unwrap_or(0);
+        if old_bal != new_bal || old_nonce != new_nonce {
+            any_watched_changed = true;
+        }
+        let delta = i128::try_from(new_bal)
+            .map_err(|_| ProcessingError::Decode { block: block_number })?
+            - i128::try_from(old_bal)
+                .map_err(|_| ProcessingError::Decode { block: block_number })?;
+        account_deltas.push((addr, delta));
+    }
+
+    // ── (3) Gated re-execution → ValueInspector frames.
+    let mut frames: Vec<(Option<B256>, bool, CapturedFrame)> = Vec::new();
+    if any_watched_changed {
+        let captured = reexec::reexecute_block_frames(
+            chain_spec.clone(),
+            &outcome,
+            block,
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, block = block_number, "re-execution failed");
+            ProcessingError::Decode { block: block_number }
+        })?;
+        // Tag top-level (depth-0 / call originating from a tx) frames so
+        // attribution records kind=TopLevel; internal frames keep the
+        // inspector's sequence path → kind=Internal.
+        for cf in captured.frames {
+            let tx_hash = captured
+                .tx_hashes
+                .get(cf.tx_index)
+                .copied()
+                .flatten();
+            let reverted = captured
+                .tx_reverted
+                .get(cf.tx_index)
+                .copied()
+                .unwrap_or(false);
+            let mut frame = cf.frame;
+            if cf.top_level {
+                frame.trace_path = format!("tx:{}", cf.tx_index);
+            }
+            frames.push((tx_hash, reverted, frame));
+        }
+    }
+
+    // ── (4) Gas: per tx whose sender ∈ watched (even if reverted).
+    let mut gas: Vec<GasPaymentRow> = Vec::new();
+    {
+        let receipts = outcome.receipts_by_block(block_number);
+        let mut prev_cumulative: u64 = 0;
+        for (tx_idx, (sender, tx)) in block.transactions_with_sender().enumerate() {
+            let receipt = match receipts.get(tx_idx) {
+                Some(r) => r,
+                None => break,
+            };
+            let gas_used = receipt
+                .cumulative_gas_used
+                .saturating_sub(prev_cumulative);
+            prev_cumulative = receipt.cumulative_gas_used;
+            if !watched.contains(sender) {
+                continue;
+            }
+            let effective_gas_price = tx.effective_gas_price(base_fee);
+            let l1_fee = adapter.l1_data_fee_wei(tx_idx);
+            gas.push(crate::attribution::compute_gas_payment(
+                crate::attribution::GasInput {
+                    chain_id,
+                    block_number,
+                    block_hash,
+                    tx_hash: *tx.tx_hash(),
+                    tx_from: *sender,
+                    gas_used,
+                    effective_gas_price,
+                    l1_fee_wei: l1_fee,
+                },
+            ));
+        }
+    }
+
+    // ── (5) system_signed: recognised non-call credits (L1: empty).
+    let system_signed = adapter.system_credits();
+
+    process_block(BlockInputs {
+        chain_id,
+        block_number,
+        block_hash,
+        watched: watched.clone(),
+        erc20_logs,
+        frames,
+        gas,
+        account_deltas,
+        system_signed,
+    })
+}
+
+/// Self-contained block re-execution for `ValueInspector` frame capture.
+///
+/// Rebuilds the exact pre-block account/storage/bytecode state from the
+/// committed `ExecutionOutcome`'s own `BundleState` (`original_info`,
+/// `previous_or_original_value`, `contracts`) into an in-memory
+/// `CacheDB<EmptyDB>` — pruning-independent, needs no historical state
+/// provider — then replays each transaction through the EVM's
+/// **per-transaction inspector tracer** (`EvmFactoryExt::create_tracer` →
+/// `TxTracer::try_trace_many`). This is the same primitive reth's own
+/// `trace_block` uses; unlike the `BlockExecutor::execute_block` path
+/// (whose `transact` does **not** drive inspector hooks for nested call
+/// frames), the tracer's `transact_commit` routes through revm's
+/// `inspect_run` so every internal value-bearing CALL/CREATE/SELFDESTRUCT
+/// fires `Inspector::call`/`create`/`selfdestruct` (see docs/reth-pin.md,
+/// Task 6.4 section, "internal-frame capture").
+mod reexec {
+    use super::*;
+    use alloy_consensus::BlockHeader;
+    use reth_ethereum::evm::primitives::block::BlockExecutor;
+    use reth_ethereum::evm::primitives::evm::EvmFactoryExt;
+    use reth_ethereum::evm::primitives::tracing::TracingCtx;
+    use reth_ethereum::evm::primitives::ConfigureEvm;
+    use reth_ethereum::evm::EthEvmConfig;
+    use reth_ethereum::chainspec::ChainSpec;
+    use revm::database::{CacheDB, EmptyDB, State};
+    use revm::state::AccountInfo;
+    use std::sync::Arc;
+
+    pub(super) struct TaggedFrame {
+        pub frame: CapturedFrame,
+        pub tx_index: usize,
+        pub top_level: bool,
+    }
+    pub(super) struct Captured {
+        pub frames: Vec<TaggedFrame>,
+        pub tx_hashes: Vec<Option<B256>>,
+        pub tx_reverted: Vec<bool>,
+    }
+
+    /// `ValueInspector` wrapper that marks each captured frame as
+    /// top-level (the transaction's depth-0 call) or internal. Cloned/reset
+    /// by the tracer between transactions, so call depth is per-tx.
+    #[derive(Default, Clone)]
+    struct TaggingInspector {
+        inner: crate::inspector::ValueInspector,
+        /// `top_level` flag parallel to inner-captured frames (this tx).
+        tags: Vec<bool>,
+        depth: i64,
+    }
+
+    impl TaggingInspector {
+        #[inline]
+        fn enter(&mut self) -> bool {
+            let top_level = self.depth == 0;
+            self.depth += 1;
+            top_level
+        }
+        #[inline]
+        fn record(&mut self, before: usize, top_level: bool) {
+            if self.inner.frame_count() > before {
+                self.tags.push(top_level);
+            }
+        }
+    }
+
+    impl<CTX> revm::Inspector<CTX> for TaggingInspector {
+        fn call(
+            &mut self,
+            ctx: &mut CTX,
+            inputs: &mut revm::interpreter::CallInputs,
+        ) -> Option<revm::interpreter::CallOutcome> {
+            let before = self.inner.frame_count();
+            let top_level = self.enter();
+            let out = self.inner.call(ctx, inputs);
+            self.record(before, top_level);
+            out
+        }
+        fn call_end(
+            &mut self,
+            _ctx: &mut CTX,
+            _inputs: &revm::interpreter::CallInputs,
+            _outcome: &mut revm::interpreter::CallOutcome,
+        ) {
+            self.depth -= 1;
+        }
+        fn create(
+            &mut self,
+            _ctx: &mut CTX,
+            _inputs: &mut revm::interpreter::CreateInputs,
+        ) -> Option<revm::interpreter::CreateOutcome> {
+            self.enter();
+            None
+        }
+        fn create_end(
+            &mut self,
+            ctx: &mut CTX,
+            inputs: &revm::interpreter::CreateInputs,
+            outcome: &mut revm::interpreter::CreateOutcome,
+        ) {
+            let before = self.inner.frame_count();
+            let top_level = self.depth == 1;
+            self.inner.create_end(ctx, inputs, outcome);
+            self.record(before, top_level);
+            self.depth -= 1;
+        }
+        fn selfdestruct(
+            &mut self,
+            contract: alloy_primitives::Address,
+            target: alloy_primitives::Address,
+            value: U256,
+        ) {
+            let before = self.inner.frame_count();
+            <crate::inspector::ValueInspector as revm::Inspector<CTX>>::selfdestruct(
+                &mut self.inner,
+                contract,
+                target,
+                value,
+            );
+            self.record(before, false);
+        }
+    }
+
+    pub(super) fn reexecute_block_frames(
+        chain_spec: Arc<ChainSpec>,
+        outcome: &reth_ethereum::provider::ExecutionOutcome,
+        block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
+    ) -> eyre::Result<Captured> {
+        // 1. Rebuild the exact pre-block state from the bundle.
+        let bundle = outcome.state();
+        let mut cache: CacheDB<EmptyDB> = CacheDB::new(EmptyDB::default());
+        for (addr, acct) in bundle.state.iter() {
+            if let Some(orig) = &acct.original_info {
+                let mut info: AccountInfo = orig.clone();
+                if info.code.is_none() && info.code_hash != revm::primitives::KECCAK_EMPTY {
+                    if let Some(bc) = bundle.contracts.get(&info.code_hash) {
+                        info.code = Some(bc.clone());
+                    }
+                }
+                cache.insert_account_info(*addr, info);
+            }
+            for (slot, sv) in acct.storage.iter() {
+                cache
+                    .insert_account_storage(*addr, *slot, sv.previous_or_original_value)
+                    .ok();
+            }
+        }
+
+        // 2. Real EVM config from the chain spec (NOT the node's, which is
+        //    a panicking no-op under the ExEx test harness).
+        let evm_config = EthEvmConfig::new(chain_spec);
+        let mut state = State::builder()
+            .with_database(cache)
+            .with_bundle_update()
+            .build();
+
+        let evm_env = evm_config.evm_env(block.header())?;
+
+        // 2a. Apply chain-specific pre-execution system changes (e.g.
+        //     Cancun beacon-root) so the replayed state matches consensus.
+        {
+            let exec_ctx = evm_config.context_for_block(block.sealed_block())?;
+            let mut executor = evm_config.create_executor(
+                evm_config.evm_with_env(&mut state, evm_env.clone()),
+                exec_ctx,
+            );
+            executor.apply_pre_execution_changes()?;
+        }
+
+        // 3. Per-tx inspector tracer (drives nested-frame inspector hooks,
+        //    unlike BlockExecutor::execute_block's plain `transact`).
+        let bn = block.header().number();
+        let receipts = outcome.receipts_by_block(bn);
+        let mut frames: Vec<TaggedFrame> = Vec::new();
+        let mut tx_hashes: Vec<Option<B256>> = Vec::new();
+        let mut tx_reverted: Vec<bool> = Vec::new();
+        for (i, tx) in block.body().transactions.iter().enumerate() {
+            tx_hashes.push(Some(*tx.tx_hash()));
+            tx_reverted.push(receipts.get(i).map(|r| !r.success).unwrap_or(false));
+        }
+
+        let mut tracer = evm_config.evm_factory().create_tracer(
+            &mut state,
+            evm_env,
+            TaggingInspector::default(),
+        );
+        let collected: Vec<(usize, Vec<(CapturedFrame, bool)>)> = {
+            let mut idx = 0usize;
+            tracer
+                .try_trace_many(
+                    block.transactions_recovered(),
+                    |mut ctx: TracingCtx<'_, _, _>| {
+                        let insp = ctx.take_inspector();
+                        let tags = insp.tags.clone();
+                        let fs: Vec<(CapturedFrame, bool)> = insp
+                            .inner
+                            .into_frames()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(k, f)| (f, tags.get(k).copied().unwrap_or(false)))
+                            .collect();
+                        let this = idx;
+                        idx += 1;
+                        Ok::<_, eyre::Error>((this, fs))
+                    },
+                )
+                .commit_last_tx()
+                .collect::<Result<_, _>>()?
+        };
+
+        for (tx_index, fs) in collected {
+            for (frame, top_level) in fs {
+                frames.push(TaggedFrame { frame, tx_index, top_level });
+            }
+        }
+        Ok(Captured { frames, tx_hashes, tx_reverted })
+    }
 }
 
 #[cfg(test)]

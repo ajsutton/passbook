@@ -23,3 +23,6 @@ reth-ethereum.workspace = true
 [dev-dependencies]
 reth-exex-test-utils.workspace = true
 tempfile.workspace = true
+alloy-signer-local.workspace = true
+alloy-network.workspace = true
+alloy-genesis.workspace = true
