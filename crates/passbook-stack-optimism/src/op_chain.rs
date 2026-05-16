@@ -403,8 +403,7 @@ mod fee_vault {
     /// coinbase still reconciles); this canonical constant documents the
     /// predeploy and is used by the recogniser's unit tests.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const SEQUENCER_FEE_VAULT: Address =
-        address!("0x4200000000000000000000000000000000000011");
+    pub const SEQUENCER_FEE_VAULT: Address = address!("0x4200000000000000000000000000000000000011");
     /// BaseFeeVault — receives `base_fee × gas_used` per tx.
     pub const BASE_FEE_VAULT: Address = address!("0x4200000000000000000000000000000000000019");
     /// L1FeeVault — receives the per-tx L1 data cost.
@@ -600,8 +599,8 @@ mod tests {
         let deposits = vec![
             (5_000_000_000_000_000u128, TxKind::Call(w), from, h0), // watched ⇒ Some
             (9_000_000_000_000_000u128, TxKind::Call(other), from, h1), // unwatched ⇒ skip
-            (0u128, TxKind::Call(w), from, h2),                    // zero mint ⇒ skip
-            (1_000u128, TxKind::Create, from, h3),                 // no recipient ⇒ skip
+            (0u128, TxKind::Call(w), from, h2),                     // zero mint ⇒ skip
+            (1_000u128, TxKind::Create, from, h3),                  // no recipient ⇒ skip
         ];
         let creds = deposit_mint_credits(&deposits, &watched);
         assert_eq!(creds.len(), 1, "only the watched, non-zero, Call mint");
@@ -676,13 +675,10 @@ mod tests {
 
         // Watch ALL THREE vaults (coinbase == SequencerFeeVault predeploy).
         let coinbase = fee_vault::SEQUENCER_FEE_VAULT;
-        let watched: std::collections::HashSet<Address> = [
-            coinbase,
-            fee_vault::BASE_FEE_VAULT,
-            fee_vault::L1_FEE_VAULT,
-        ]
-        .into_iter()
-        .collect();
+        let watched: std::collections::HashSet<Address> =
+            [coinbase, fee_vault::BASE_FEE_VAULT, fee_vault::L1_FEE_VAULT]
+                .into_iter()
+                .collect();
         let creds = fee_vault_credits(&watched, coinbase, base_fee, &txs);
         assert_eq!(creds.len(), 3, "one netted row per watched vault");
 
@@ -705,12 +701,7 @@ mod tests {
         assert_eq!(creds[0].source, "base_fee_vault");
 
         // Zero base fee + zero priority + zero L1 ⇒ no rows at all.
-        let creds = fee_vault_credits(
-            &watched,
-            coinbase,
-            0,
-            &[(0u128, 21_000u64, U256::ZERO)],
-        );
+        let creds = fee_vault_credits(&watched, coinbase, 0, &[(0u128, 21_000u64, U256::ZERO)]);
         assert!(
             creds.is_empty(),
             "no vault row when every fee total is zero"
@@ -740,13 +731,10 @@ mod tests {
         let l1 = 500u128 + 800u128;
 
         let coinbase = fee_vault::SEQUENCER_FEE_VAULT;
-        let watched: std::collections::HashSet<Address> = [
-            coinbase,
-            fee_vault::BASE_FEE_VAULT,
-            fee_vault::L1_FEE_VAULT,
-        ]
-        .into_iter()
-        .collect();
+        let watched: std::collections::HashSet<Address> =
+            [coinbase, fee_vault::BASE_FEE_VAULT, fee_vault::L1_FEE_VAULT]
+                .into_iter()
+                .collect();
         let system_signed = fee_vault_credits(&watched, coinbase, base_fee, &txs);
 
         // Observed per-vault balance delta == exactly the fee inflow the

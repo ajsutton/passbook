@@ -49,10 +49,7 @@ impl Ledger {
             if v == "1" {
                 let tx = conn.transaction()?;
                 tx.execute_batch(schema::MIGRATE_V1_TO_V2)?;
-                tx.execute(
-                    "UPDATE meta SET v='2' WHERE k='schema_version'",
-                    [],
-                )?;
+                tx.execute("UPDATE meta SET v='2' WHERE k='schema_version'", [])?;
                 tx.commit()?;
             }
             let v: String =
@@ -68,9 +65,7 @@ impl Ledger {
             // would silently mix chains in one DB. Abort loudly (spec's
             // stated preference) rather than corrupt a mixed ledger.
             let stored_chain_id: String =
-                conn.query_row("SELECT v FROM meta WHERE k='chain_id'", [], |r| {
-                    r.get(0)
-                })?;
+                conn.query_row("SELECT v FROM meta WHERE k='chain_id'", [], |r| r.get(0))?;
             if stored_chain_id != chain_id.to_string() {
                 eyre::bail!(
                     "chain-id mismatch: existing ledger is for chain {stored_chain_id}, \
@@ -126,10 +121,7 @@ mod tests {
             Ok(_) => panic!("reopen with mismatched chain id must fail"),
             Err(e) => e.to_string(),
         };
-        assert!(
-            msg.contains("chain-id mismatch"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("chain-id mismatch"), "unexpected error: {msg}");
         let stored: String = {
             let c = rusqlite::Connection::open(&path).unwrap();
             c.query_row("SELECT v FROM meta WHERE k='chain_id'", [], |r| r.get(0))

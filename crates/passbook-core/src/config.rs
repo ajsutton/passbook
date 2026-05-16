@@ -47,7 +47,10 @@ fn parse_watched_address(a: &str) -> eyre::Result<Address> {
         Address::from_str(a).map_err(|e| eyre::eyre!("invalid watched address {a:?}: {e}"))?;
 
     // Strip an optional "0x"/"0X" prefix before classifying case.
-    let hex = a.strip_prefix("0x").or_else(|| a.strip_prefix("0X")).unwrap_or(a);
+    let hex = a
+        .strip_prefix("0x")
+        .or_else(|| a.strip_prefix("0X"))
+        .unwrap_or(a);
     let has_lower = hex.chars().any(|c| c.is_ascii_lowercase());
     let has_upper = hex.chars().any(|c| c.is_ascii_uppercase());
 

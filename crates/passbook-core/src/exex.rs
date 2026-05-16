@@ -734,8 +734,11 @@ mod tests {
         };
         let batch = process_block(inp).expect("clean");
         assert_eq!(batch.erc20.len(), 2, "both directional rows emitted");
-        let mut dirs: Vec<(Address, Direction)> =
-            batch.erc20.iter().map(|r| (r.address, r.direction)).collect();
+        let mut dirs: Vec<(Address, Direction)> = batch
+            .erc20
+            .iter()
+            .map(|r| (r.address, r.direction))
+            .collect();
         dirs.sort_by_key(|(a, _)| *a);
         let mut expect = vec![(to, Direction::In), (from, Direction::Out)];
         expect.sort_by_key(|(a, _)| *a);

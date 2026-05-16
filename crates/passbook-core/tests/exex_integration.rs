@@ -2213,7 +2213,10 @@ async fn watched_to_watched_erc20_and_eth_no_row_loss_zero_residual() {
     alloc.insert(w1, acct(funded, None));
     alloc.insert(w2, acct(funded, None));
     // TOKEN emits Transfer(W1 -> W2) — both watched.
-    alloc.insert(token, acct(U256::ZERO, Some(token_code(w1, w2, erc20_amount))));
+    alloc.insert(
+        token,
+        acct(U256::ZERO, Some(token_code(w1, w2, erc20_amount))),
+    );
     let chain_spec: Arc<ChainSpec> =
         Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
 
@@ -2299,16 +2302,12 @@ async fn watched_to_watched_erc20_and_eth_no_row_loss_zero_residual() {
     let erc20_in: Vec<&_> = batch
         .erc20
         .iter()
-        .filter(|r| {
-            r.address == w2 && matches!(r.direction, passbook_core::model::Direction::In)
-        })
+        .filter(|r| r.address == w2 && matches!(r.direction, passbook_core::model::Direction::In))
         .collect();
     let erc20_out: Vec<&_> = batch
         .erc20
         .iter()
-        .filter(|r| {
-            r.address == w1 && matches!(r.direction, passbook_core::model::Direction::Out)
-        })
+        .filter(|r| r.address == w1 && matches!(r.direction, passbook_core::model::Direction::Out))
         .collect();
     assert_eq!(erc20_in.len(), 1, "one inbound ERC20 row for W2");
     assert_eq!(erc20_out.len(), 1, "one outbound ERC20 row for W1");

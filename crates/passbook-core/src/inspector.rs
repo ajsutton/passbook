@@ -132,12 +132,7 @@ impl<CTX> Inspector<CTX> for ValueInspector {
         None
     }
 
-    fn call_end(
-        &mut self,
-        _context: &mut CTX,
-        _inputs: &CallInputs,
-        outcome: &mut CallOutcome,
-    ) {
+    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
         // A non-`is_ok` instruction result == revert/halt; revm rolls back
         // the whole subtree's state, so its captured frames never
         // committed and must be dropped from reconciliation (issue #2).

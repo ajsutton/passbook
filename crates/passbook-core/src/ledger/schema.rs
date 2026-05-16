@@ -95,7 +95,9 @@ mod tests {
         c.execute_batch(super::SCHEMA).unwrap();
         let cols: Vec<String> = {
             let mut s = c
-                .prepare("SELECT name FROM pragma_table_info('erc20_transfers') WHERE pk>0 ORDER BY pk")
+                .prepare(
+                    "SELECT name FROM pragma_table_info('erc20_transfers') WHERE pk>0 ORDER BY pk",
+                )
                 .unwrap();
             let rows = s
                 .query_map([], |r| r.get::<_, String>(0))
