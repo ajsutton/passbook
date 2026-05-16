@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/spike"]
+
+# ── Single pin table ─────────────────────────────────────────────────────────
+# Co-resolution strategy (see docs/reth-pin.md):
+#
+#   * The OP facade `reth-op` (v1.11.3) is NOT published to crates.io yet. We
+#     pull it from the ethereum-optimism/optimism monorepo via a LOCAL blobless
+#     sparse mirror at .vendor/optimism (a `file://` git source). Cargo locates
+#     the crate `reth-op` by name inside that repo's `rust/` workspace.
+#   * The L1 facade `reth-ethereum` is pinned to paradigmxyz/reth at the EXACT
+#     SAME rev (88505c7…) that the monorepo's `rust/Cargo.toml` pins all of its
+#     upstream reth crates to. Because both facades resolve their shared
+#     transitive `reth-*` crates from one identical git rev, they unify into a
+#     single dependency graph (reth v2.2.0).
+#   * revm / revm-inspectors / alloy-evm are pinned to the exact crates.io
+#     versions the monorepo uses, so the shared revm stack also unifies.
+#
+# op-reth is not yet on crates.io — migrate `reth-op` to the published crate
+# when it exists (drop the local mirror + `.vendor/` machinery then).
+[workspace.dependencies]
+reth-op = { git = "file:///Users/aj/Documents/code/passbook/.vendor/optimism", rev = "27bf9194a08aef70f3fdbff6b3d04bdd70af62ff", default-features = false, features = ["node", "cli"] }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", features = ["full", "cli"] }
+
+revm = "38.0.0"
+revm-inspectors = "0.39.0"
+alloy-evm = "0.34.0"
+
+futures = "0.3"
+eyre = "0.6"

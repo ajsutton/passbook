@@ -1,0 +1,10 @@
+[package]
+name = "spike"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+reth-ethereum.workspace = true
+reth-op.workspace = true
+futures.workspace = true
+eyre.workspace = true
