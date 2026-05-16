@@ -1933,3 +1933,228 @@ async fn fault_injected_db_write_error_stalls_without_advancing() {
 
     driver.abort();
 }
+
+/// Issue #4 (C3): a single block where BOTH parties of an ERC20 transfer
+/// AND both parties of a native ETH transfer are watched.
+///
+/// Actors: W1 and W2 are two watched EOAs.
+///  - tx0: W1 → TOKEN. TOKEN emits `Transfer(W1, W2, erc20_amount)`. Both
+///    W1 and W2 are watched ⇒ `decode_transfer` returns
+///    `[(W2,In),(W1,Out)]` ⇒ `process_block` pushes TWO `erc20` rows
+///    sharing `(chain_id, block_hash, tx_hash, log_index)`, distinct only
+///    in `address`/`direction`. Pre-fix the v1 PK (omitting `address`)
+///    made `INSERT OR REPLACE` destroy the inbound row; both must now
+///    persist.
+///  - tx1: W1 → W2 with `eth_value` (native, watched→watched). The
+///    analogous ETH case is safe (distinct `:out` trace_path suffix) but
+///    must be covered too: exactly one in row for W2 and one out row for
+///    W1, both surviving.
+///
+/// The whole block must still reconcile to ZERO unattributed residual
+/// (ERC20 moves no ETH; the only ETH movement is the W1→W2 transfer plus
+/// W1's gas).
+#[tokio::test(flavor = "multi_thread")]
+async fn watched_to_watched_erc20_and_eth_no_row_loss_zero_residual() {
+    let w1_signer = PrivateKeySigner::random();
+    let w2_signer = PrivateKeySigner::random();
+    let w1 = w1_signer.address(); // watched sender
+    let w2 = w2_signer.address(); // watched recipient
+    let token = Address::repeat_byte(0x70);
+
+    let chain_id = 0x1234u64;
+    let gas_price = 1_000_000_000u128; // 1 gwei
+    let erc20_amount = U256::from(555_000_111u64);
+    let eth_value = U256::from(2_000_000_000_000_000u64); // 0.002 ETH W1 → W2
+
+    let funded = U256::from(10u64).pow(U256::from(18u64)); // 1 ETH
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(w1, acct(funded, None));
+    alloc.insert(w2, acct(funded, None));
+    // TOKEN emits Transfer(W1 -> W2) — both watched.
+    alloc.insert(token, acct(U256::ZERO, Some(token_code(w1, w2, erc20_amount))));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    let gas_limit = 200_000u64;
+    // tx0: W1 -> TOKEN ⇒ ERC20 Transfer(W1, W2, amount) log.
+    let tx0 = sign_legacy(
+        &w1_signer,
+        chain_id,
+        0,
+        TxKind::Call(token),
+        U256::ZERO,
+        gas_limit,
+        gas_price,
+        Bytes::new(),
+    );
+    // tx1: W1 -> W2 native value (watched → watched ETH).
+    let tx1 = sign_legacy(
+        &w1_signer,
+        chain_id,
+        1,
+        TxKind::Call(w2),
+        eth_value,
+        gas_limit,
+        gas_price,
+        Bytes::new(),
+    );
+
+    let recovered = build_block(
+        &chain_spec,
+        1,
+        chain_spec.genesis_hash(),
+        12,
+        vec![tx0, tx1],
+    );
+
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let state_db = genesis_state(&chain_spec);
+    let exec_out = evm_config
+        .executor(state_db)
+        .execute(&recovered)
+        .expect("block execution");
+    let outcome = ExecutionOutcome::single(1, exec_out);
+    let chain = Chain::new(
+        vec![recovered.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg = PassbookConfig::from_parts(
+        vec![format!("{w1:#x}"), format!("{w2:#x}")],
+        db_path.clone(),
+    )
+    .expect("cfg");
+
+    let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let genesis_hash = handle.genesis.hash();
+
+    // Deterministic core check against the real genesis-state provider.
+    let parent_state: StateProviderBox = handle
+        .provider_factory
+        .history_by_block_hash(genesis_hash)
+        .expect("genesis state provider");
+    let batch = passbook_core::exex::process_committed_block_inner(
+        chain_id,
+        chain_spec.clone(),
+        &chain,
+        &recovered,
+        &cfg,
+        &L1Adapter,
+        parent_state,
+    )
+    .expect("per-block processing must reconcile to zero residual");
+    assert!(
+        batch.unattributed.is_empty(),
+        "zero unattributed residual expected"
+    );
+    // BOTH directional ERC20 rows for the single watched→watched log.
+    let erc20_in: Vec<&_> = batch
+        .erc20
+        .iter()
+        .filter(|r| {
+            r.address == w2 && matches!(r.direction, passbook_core::model::Direction::In)
+        })
+        .collect();
+    let erc20_out: Vec<&_> = batch
+        .erc20
+        .iter()
+        .filter(|r| {
+            r.address == w1 && matches!(r.direction, passbook_core::model::Direction::Out)
+        })
+        .collect();
+    assert_eq!(erc20_in.len(), 1, "one inbound ERC20 row for W2");
+    assert_eq!(erc20_out.len(), 1, "one outbound ERC20 row for W1");
+    assert_eq!(erc20_in[0].amount, erc20_amount);
+    assert_eq!(erc20_out[0].amount, erc20_amount);
+    // The two rows share the collision PK columns but differ in address.
+    assert_eq!(erc20_in[0].tx_hash, erc20_out[0].tx_hash);
+    assert_eq!(erc20_in[0].log_index, erc20_out[0].log_index);
+    assert_ne!(erc20_in[0].address, erc20_out[0].address);
+
+    // ── End-to-end through run_passbook + the durable ledger ───────────
+    let ledger = Arc::new(Mutex::new(
+        Ledger::open(&db_path, chain_id).expect("ledger open"),
+    ));
+    let driver = tokio::spawn(passbook_core::exex::run_passbook(
+        ctx,
+        cfg,
+        ledger.clone(),
+        || L1Adapter,
+    ));
+    handle
+        .send_notification_chain_committed(chain)
+        .await
+        .expect("send committed");
+    wait_finished_height(&mut handle, 1).await;
+    driver.abort();
+
+    let g = ledger.lock().unwrap();
+    let conn = g.conn();
+    let w1_lc = format!("{w1:#x}");
+    let w2_lc = format!("{w2:#x}");
+
+    // The crux: BOTH directional ERC20 rows survived the durable write.
+    let erc20_total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM erc20_transfers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        erc20_total, 2,
+        "watched→watched ERC20 must keep BOTH rows (issue #4)"
+    );
+    let erc20_w2_in: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM erc20_transfers WHERE address=?1 AND direction='in'",
+            [&w2_lc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let erc20_w1_out: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM erc20_transfers WHERE address=?1 AND direction='out'",
+            [&w1_lc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        (erc20_w2_in, erc20_w1_out),
+        (1, 1),
+        "exactly one inbound (W2) and one outbound (W1) ERC20 row"
+    );
+
+    // ETH watched→watched: one out row for W1, one in row for W2.
+    let eth_w1_out: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM eth_transfers WHERE address=?1 AND direction='out'",
+            [&w1_lc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let eth_w2_in: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM eth_transfers WHERE address=?1 AND direction='in'",
+            [&w2_lc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(eth_w1_out, 1, "one outbound ETH row for W1");
+    assert_eq!(eth_w2_in, 1, "one inbound ETH row for W2");
+    let eth_in_amt: String = conn
+        .query_row(
+            "SELECT amount_wei FROM eth_transfers WHERE address=?1 AND direction='in'",
+            [&w2_lc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(eth_in_amt, eth_value.to_string());
+
+    let unattributed: i64 = conn
+        .query_row("SELECT COUNT(*) FROM unattributed_deltas", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(unattributed, 0, "ZERO unattributed residual expected");
+}

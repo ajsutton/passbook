@@ -198,6 +198,85 @@ mod tests {
         assert_eq!(last, "100");
     }
 
+    /// Issue #4 (C3): a single ERC20 `Transfer` log whose `from` AND `to`
+    /// are both watched yields two `Erc20TransferRow`s with identical
+    /// `(chain_id, block_hash, tx_hash, log_index)` but different
+    /// `address`/`direction`. Before the PK fix `INSERT OR REPLACE` made
+    /// the second clobber the first — one directional row was silently
+    /// destroyed. With `address` in the PK both rows must persist.
+    #[test]
+    fn watched_to_watched_erc20_keeps_both_rows() {
+        let (mut l, _tmp) = ledger();
+        let bh = B256::repeat_byte(0x21);
+        let tx = B256::repeat_byte(0x22);
+        let from = Address::repeat_byte(0xa1);
+        let to = Address::repeat_byte(0xb2);
+        let token = Address::repeat_byte(0xcc);
+        // Exactly what process_block pushes for a watched→watched transfer:
+        // (to, In) then (from, Out), same PK columns, different address.
+        let batch = BlockBatch {
+            chain_id: 1,
+            block_number: 50,
+            block_hash: bh,
+            eth: vec![],
+            erc20: vec![
+                Erc20TransferRow {
+                    chain_id: 1,
+                    block_number: 50,
+                    block_hash: bh,
+                    tx_hash: tx,
+                    log_index: 0,
+                    token,
+                    from,
+                    to,
+                    amount: U256::from(777),
+                    address: to,
+                    direction: Direction::In,
+                },
+                Erc20TransferRow {
+                    chain_id: 1,
+                    block_number: 50,
+                    block_hash: bh,
+                    tx_hash: tx,
+                    log_index: 0,
+                    token,
+                    from,
+                    to,
+                    amount: U256::from(777),
+                    address: from,
+                    direction: Direction::Out,
+                },
+            ],
+            gas: vec![],
+            unattributed: vec![],
+        };
+        write_block(l.conn_mut(), &batch).unwrap();
+        write_block(l.conn_mut(), &batch).unwrap(); // replay -> still idempotent
+
+        let n: i64 = l
+            .conn()
+            .query_row("SELECT count(*) FROM erc20_transfers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "both directional rows must survive (issue #4)");
+        let n_in: i64 = l
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM erc20_transfers WHERE direction='in'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_out: i64 = l
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM erc20_transfers WHERE direction='out'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((n_in, n_out), (1, 1), "one in row and one out row");
+    }
+
     #[test]
     fn write_unattributed_is_queryable() {
         let (mut l, _tmp) = ledger();

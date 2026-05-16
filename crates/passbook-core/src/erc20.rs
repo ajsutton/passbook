@@ -98,6 +98,33 @@ mod tests {
         assert_eq!(out.matched, vec![(watched, crate::model::Direction::In)]);
     }
 
+    /// Issue #4 (C3): when BOTH parties are watched, `decode_transfer`
+    /// returns two matched entries — (to, In) then (from, Out) — so
+    /// `process_block` emits two rows. The DB PK must keep both (covered
+    /// by the writer + integration tests); here we pin the decoder
+    /// contract those tests rely on.
+    #[test]
+    fn watched_to_watched_yields_both_directions() {
+        let from = Address::repeat_byte(0xa1);
+        let to = Address::repeat_byte(0xb2);
+        let token = Address::repeat_byte(0x99);
+        let log = RawLog {
+            address: token,
+            topics: vec![TRANSFER_TOPIC0, topic_addr(from), topic_addr(to)],
+            data: Bytes::from(U256::from(777).to_be_bytes::<32>().to_vec()),
+        };
+        let watch = [from, to].into_iter().collect();
+        let out = decode_transfer(&log, &watch).unwrap();
+        assert_eq!(
+            out.matched,
+            vec![
+                (to, crate::model::Direction::In),
+                (from, crate::model::Direction::Out)
+            ],
+            "both watched parties must produce a directional match"
+        );
+    }
+
     #[test]
     fn ignores_non_transfer_and_unwatched() {
         let watch = [Address::repeat_byte(0xcc)].into_iter().collect();

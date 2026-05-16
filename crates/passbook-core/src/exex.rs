@@ -661,6 +661,51 @@ mod tests {
         assert!(r.unattributed.is_empty());
     }
 
+    /// Issue #4 (C3): a watched→watched ERC20 transfer must yield TWO
+    /// erc20 rows in the batch (In for `to`, Out for `from`), each with
+    /// distinct `address`. `process_block` is the producer the
+    /// PK-collision bug truncated downstream.
+    #[test]
+    fn watched_to_watched_erc20_produces_two_rows() {
+        use crate::erc20::{RawLog, TRANSFER_TOPIC0};
+        let from = Address::repeat_byte(0xa1);
+        let to = Address::repeat_byte(0xb2);
+        let token = Address::repeat_byte(0x99);
+        let topic_addr = |a: Address| {
+            let mut b = [0u8; 32];
+            b[12..].copy_from_slice(a.as_slice());
+            B256::from(b)
+        };
+        let log = RawLog {
+            address: token,
+            topics: vec![TRANSFER_TOPIC0, topic_addr(from), topic_addr(to)],
+            data: U256::from(777).to_be_bytes::<32>().to_vec().into(),
+        };
+        let inp = BlockInputs {
+            chain_id: 1,
+            block_number: 11,
+            block_hash: B256::repeat_byte(3),
+            watched: [from, to].into_iter().collect(),
+            erc20_logs: vec![(Some(B256::repeat_byte(0x44)), 0, log)],
+            frames: vec![],
+            gas: vec![],
+            account_deltas: vec![],
+            system_signed: vec![],
+        };
+        let batch = process_block(inp).expect("clean");
+        assert_eq!(batch.erc20.len(), 2, "both directional rows emitted");
+        let mut dirs: Vec<(Address, Direction)> =
+            batch.erc20.iter().map(|r| (r.address, r.direction)).collect();
+        dirs.sort_by_key(|(a, _)| *a);
+        let mut expect = vec![(to, Direction::In), (from, Direction::Out)];
+        expect.sort_by_key(|(a, _)| *a);
+        assert_eq!(dirs, expect);
+        // Same PK columns, different address — the exact collision case.
+        assert_eq!(batch.erc20[0].tx_hash, batch.erc20[1].tx_hash);
+        assert_eq!(batch.erc20[0].log_index, batch.erc20[1].log_index);
+        assert_ne!(batch.erc20[0].address, batch.erc20[1].address);
+    }
+
     #[test]
     fn unexplained_residual_is_processing_error() {
         let w = Address::repeat_byte(0xcc);
