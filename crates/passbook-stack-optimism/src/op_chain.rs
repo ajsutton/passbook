@@ -246,15 +246,25 @@ impl ChainExec for OpChainExec {
         //   that minted wei is a recognised `kind=system` credit so
         //   reconciliation nets it (no residual / stall).
         //
-        //   **Fee vaults**: OP routes sequencer/base/L1 fees to predeploy
-        //   vault addresses, but the pinned reth-op API (rev 27bf919)
-        //   applies these as in-EVM state writes with NO extractable
-        //   per-block vault-credit accessor — see `op-reth/crates/evm`
-        //   (`l1.rs` only exposes the L1-fee scalars, never a vault
-        //   credit). This sub-case is a bounded, documented limitation
-        //   (README + docs/validation.md): a watched fee-vault address
-        //   would still residual-stall. Deposit mints — the common
-        //   user-visible OP system credit — ARE implemented here.
+        //   **Fee vaults**: per non-deposit tx, the pinned op-revm
+        //   `reward_beneficiary` (rev 27bf919,
+        //   `op-revm/src/handler.rs:298`) credits THREE predeploy vaults
+        //   with NO captured CALL frame:
+        //     • SequencerFeeVault (block coinbase, `0x..11`) gets the
+        //       priority fee `(effective_gas_price − base_fee) × gas_used`
+        //       (the mainnet `reward_beneficiary` delegate);
+        //     • BaseFeeVault (`0x..19`) gets `base_fee × gas_used`;
+        //     • L1FeeVault (`0x..1a`) gets the per-tx L1 data cost.
+        //   These are a spec §(c) recognised system category ("OP …  fee
+        //   vaults … produce no residual"). Previously unhandled, so a
+        //   watched fee-vault address residual-stalled — issue #5. We now
+        //   extract them from the SAME per-tx (gas_used, effective price,
+        //   L1 fee) data already gathered for gas attribution + the
+        //   per-block L1-fee table, mirroring the L1 arm's `block_reward`
+        //   priority-fee design. The Isthmus operator-fee vault (`0x..1b`)
+        //   is left as a documented narrow gap (defaults to zero on
+        //   effectively all chains; not reconstructable without re-running
+        //   the EVM at the pinned API).
         let system_signed = {
             // `as_deposit()` is INHERENT on `OpTxEnvelope` (op-alloy
             // `transaction/envelope.rs:436`); `OpTransactionSigned` is a
@@ -271,7 +281,42 @@ impl ChainExec for OpChainExec {
                         .map(|d| (d.mint, d.to, d.from))
                 })
                 .collect();
-            deposit_mint_credits(&deposits, watched)
+            let mut creds = deposit_mint_credits(&deposits, watched);
+
+            // Per non-deposit tx: (effective_gas_price, gas_used, l1_fee).
+            // Deposit txs pay no priority/base/L1 fee to the vaults (the
+            // op-revm handler short-circuits deposits before
+            // `reward_beneficiary`), so they contribute nothing here. The
+            // block coinbase IS the SequencerFeeVault predeploy on OP.
+            let base_fee_u128 = u128::from(base_fee.unwrap_or(0));
+            let coinbase = block.header().beneficiary();
+            let mut vault_txs: Vec<(u128, u64, U256)> = Vec::new();
+            {
+                let receipts = outcome.receipts_by_block(block_number);
+                let mut prev_cumulative: u64 = 0;
+                for (tx_idx, tx) in block.body().transactions.iter().enumerate() {
+                    let receipt = match receipts.get(tx_idx) {
+                        Some(r) => r,
+                        None => break,
+                    };
+                    let gas_used = receipt
+                        .cumulative_gas_used()
+                        .saturating_sub(prev_cumulative);
+                    prev_cumulative = receipt.cumulative_gas_used();
+                    if tx.is_deposit() {
+                        continue;
+                    }
+                    let l1_fee = l1_adapter.l1_data_fee_wei(tx_idx).unwrap_or(U256::ZERO);
+                    vault_txs.push((tx.effective_gas_price(base_fee), gas_used, l1_fee));
+                }
+            }
+            creds.extend(fee_vault_credits(
+                watched,
+                coinbase,
+                base_fee_u128,
+                &vault_txs,
+            ));
+            creds
         };
 
         // SHARED pure orchestrator — invoked, never forked.
@@ -322,6 +367,79 @@ fn deposit_mint_credits(
             }
         }
     }
+    creds
+}
+
+/// The three OP fee-vault predeploys credited (no CALL frame) by the
+/// op-revm `reward_beneficiary` handler per non-deposit tx. Addresses are
+/// the canonical predeploys (op-revm `constants.rs`,
+/// kona `predeploys.rs`).
+mod fee_vault {
+    use alloy_primitives::{address, Address};
+    /// SequencerFeeVault — the OP block coinbase; receives the priority
+    /// fee. Production uses the actual block coinbase (so a non-standard
+    /// coinbase still reconciles); this canonical constant documents the
+    /// predeploy and is used by the recogniser's unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const SEQUENCER_FEE_VAULT: Address =
+        address!("0x4200000000000000000000000000000000000011");
+    /// BaseFeeVault — receives `base_fee × gas_used` per tx.
+    pub const BASE_FEE_VAULT: Address = address!("0x4200000000000000000000000000000000000019");
+    /// L1FeeVault — receives the per-tx L1 data cost.
+    pub const L1_FEE_VAULT: Address = address!("0x420000000000000000000000000000000000001a");
+}
+
+/// Pure recognition of OP **fee-vault** system credits (spec §(c)).
+///
+/// For every non-deposit tx the op-revm `reward_beneficiary` handler
+/// (`op-revm/src/handler.rs:298`, pinned rev 27bf919) credits, with NO
+/// captured CALL frame:
+///
+/// - the **block coinbase** (the SequencerFeeVault predeploy on OP) with
+///   the priority fee `(effective_gas_price − base_fee) × gas_used`
+///   (the delegated mainnet `reward_beneficiary`);
+/// - the **BaseFeeVault** (`0x..19`) with `base_fee × gas_used`;
+/// - the **L1FeeVault** (`0x..1a`) with that tx's L1 data cost.
+///
+/// Each total whose recipient ∈ `watched` becomes one netted
+/// `kind=system` [`SystemCredit`] (one row per vault, stable `source`
+/// tag) so reconciliation nets it to zero instead of residual-stalling
+/// (issue #5). `coinbase` is passed explicitly (rather than assuming the
+/// `SEQUENCER_FEE_VAULT` constant) so a non-standard coinbase still
+/// reconciles correctly. Kept type-free (`&[(eff_price, gas_used,
+/// l1_fee)]`) so it is unit-testable without an OP block, mirroring
+/// [`deposit_mint_credits`] and the L1 `l1_system_credits` design.
+fn fee_vault_credits(
+    watched: &std::collections::HashSet<alloy_primitives::Address>,
+    coinbase: alloy_primitives::Address,
+    base_fee_per_gas: u128,
+    txs: &[(u128, u64, U256)], // (effective_gas_price, gas_used, l1_fee_wei) per non-deposit tx
+) -> Vec<SystemCredit> {
+    let mut priority_total = U256::ZERO; // → coinbase / SequencerFeeVault
+    let mut base_total = U256::ZERO; // → BaseFeeVault
+    let mut l1_total = U256::ZERO; // → L1FeeVault
+    for (effective_gas_price, gas_used, l1_fee) in txs {
+        let prio = effective_gas_price.saturating_sub(base_fee_per_gas);
+        priority_total += U256::from(prio) * U256::from(*gas_used);
+        base_total += U256::from(base_fee_per_gas) * U256::from(*gas_used);
+        l1_total += *l1_fee;
+    }
+
+    let mut creds: Vec<SystemCredit> = Vec::new();
+    let mut push = |addr: alloy_primitives::Address, total: U256, source: &str| {
+        if total.is_zero() || !watched.contains(&addr) {
+            return;
+        }
+        creds.push(SystemCredit::new(
+            addr,
+            i128::try_from(total).unwrap_or(i128::MAX),
+            addr,
+            source,
+        ));
+    };
+    push(coinbase, priority_total, "sequencer_fee_vault");
+    push(fee_vault::BASE_FEE_VAULT, base_total, "base_fee_vault");
+    push(fee_vault::L1_FEE_VAULT, l1_total, "l1_fee_vault");
     creds
 }
 
@@ -465,6 +583,147 @@ mod tests {
         assert_eq!(creds[0].signed_wei, 5_000_000_000_000_000i128);
         assert_eq!(creds[0].counterparty, from);
         assert_eq!(creds[0].source, "deposit_mint");
+    }
+
+    /// Issue #5 (OP arm): the three OP fee-vault predeploys credited by
+    /// the op-revm `reward_beneficiary` handler with NO call frame
+    /// (SequencerFeeVault = coinbase priority fee, BaseFeeVault =
+    /// `base_fee × gas_used`, L1FeeVault = Σ per-tx L1 data cost) are
+    /// recognised as `kind=system` `SystemCredit`s when watched, so a
+    /// watched fee vault nets to zero instead of a spec-violating
+    /// residual stall. Only watched vaults yield rows; a zero total
+    /// yields none; deposit txs are excluded by the caller (none passed).
+    #[test]
+    fn op_fee_vault_credits_recognized_as_system_for_watched_vaults() {
+        use alloy_primitives::Address;
+        let base_fee: u128 = 7;
+        // Two non-deposit txs.
+        //  tx0: eff price 1 gwei, 21000 gas, L1 fee 500
+        //  tx1: eff price 2 gwei,  50000 gas, L1 fee 800
+        let txs = vec![
+            (1_000_000_000u128, 21_000u64, U256::from(500u64)),
+            (2_000_000_000u128, 50_000u64, U256::from(800u64)),
+        ];
+        let priority = (1_000_000_000u128 - 7) * 21_000 + (2_000_000_000u128 - 7) * 50_000;
+        let base = 7u128 * 21_000 + 7u128 * 50_000;
+        let l1 = 500u128 + 800u128;
+
+        // Watch ALL THREE vaults (coinbase == SequencerFeeVault predeploy).
+        let coinbase = fee_vault::SEQUENCER_FEE_VAULT;
+        let watched: std::collections::HashSet<Address> = [
+            coinbase,
+            fee_vault::BASE_FEE_VAULT,
+            fee_vault::L1_FEE_VAULT,
+        ]
+        .into_iter()
+        .collect();
+        let creds = fee_vault_credits(&watched, coinbase, base_fee, &txs);
+        assert_eq!(creds.len(), 3, "one netted row per watched vault");
+
+        let by_src = |s: &str| creds.iter().find(|c| c.source == s).expect("row present");
+        let seq = by_src("sequencer_fee_vault");
+        assert_eq!(seq.address, coinbase);
+        assert_eq!(seq.signed_wei, priority as i128);
+        let bfv = by_src("base_fee_vault");
+        assert_eq!(bfv.address, fee_vault::BASE_FEE_VAULT);
+        assert_eq!(bfv.signed_wei, base as i128);
+        let l1fv = by_src("l1_fee_vault");
+        assert_eq!(l1fv.address, fee_vault::L1_FEE_VAULT);
+        assert_eq!(l1fv.signed_wei, l1 as i128);
+
+        // Unwatched vaults ⇒ no rows; only the watched one is emitted.
+        let only_base: std::collections::HashSet<Address> =
+            [fee_vault::BASE_FEE_VAULT].into_iter().collect();
+        let creds = fee_vault_credits(&only_base, coinbase, base_fee, &txs);
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].source, "base_fee_vault");
+
+        // Zero base fee + zero priority + zero L1 ⇒ no rows at all.
+        let creds = fee_vault_credits(
+            &watched,
+            coinbase,
+            0,
+            &[(0u128, 21_000u64, U256::ZERO)],
+        );
+        assert!(
+            creds.is_empty(),
+            "no vault row when every fee total is zero"
+        );
+    }
+
+    /// Reconciliation-shaped proof (issue #5): a watched fee vault's full
+    /// observed BundleState balance delta in a block is exactly the sum
+    /// of the recognised fee-vault `SystemCredit`s, so the shared pure
+    /// `process_block` reconciler nets it to ZERO residual (no stall),
+    /// AND emits a queryable `kind=system` row. This is the OP
+    /// counterpart of the L1 `block_reward` zero-residual integration
+    /// proof (a live OP `Chain<OpPrimitives>` harness remains infeasible
+    /// at the pinned revs — see docs/reth-pin.md).
+    #[test]
+    fn watched_fee_vault_nets_to_zero_residual_via_process_block() {
+        use alloy_primitives::Address;
+        use passbook_core::exex::{process_block, BlockInputs};
+
+        let base_fee: u128 = 7;
+        let txs = vec![
+            (1_000_000_000u128, 21_000u64, U256::from(500u64)),
+            (2_000_000_000u128, 50_000u64, U256::from(800u64)),
+        ];
+        let priority = (1_000_000_000u128 - 7) * 21_000 + (2_000_000_000u128 - 7) * 50_000;
+        let base = 7u128 * 21_000 + 7u128 * 50_000;
+        let l1 = 500u128 + 800u128;
+
+        let coinbase = fee_vault::SEQUENCER_FEE_VAULT;
+        let watched: std::collections::HashSet<Address> = [
+            coinbase,
+            fee_vault::BASE_FEE_VAULT,
+            fee_vault::L1_FEE_VAULT,
+        ]
+        .into_iter()
+        .collect();
+        let system_signed = fee_vault_credits(&watched, coinbase, base_fee, &txs);
+
+        // Observed per-vault balance delta == exactly the fee inflow the
+        // op-revm handler applied as an in-EVM state write (no call frame).
+        let account_deltas = vec![
+            (coinbase, priority as i128),
+            (fee_vault::BASE_FEE_VAULT, base as i128),
+            (fee_vault::L1_FEE_VAULT, l1 as i128),
+        ];
+
+        let batch = process_block(BlockInputs {
+            chain_id: 10,
+            block_number: 42,
+            block_hash: B256::repeat_byte(0xAB),
+            watched: watched.clone(),
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            account_deltas,
+            system_signed,
+        })
+        .expect("zero residual: fee-vault credits net the observed delta");
+
+        // Three queryable kind=system rows, one per vault, no residual.
+        assert_eq!(batch.eth.len(), 3);
+        assert!(batch.unattributed.is_empty());
+
+        // BEFORE the fix (system_signed empty) the SAME deltas stall.
+        let stalled = process_block(BlockInputs {
+            chain_id: 10,
+            block_number: 42,
+            block_hash: B256::repeat_byte(0xAB),
+            watched,
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            account_deltas: vec![(fee_vault::BASE_FEE_VAULT, base as i128)],
+            system_signed: vec![],
+        });
+        assert!(
+            stalled.is_err(),
+            "regression guard: an unrecognised fee-vault delta MUST residual-stall"
+        );
     }
 
     #[test]

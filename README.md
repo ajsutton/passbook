@@ -104,17 +104,20 @@ path anywhere.
   `kind = system` and produce **no reconciliation residual** (so they do
   not stall): **L1 beacon-chain withdrawals**, the **post-merge block
   reward** (the beneficiary/coinbase priority-fee credit, = Σ
-  `(effective_gas_price − base_fee) × gas_used`), and **OP deposit
-  mints**. They are recorded as queryable `kind=system` `eth_transfers`
-  rows. **Bounded, disclosed limitation:** OP **fee-vault** per-block
-  credits are *not* recognized — the pinned reth-op API applies them as
-  in-EVM state writes with no per-block vault-credit accessor (see
-  `docs/reth-pin.md`). Consequence: a watched address that is *itself an
-  OP fee-vault predeploy* would residual-**stall** on its vault credit
-  (this is intentional fail-closed behaviour, not silent loss; it is a
-  narrow case — watching a protocol predeploy is not the common
-  scenario). Pre-merge fixed block rewards are out of scope (forward-only
-  on post-merge networks).
+  `(effective_gas_price − base_fee) × gas_used`), **OP deposit
+  mints**, and the **OP fee-vault** per-block credits (SequencerFeeVault
+  = coinbase priority fee, BaseFeeVault = Σ `base_fee × gas_used`,
+  L1FeeVault = Σ per-tx L1 data cost — reconstructed from the same per-tx
+  fee data Passbook already gathers, mirroring the L1 block-reward
+  derivation). They are recorded as queryable `kind=system`
+  `eth_transfers` rows, so a watched OP fee-vault predeploy now nets to
+  zero residual instead of stalling. **Narrow remaining gap:** the
+  Isthmus *operator-fee* vault (`0x..1b`, defaults to zero on
+  effectively all chains) is not reconstructable without re-running the
+  EVM at the pinned reth-op API (see `docs/reth-pin.md`); a watched
+  operator-fee vault on a chain with a non-zero operator-fee scalar would
+  still fail-closed (stall, not silent loss). Pre-merge fixed block
+  rewards are out of scope (forward-only on post-merge networks).
 - The ExEx halts by *stalling* (retrying the current block), not by crashing
   the node. The node keeps running so RPC stays available, the ExEx applies
   natural backpressure, and reth will not prune below the stalled height.

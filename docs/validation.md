@@ -111,16 +111,21 @@ The 5 integration tests in `tests/exex_integration.rs`, by exact name:
     priority_fee_recognized_zero_residual` — the exact case that previously
     permanently residual-STALLED now completes with zero residual and durable
     `kind=system` rows). OP **deposit mints** are implemented and unit-tested
-    (`op_deposit_mint_to_watched_is_recognized_system_credit`). **Bounded,
-    disclosed limitation:** OP **fee-vault** per-block credits are NOT
-    recognized — the pinned reth-op API applies them as in-EVM state writes
-    with no per-block vault-credit accessor (`docs/reth-pin.md` "B1 —
-    recognized system-event APIs"). Consequence, stated honestly: a watched
-    address that is itself an OP fee-vault predeploy would residual-stall on
-    its vault credit. This is a narrow case (watching a protocol predeploy is
-    not the common scenario); the proven-broken common path (L1 withdrawals +
-    beneficiary priority-fee) and the common OP system credit (deposit mints)
-    are implemented. The fault test was **reworked** so it still genuinely
+    (`op_deposit_mint_to_watched_is_recognized_system_credit`). OP
+    **fee-vault** per-block credits (SequencerFeeVault / BaseFeeVault /
+    L1FeeVault) are now **implemented and unit-tested** (issue #5 —
+    `op_fee_vault_credits_recognized_as_system_for_watched_vaults`,
+    `watched_fee_vault_nets_to_zero_residual_via_process_block`): the
+    op-revm `reward_beneficiary` per-non-deposit-tx vault credits are
+    reconstructed from the same per-tx `(effective_gas_price, gas_used,
+    L1 data fee)` data Passbook already gathers, so a watched fee-vault
+    predeploy nets to zero residual instead of stalling. **Narrow
+    remaining gap:** the Isthmus operator-fee vault (`0x..1b`, defaults
+    to zero on effectively all chains) is not reconstructable without
+    re-running the EVM at the pinned reth-op API (`docs/reth-pin.md`
+    "B1 — recognized system-event APIs"); a watched operator-fee vault on
+    a chain with a non-zero operator-fee scalar would still fail-closed
+    (stall, not silent loss). The fault test was **reworked** so it still genuinely
     proves stall-on-TRULY-unexplained-residual (a synthetic non-system
     discrepancy), since the old coinbase-credit fixture is now correctly
     recognized.
