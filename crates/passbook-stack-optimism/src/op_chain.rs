@@ -44,6 +44,7 @@ use passbook_core::inspector::CapturedFrame;
 use passbook_core::ledger::writer::BlockBatch;
 use passbook_core::reexec::{build_prestate_cache, Captured, TaggedFrame, TaggingInspector};
 use passbook_core::stack::StackAdapter;
+use passbook_core::system::SystemCredit;
 
 use reth_op::chainspec::OpChainSpec;
 use reth_op::primitives::RecoveredBlock;
@@ -237,8 +238,41 @@ impl ChainExec for OpChainExec {
             }
         }
 
-        // ── (5) system_signed (OP adapter currently records none).
-        let system_signed = l1_adapter.system_credits();
+        // ── (5) system_signed: recognised OP non-call credits.
+        //   **Deposit mints**: an OP deposit tx (`OpTxEnvelope::Deposit`)
+        //   can `mint` ETH to its recipient with NO value-CALL frame —
+        //   `TxDeposit { mint: u128, to: TxKind, .. }` (op-alloy 0.23.1
+        //   `transaction/deposit.rs`). If the mint recipient ∈ watched
+        //   that minted wei is a recognised `kind=system` credit so
+        //   reconciliation nets it (no residual / stall).
+        //
+        //   **Fee vaults**: OP routes sequencer/base/L1 fees to predeploy
+        //   vault addresses, but the pinned reth-op API (rev 27bf919)
+        //   applies these as in-EVM state writes with NO extractable
+        //   per-block vault-credit accessor — see `op-reth/crates/evm`
+        //   (`l1.rs` only exposes the L1-fee scalars, never a vault
+        //   credit). This sub-case is a bounded, documented limitation
+        //   (README + docs/validation.md): a watched fee-vault address
+        //   would still residual-stall. Deposit mints — the common
+        //   user-visible OP system credit — ARE implemented here.
+        let system_signed = {
+            // `as_deposit()` is INHERENT on `OpTxEnvelope` (op-alloy
+            // `transaction/envelope.rs:436`); `OpTransactionSigned` is a
+            // type alias for it, so no extra op-alloy dependency edge is
+            // needed. Extract `(mint, to, from)` per deposit, then run
+            // the pure recogniser.
+            let deposits: Vec<(u128, alloy_primitives::TxKind, alloy_primitives::Address)> = block
+                .body()
+                .transactions
+                .iter()
+                .filter_map(|tx| {
+                    tx.as_deposit()
+                        .map(|d| d.inner())
+                        .map(|d| (d.mint, d.to, d.from))
+                })
+                .collect();
+            deposit_mint_credits(&deposits, watched)
+        };
 
         // SHARED pure orchestrator — invoked, never forked.
         process_block(BlockInputs {
@@ -253,6 +287,42 @@ impl ChainExec for OpChainExec {
             system_signed,
         })
     }
+}
+
+/// Pure recognition of OP **deposit-mint** system credits.
+///
+/// An OP deposit transaction (`OpTxEnvelope::Deposit`,
+/// op-alloy-consensus `TxDeposit`) carries a `mint: u128` minting that
+/// many wei to the deposit recipient (`to: TxKind`) with NO captured
+/// value-CALL frame. The OP seam extracts `(mint, to, from)` per deposit
+/// tx via the INHERENT `OpTxEnvelope::as_deposit()` (so no extra
+/// op-alloy dependency edge is needed) and feeds them here. For each
+/// deposit whose recipient ∈ `watched` with a non-zero mint, this yields
+/// a recognised `kind=system` credit so reconciliation nets it (spec
+/// §(b)/(c)) — no residual / stall. Kept type-free
+/// (`&[(mint, TxKind, from)]`) so it is unit-testable without an OP
+/// block, exactly mirroring the L1 `l1_system_credits` design.
+fn deposit_mint_credits(
+    deposits: &[(u128, alloy_primitives::TxKind, alloy_primitives::Address)],
+    watched: &std::collections::HashSet<alloy_primitives::Address>,
+) -> Vec<SystemCredit> {
+    let mut creds: Vec<SystemCredit> = Vec::new();
+    for (mint, to, from) in deposits {
+        if *mint == 0 {
+            continue;
+        }
+        if let alloy_primitives::TxKind::Call(to) = to {
+            if watched.contains(to) {
+                creds.push(SystemCredit::new(
+                    *to,
+                    i128::try_from(*mint).unwrap_or(i128::MAX),
+                    *from,
+                    "deposit_mint",
+                ));
+            }
+        }
+    }
+    creds
 }
 
 /// OP re-execution driver — the structural analogue of
@@ -367,6 +437,36 @@ mod tests {
     /// C::Primitives, ChainSpec = C::ChainSpec>` is satisfied by `OpNode`
     /// iff these associated types are exactly `OpPrimitives` /
     /// `OpChainSpec` (the same pair `OpNode: NodeTypes` declares).
+    /// B1 (OP arm): the deposit-mint recogniser maps a deposit `mint`
+    /// to a watched recipient into a `kind=system` `SystemCredit` so
+    /// reconciliation nets it (no residual / stall), and correctly
+    /// EXCLUDES: a mint to an unwatched address, a zero-mint deposit,
+    /// and a `TxKind::Create` deposit (no recipient). This is the OP
+    /// counterpart of the L1 `system::tests` recognition proofs; a live
+    /// OP end-to-end block test remains infeasible at the pinned revs
+    /// (no OP `Chain<OpPrimitives>` harness in `reth-exex-test-utils`),
+    /// documented in docs/reth-pin.md + docs/validation.md.
+    #[test]
+    fn op_deposit_mint_to_watched_is_recognized_system_credit() {
+        use alloy_primitives::{Address, TxKind};
+        let w = Address::repeat_byte(0xD7);
+        let other = Address::repeat_byte(0x11);
+        let from = Address::repeat_byte(0xFF);
+        let watched = [w].into_iter().collect();
+        let deposits = vec![
+            (5_000_000_000_000_000u128, TxKind::Call(w), from), // watched ⇒ Some
+            (9_000_000_000_000_000u128, TxKind::Call(other), from), // unwatched ⇒ skip
+            (0u128, TxKind::Call(w), from),                     // zero mint ⇒ skip
+            (1_000u128, TxKind::Create, from),                  // no recipient ⇒ skip
+        ];
+        let creds = deposit_mint_credits(&deposits, &watched);
+        assert_eq!(creds.len(), 1, "only the watched, non-zero, Call mint");
+        assert_eq!(creds[0].address, w);
+        assert_eq!(creds[0].signed_wei, 5_000_000_000_000_000i128);
+        assert_eq!(creds[0].counterparty, from);
+        assert_eq!(creds[0].source, "deposit_mint");
+    }
+
     #[test]
     fn op_chain_exec_binds_op_primitives_and_chainspec() {
         fn assert_chain_exec<C: ChainExec>() {}

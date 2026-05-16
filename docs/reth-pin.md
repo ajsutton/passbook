@@ -1118,3 +1118,85 @@ Package count unchanged (998 → 998); no `version`/`source` line changed.
 Structurally required so the OP `ChainExec` arm can live in the OP stack
 crate (keeping `passbook-core` OP-free), consistent with the existing
 per-stack crate boundary.
+
+## B1 — recognized system-event APIs (withdrawals / beneficiary priority-fee / OP deposit-mint / fee-vault)
+
+Spec `passbook-spec.md` §(b)/(c) requires L1 beacon withdrawals, the
+post-merge beneficiary "block reward", and OP deposit mints to be
+attributed `kind = system` with **zero reconciliation residual** (only a
+*truly* unexplained delta is the stall case). The exact pinned APIs used
+by the `ChainExec` seam to surface these (file:line in the pinned
+sources):
+
+### L1 (fully implemented — `EthChainExec` / `process_committed_block_inner`)
+
+- **Beacon withdrawals** — `alloy_consensus::Block` body field
+  `withdrawals: Option<Withdrawals>`
+  (`alloy-consensus 2.0.4 src/block/mod.rs:240`). Each
+  `alloy_eips::eip4895::Withdrawal { address: Address, amount: u64 }`
+  (`alloy-eips 2.0.4 src/eip4895.rs:19,30,33`); GWEI→wei via the inherent
+  `Withdrawal::amount_wei(&self) -> U256`
+  (`src/eip4895.rs:38`, `= amount * GWEI_TO_WEI(1e9)`,
+  `src/eip4895.rs:11`). Reached as `block.body().withdrawals` exactly as
+  the existing integration fixtures already build blocks.
+- **Post-merge block "reward" = Σ beneficiary priority fee** — there is
+  **no captured CALL frame**. Computed as `Σ over included txs of
+  (effective_gas_price − base_fee_per_gas) × gas_used`, where
+  `effective_gas_price` is `alloy_consensus::Transaction::
+  effective_gas_price(base_fee)` (already used verbatim by the gas path),
+  `base_fee_per_gas` is `alloy_consensus::BlockHeader::
+  base_fee_per_gas()`, `gas_used` is the per-tx delta of
+  `receipt.cumulative_gas_used` (same derivation the gas path uses), and
+  the credit target is `BlockHeader::beneficiary()`. Pre-1559 / missing
+  base fee ⇒ `base_fee = 0` (full `effective_gas_price × gas_used`).
+  **Pre-merge fixed block rewards are intentionally OUT OF SCOPE**
+  (forward-only on post-merge networks) and are NOT synthesised — a
+  watched miner on a *pre-merge* chain's fixed reward would be a
+  genuinely-unexplained residual (correct stall).
+
+The chain-agnostic arithmetic is `passbook_core::system::
+l1_system_credits` (unit-tested); the seam feeds it the extracted
+withdrawal list + per-tx `(effective_gas_price, gas_used)` pairs.
+
+### OP (deposit-mint implemented; fee-vault is a bounded, disclosed limitation)
+
+- **Deposit mints (IMPLEMENTED)** — an OP deposit tx is
+  `op_alloy_consensus::OpTxEnvelope::Deposit(Sealed<TxDeposit>)`; the
+  recipient + minted wei come from
+  `TxDeposit { mint: u128, to: TxKind, from: Address, .. }`
+  (op-alloy-consensus monorepo rev `27bf9194`
+  `rust/op-alloy/crates/consensus/src/transaction/deposit.rs:19,27,30`).
+  Accessed via the **inherent** `OpTxEnvelope::as_deposit(&self) ->
+  Option<&Sealed<TxDeposit>>`
+  (`.../transaction/envelope.rs:436`) — inherent, so **no new op-alloy
+  dependency edge** is required (`OpTransactionSigned` is a type alias
+  for `OpTxEnvelope`, `op-reth/crates/primitives/src/transaction/
+  mod.rs:15`; `as_deposit`/`is_deposit` are inherent on it). A deposit
+  whose `to = TxKind::Call(addr)` with `addr ∈ watched` and `mint > 0`
+  ⇒ a recognized `+mint` `kind=system` credit. The recogniser
+  (`deposit_mint_credits`, `passbook-stack-optimism/src/op_chain.rs`) is
+  pure over `&[(mint, TxKind, from)]` and unit-tested.
+- **Fee vaults (BOUNDED, DISCLOSED LIMITATION)** — OP routes
+  sequencer/base/L1 fees to predeploy vault addresses, but the pinned
+  reth-op API (`op-reth/crates/evm/src/l1.rs`, rev `27bf9194`) applies
+  these as **in-EVM state writes during block execution** and exposes
+  **only the L1-fee scalars** (`extract_l1_info` /
+  `RethL1BlockInfo::l1_tx_data_fee`, `l1.rs:25,295,325`) — there is **no
+  per-block "vault credit" accessor** to derive a recognized
+  fee-vault `SystemCredit` from. Consequence (disclosed honestly in
+  `README.md` + `docs/validation.md`): **if a watched address is itself
+  an OP fee-vault predeploy, its per-block vault credit is not
+  recognized and would residual-stall.** This is a narrow, explicitly
+  bounded case (watching a protocol predeploy is not the common user
+  scenario); L1 (withdrawals + beneficiary priority-fee) — the
+  proven-broken common case — is FULLY implemented, and OP deposit-mints
+  (the common user-visible OP system credit) are implemented.
+
+### Cargo.lock delta for B1
+
+**None.** Zero package/version/source/edge change: the new
+`passbook_core::system` module uses only `alloy-primitives`
+(already a dep); the L1 withdrawal/fee derivation uses already-present
+`alloy-consensus`/`alloy-eips`/`reth-ethereum` facade APIs; the OP
+deposit-mint path uses the **inherent** `OpTxEnvelope::as_deposit`
+(no op-alloy edge added). `git diff --stat Cargo.lock` is empty.

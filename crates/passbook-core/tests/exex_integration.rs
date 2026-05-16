@@ -699,25 +699,28 @@ async fn spawn_driver(
     (driver, handle)
 }
 
-/// Block-fee credit to the coinbase: a tx that pays priority fee with the
-/// WATCHED address as the block beneficiary. The watched account receives a
-/// real post-state balance delta (the priority fee) that has NO captured
-/// CALL/SELFDESTRUCT frame and is NOT a recognised `system_credits` entry
-/// for the L1 adapter — `reconcile_account` therefore yields a residual.
+/// Build a block carrying a non-empty beacon **withdrawals** list (one
+/// withdrawal to `wd_recipient` for `wd_gwei` GWEI) AND `beneficiary` set,
+/// then genuinely execute it so the committed `Chain`'s `BundleState`
+/// reflects BOTH the withdrawal credit and the beneficiary priority-fee
+/// credit (post-Shanghai consensus applies withdrawals to state).
 // test fixture builder: each arg is an independent block/tx input knob
 #[allow(clippy::too_many_arguments)]
-fn coinbase_fee_block(
+fn withdrawal_and_beneficiary_block(
     chain_spec: &Arc<ChainSpec>,
     number: u64,
     parent_hash: B256,
     timestamp: u64,
-    watched: Address,
+    beneficiary: Address,
+    wd_recipient: Address,
+    wd_gwei: u64,
     s_signer: &PrivateKeySigner,
     s_nonce: u64,
     chain_id: u64,
 ) -> (RecoveredBlock<Block<TransactionSigned>>, Chain) {
+    use alloy_eips::eip4895::{Withdrawal, Withdrawals};
     // A plain value transfer S -> sink. The 21000-gas tx pays a priority
-    // fee (gas_price 1 gwei vs base_fee 7 wei) to the beneficiary = W.
+    // fee (gas_price 1 gwei vs base_fee 7 wei) to the beneficiary.
     let sink = Address::repeat_byte(0x51);
     let tx = sign_legacy(
         s_signer,
@@ -729,14 +732,32 @@ fn coinbase_fee_block(
         1_000_000_000u128,
         Bytes::new(),
     );
-    let recovered = build_block_with_beneficiary(
-        chain_spec,
-        number,
+    let genesis_header = chain_spec.genesis_header().clone();
+    let header = Header {
         parent_hash,
+        number,
+        gas_limit: 30_000_000,
+        base_fee_per_gas: Some(7),
         timestamp,
-        watched,
-        vec![tx],
-    );
+        beneficiary,
+        difficulty: U256::ZERO,
+        mix_hash: B256::ZERO,
+        gas_used: 0,
+        withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+        ..genesis_header
+    };
+    let withdrawals = Withdrawals(vec![Withdrawal {
+        index: 0,
+        validator_index: 7,
+        address: wd_recipient,
+        amount: wd_gwei,
+    }]);
+    let body = BlockBody {
+        transactions: vec![tx],
+        ommers: vec![],
+        withdrawals: Some(withdrawals),
+    };
+    let recovered = RecoveredBlock::try_recover(Block::new(header, body)).expect("recover senders");
     let evm_config = EthEvmConfig::new(chain_spec.clone());
     let state_db = genesis_state(chain_spec);
     let exec_out = evm_config
@@ -752,46 +773,134 @@ fn coinbase_fee_block(
     (recovered, chain)
 }
 
-/// 1. A deterministic reconciliation residual MUST halt indexing: the loop
-///    never emits `FinishedHeight`, never advances `meta.last_block`, writes
-///    the diagnostic `unattributed_deltas` row, and keeps retrying (the task
-///    is still alive — it did not return or panic).
+/// A test `ChainExec` that runs the **real, unchanged** L1 per-block
+/// pipeline (`process_committed_block_inner`) and then injects a single
+/// SYNTHETIC, genuinely-unexplained balance discrepancy for `victim` into
+/// the resulting batch via the pure reconciler — i.e. an observed delta
+/// with **no captured CALL/SELFDESTRUCT/CREATE frame, no gas, and NOT any
+/// recognised system category** (not a beacon withdrawal, not the
+/// beneficiary priority-fee block reward, not an OP deposit mint / fee
+/// vault). This is precisely the spec's "TRULY unexplained delta ⇒
+/// processing-failure/stall" case, constructed so it can never be
+/// explained away by the new recognition.
+#[derive(Clone, Copy)]
+struct UnexplainedInjector {
+    victim: Address,
+    phantom_wei: i128,
+}
+
+impl passbook_core::exex::ChainExec for UnexplainedInjector {
+    type Primitives = reth_ethereum::EthPrimitives;
+    type ChainSpec = ChainSpec;
+
+    fn process_committed_block(
+        &self,
+        chain_id: u64,
+        chain_spec: Arc<ChainSpec>,
+        chain: &Chain,
+        block: &RecoveredBlock<reth_ethereum::Block>,
+        cfg: &PassbookConfig,
+        parent_state: StateProviderBox,
+    ) -> Result<passbook_core::ledger::writer::BlockBatch, passbook_core::exex::ProcessingError>
+    {
+        use alloy_consensus::BlockHeader;
+        // Drive the REAL pipeline first (proves the genuine path; its
+        // own recognition nets every real system credit to zero).
+        let _real = passbook_core::exex::process_committed_block_inner(
+            chain_id,
+            chain_spec.clone(),
+            chain,
+            block,
+            cfg,
+            &L1Adapter,
+            parent_state,
+        )?;
+        // Now feed the pure orchestrator a synthetic balance discrepancy
+        // for `victim` with NO explaining flow of ANY kind: no frame, no
+        // gas, no system credit. Reconciliation MUST treat this as a
+        // TRULY unexplained residual ⇒ ProcessingError::UnexplainedResidual
+        // ⇒ the loop stalls (this is the spec's processing-failure case).
+        passbook_core::exex::process_block(passbook_core::exex::BlockInputs {
+            chain_id,
+            block_number: block.header().number(),
+            block_hash: block.hash(),
+            watched: [self.victim].into_iter().collect(),
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            account_deltas: vec![(self.victim, self.phantom_wei)],
+            system_signed: vec![],
+        })
+    }
+}
+
+/// 1. A TRULY unexplained reconciliation residual MUST halt indexing: the
+///    loop never emits `FinishedHeight`, never advances `meta.last_block`,
+///    writes the diagnostic `unattributed_deltas` row, and keeps retrying
+///    (the task is still alive — it did not return or panic).
+///
+///    REWORKED for B1: the previous fixture relied on a coinbase
+///    priority-fee credit to `W`, which is now a *recognised* `kind=system`
+///    block-reward (zero residual, no stall) — so it can no longer prove
+///    "stall on unexplained". Instead we inject a SYNTHETIC balance
+///    discrepancy with no captured flow and no withdrawal/coinbase/
+///    deposit/vault explanation (see [`UnexplainedInjector`]) — the exact
+///    spec "TRULY unexplained delta" case. All strong assertions are kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn fault_injected_residual_stalls_without_advancing() {
     let s_signer = PrivateKeySigner::random();
     let w_signer = PrivateKeySigner::random();
     let sender = s_signer.address();
-    let watched = w_signer.address(); // W = block beneficiary (coinbase)
+    let watched = w_signer.address();
 
     let chain_id = 0xFA17u64;
     let funded = U256::from(10u64).pow(U256::from(18u64));
     let mut alloc = std::collections::BTreeMap::new();
     alloc.insert(sender, acct(funded, None));
-    // W starts with zero balance and no code: its ONLY balance change this
-    // block is the uncaptured coinbase fee credit ⇒ guaranteed residual.
     alloc.insert(watched, acct(U256::ZERO, None));
     let chain_spec: Arc<ChainSpec> =
         Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
 
-    let (recovered, chain) = coinbase_fee_block(
-        &chain_spec,
-        1,
-        chain_spec.genesis_hash(),
-        12,
-        watched,
+    // A perfectly ordinary, fully-explainable block (S -> sink). The
+    // residual comes ONLY from the injected synthetic discrepancy, so the
+    // test proves the *truly unexplained* property, not a fixture quirk.
+    let tx = sign_legacy(
         &s_signer,
-        0,
         chain_id,
+        0,
+        TxKind::Call(Address::repeat_byte(0x51)),
+        U256::from(1u64),
+        100_000,
+        1_000_000_000u128,
+        Bytes::new(),
     );
+    let recovered = build_block(&chain_spec, 1, chain_spec.genesis_hash(), 12, vec![tx]);
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let exec_out = evm_config
+        .executor(genesis_state(&chain_spec))
+        .execute(&recovered)
+        .expect("block execution");
+    let outcome = ExecutionOutcome::single(1, exec_out);
+    let chain = Chain::new(
+        vec![recovered.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    let phantom_wei = 4_242_424_242_424_242i128;
+    let injector = UnexplainedInjector {
+        victim: watched,
+        phantom_wei,
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("passbook.db");
     let cfg =
         PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
 
-    // Deterministic core check: the pure pipeline against the real genesis
-    // provider MUST surface an UnexplainedResidual for W (proves the
-    // scenario genuinely yields a residual, not just "no error").
+    // Deterministic core check: the injector pipeline against the real
+    // genesis provider MUST surface an UnexplainedResidual for W (proves
+    // the scenario genuinely yields a residual, not just "no error").
     let (mut ctx, handle0) = test_exex_context_with_chain_spec(chain_spec.clone())
         .await
         .expect("test exex ctx");
@@ -800,13 +909,13 @@ async fn fault_injected_residual_stalls_without_advancing() {
         .provider_factory
         .history_by_block_hash(handle0.genesis.hash())
         .expect("genesis state provider");
-    let direct = passbook_core::exex::process_committed_block_inner(
+    let direct = passbook_core::exex::ChainExec::process_committed_block(
+        &injector,
         chain_id,
         chain_spec.clone(),
         &chain,
         &recovered,
         &cfg,
-        &L1Adapter,
         parent_state,
     );
     match direct {
@@ -814,8 +923,8 @@ async fn fault_injected_residual_stalls_without_advancing() {
             assert_eq!(address, watched, "residual must be for W")
         }
         other => panic!(
-            "expected an UnexplainedResidual for the uncaptured coinbase \
-             fee credit to W, got {other:?}"
+            "expected an UnexplainedResidual for the synthetic, truly \
+             unexplained balance discrepancy for W, got {other:?}"
         ),
     }
     drop(ctx);
@@ -825,7 +934,16 @@ async fn fault_injected_residual_stalls_without_advancing() {
     let ledger = Arc::new(Mutex::new(
         Ledger::open(&db_path, chain_id).expect("ledger open"),
     ));
-    let (driver, mut handle) = spawn_driver(&chain_spec, &cfg, &ledger).await;
+    let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let driver = tokio::spawn(passbook_core::exex::run_passbook(
+        ctx,
+        cfg.clone(),
+        ledger.clone(),
+        injector,
+    ));
     handle
         .send_notification_chain_committed(chain)
         .await
@@ -897,6 +1015,142 @@ async fn fault_injected_residual_stalls_without_advancing() {
     );
 
     driver.abort();
+}
+
+/// B1 PROOF: the exact scenario that previously STALLED now SUCCEEDS.
+///
+/// A single watched address `W` is BOTH (a) a beacon-withdrawal recipient
+/// AND (b) the block `beneficiary` receiving the txs' priority fees — two
+/// real post-state balance credits with NO captured CALL frame. Pre-fix
+/// (B1) this produced a permanent reconciliation-residual stall. Post-fix
+/// both are RECOGNISED `kind=system` credits: the block processes to
+/// completion (`FinishedHeight` emitted, `meta.last_block` advances),
+/// `unattributed_deltas` is EMPTY (zero residual), and the ledger has the
+/// `kind=system` `eth_transfers` rows (one `withdrawal`, one
+/// `block_reward`).
+#[tokio::test(flavor = "multi_thread")]
+async fn l1_withdrawal_and_beneficiary_priority_fee_recognized_zero_residual() {
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address();
+    let watched = w_signer.address(); // W = beneficiary AND withdrawal recipient
+
+    let chain_id = 0xB100u64;
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    // W starts at zero: its ONLY balance changes this block are the
+    // (uncaptured) withdrawal credit + the (uncaptured) priority fee.
+    alloc.insert(watched, acct(U256::ZERO, None));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    let wd_gwei = 32_000_000_000u64; // 32 ETH worth of GWEI
+    let (recovered, chain) = withdrawal_and_beneficiary_block(
+        &chain_spec,
+        1,
+        chain_spec.genesis_hash(),
+        12,
+        watched, // beneficiary
+        watched, // withdrawal recipient
+        wd_gwei,
+        &s_signer,
+        0,
+        chain_id,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
+
+    // Deterministic core check: the REAL pipeline against the real genesis
+    // provider MUST reconcile to ZERO (no residual) — the precise B1 fix.
+    let (mut ctx, handle0) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let parent_state: StateProviderBox = handle0
+        .provider_factory
+        .history_by_block_hash(handle0.genesis.hash())
+        .expect("genesis state provider");
+    let batch = passbook_core::exex::process_committed_block_inner(
+        chain_id,
+        chain_spec.clone(),
+        &chain,
+        &recovered,
+        &cfg,
+        &L1Adapter,
+        parent_state,
+    )
+    .expect("withdrawal + beneficiary priority fee MUST now reconcile to zero");
+    assert!(
+        batch.unattributed.is_empty(),
+        "ZERO residual expected — both credits are recognised system events"
+    );
+    let sys_rows: Vec<&_> = batch
+        .eth
+        .iter()
+        .filter(|r| r.address == watched && matches!(r.kind, passbook_core::model::EthKind::System))
+        .collect();
+    assert_eq!(
+        sys_rows.len(),
+        2,
+        "expected two kind=system rows (withdrawal + block_reward)"
+    );
+    assert!(
+        sys_rows
+            .iter()
+            .any(|r| r.trace_path.starts_with("system:withdrawal:")),
+        "a system:withdrawal row must be present"
+    );
+    assert!(
+        sys_rows
+            .iter()
+            .any(|r| r.trace_path.starts_with("system:block_reward:")),
+        "a system:block_reward row must be present"
+    );
+    drop(ctx);
+    drop(handle0);
+
+    // End-to-end: the block must process to COMPLETION (no stall).
+    let ledger = Arc::new(Mutex::new(
+        Ledger::open(&db_path, chain_id).expect("ledger open"),
+    ));
+    let (driver, mut handle) = spawn_driver(&chain_spec, &cfg, &ledger).await;
+    handle
+        .send_notification_chain_committed(chain)
+        .await
+        .expect("send committed");
+    wait_finished_height(&mut handle, 1).await; // would hang pre-fix
+    driver.abort();
+
+    let g = ledger.lock().unwrap();
+    let conn = g.conn();
+    let w_lc = format!("{watched:#x}");
+
+    let unattributed: i64 = conn
+        .query_row("SELECT COUNT(*) FROM unattributed_deltas", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(unattributed, 0, "ZERO unattributed residual expected (B1)");
+
+    let sys_in: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM eth_transfers \
+             WHERE address=?1 AND kind='system'",
+            [&w_lc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sys_in, 2,
+        "two durable kind=system rows for W (withdrawal + block_reward)"
+    );
+
+    let last: String = conn
+        .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(last, "1", "meta.last_block advanced — block completed");
 }
 
 /// 2. A reorg replaces rows: block at hash A (watched activity → rows,

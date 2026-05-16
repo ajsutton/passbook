@@ -1,21 +1,18 @@
-use alloy_primitives::{Address, U256};
+use alloy_primitives::U256;
 
-/// Isolates L1-vs-OP differences. Implemented per binary:
-/// - ethereum: always returns None for the L1 data fee.
+/// Isolates the L1-vs-OP **per-tx gas** difference. Implemented per binary:
+/// - ethereum: always returns `None` for the L1 data fee.
 /// - optimism: computes per-tx L1 data fee via reth-optimism-evm.
 ///
-/// `system_credits` surfaces recognised non-call balance changes
-/// (L1 withdrawals/beacon deposits/block rewards, OP deposit mints / fee
-/// vaults) so reconciliation attributes them as kind=system.
+/// Recognised **non-call system balance changes** (L1
+/// withdrawals/block-reward, OP deposit mints) are NOT surfaced through
+/// this adapter — they require the block/receipts as input, so they are
+/// computed at the [`ChainExec`](crate::exex::ChainExec) seam and fed into
+/// [`BlockInputs::system_signed`](crate::exex::BlockInputs) as
+/// [`SystemCredit`](crate::system::SystemCredit)s. See [`crate::system`].
 pub trait StackAdapter: Send + Sync + 'static {
     /// Per-transaction OP L1 data fee, or None on L1.
     fn l1_data_fee_wei(&self, tx_index: usize) -> Option<U256>;
-
-    /// Recognised system balance credits/debits for this block,
-    /// as (address, signed_wei) where positive = credit to address.
-    fn system_credits(&self) -> Vec<(Address, i128)> {
-        Vec::new()
-    }
 }
 
 #[cfg(test)]

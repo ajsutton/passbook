@@ -100,6 +100,21 @@ path anywhere.
   halts indexing progress until fixed — "can't process" means "don't
   proceed". The fix is a **code change + redeploy**, after which processing
   resumes **exactly where it stalled** — no gap, no duplicate.
+- **Recognized system events** (no captured call frame) are attributed
+  `kind = system` and produce **no reconciliation residual** (so they do
+  not stall): **L1 beacon-chain withdrawals**, the **post-merge block
+  reward** (the beneficiary/coinbase priority-fee credit, = Σ
+  `(effective_gas_price − base_fee) × gas_used`), and **OP deposit
+  mints**. They are recorded as queryable `kind=system` `eth_transfers`
+  rows. **Bounded, disclosed limitation:** OP **fee-vault** per-block
+  credits are *not* recognized — the pinned reth-op API applies them as
+  in-EVM state writes with no per-block vault-credit accessor (see
+  `docs/reth-pin.md`). Consequence: a watched address that is *itself an
+  OP fee-vault predeploy* would residual-**stall** on its vault credit
+  (this is intentional fail-closed behaviour, not silent loss; it is a
+  narrow case — watching a protocol predeploy is not the common
+  scenario). Pre-merge fixed block rewards are out of scope (forward-only
+  on post-merge networks).
 - The ExEx halts by *stalling* (retrying the current block), not by crashing
   the node. The node keeps running so RPC stays available, the ExEx applies
   natural backpressure, and reth will not prune below the stalled height.
@@ -257,6 +272,16 @@ CI also builds both Docker images and smoke-tests that `node --help` exposes
   validated at the current pin. The L1-vs-OP seam is deliberately narrow
   (only `ChainExec`) to keep this risk contained, but treat live OP
   behaviour as not yet end-to-end verified.
+- **System-event recognition (spec §(b)/(c)).** L1 beacon withdrawals +
+  the post-merge beneficiary priority-fee block reward are fully
+  implemented and live-tested (the exact case that previously
+  residual-stalled now completes with zero residual). OP deposit mints
+  are implemented and unit-tested. **OP fee-vault per-block credits are
+  NOT recognized** — the pinned reth-op API exposes no per-block
+  vault-credit accessor (`docs/reth-pin.md` "B1 — recognized
+  system-event APIs"); a watched address that is itself an OP fee-vault
+  predeploy would residual-stall on its vault credit. Disclosed honestly;
+  it is fail-closed (a stall, never silent loss) and a narrow case.
 - `passbook_health` reports `last_block` and `chain_id` only. It does not
   report node-tip lag; a stall is observable as `last_block` no longer
   advancing (together with the error logs and the `unattributed_deltas`

@@ -5,9 +5,10 @@ use crate::ledger::writer::BlockBatch;
 use crate::ledger::writer::{delete_blocks, write_block, write_unattributed};
 use crate::ledger::Ledger;
 use crate::model::UnattributedDeltaRow;
-use crate::model::{Direction, Erc20TransferRow, GasPaymentRow};
+use crate::model::{Direction, Erc20TransferRow, EthKind, EthTransferRow, GasPaymentRow};
 use crate::reconcile::{reconcile_account, ReconcileInput};
 use crate::stack::StackAdapter;
+use crate::system::SystemCredit;
 use alloy_primitives::{Address, B256, U256};
 use futures::TryStreamExt;
 use reth_ethereum::chainspec::{ChainSpec, EthChainSpec};
@@ -34,7 +35,11 @@ pub struct BlockInputs {
     pub frames: Vec<(Option<B256>, bool, CapturedFrame)>, // (tx_hash, reverted, frame)
     pub gas: Vec<GasPaymentRow>,
     pub account_deltas: Vec<(Address, i128)>, // watched accounts touched
-    pub system_signed: Vec<(Address, i128)>,  // recognised system credits
+    /// Recognised non-call system balance changes for watched addresses
+    /// (L1 withdrawals/block-reward, OP deposit mints). Computed at the
+    /// chain seam; netted into reconciliation AND recorded as
+    /// `kind = system` `eth_transfers` rows.
+    pub system_signed: Vec<SystemCredit>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,8 +108,46 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
         *gas_paid.entry(g.address).or_default() += g.total_wei;
     }
 
+    // (b2) recognised system credits → kind=system eth_transfers rows
+    //   (spec §(b)/(c): L1 withdrawals/block-reward, OP deposit mints).
+    //   Also fold the signed total per address for reconciliation so a
+    //   recognised system event produces ZERO residual (never a stall).
+    let mut sys: std::collections::HashMap<Address, i128> = Default::default();
+    for sc in &i.system_signed {
+        if !i.watched.contains(&sc.address) {
+            continue;
+        }
+        *sys.entry(sc.address).or_default() += sc.signed_wei;
+        let (direction, amount) = if sc.signed_wei >= 0 {
+            (Direction::In, sc.signed_wei.unsigned_abs())
+        } else {
+            (Direction::Out, sc.signed_wei.unsigned_abs())
+        };
+        // System events are block-scoped (no originating tx). The
+        // `eth_transfers` natural PK is
+        // `(chain_id, block_hash, tx_hash, trace_path)`; SQLite treats
+        // NULLs in a PRIMARY KEY as DISTINCT, so a NULL `tx_hash` would
+        // break the INSERT-OR-REPLACE idempotency the restart-resume
+        // contract relies on. We therefore key the row's tx-slot by the
+        // (unique-per-block) `block_hash` and disambiguate multiple
+        // system rows in one block by the per-source/per-address
+        // `trace_path` — stable across replays, collision-free.
+        eth.push(EthTransferRow {
+            chain_id: i.chain_id,
+            block_number: i.block_number,
+            block_hash: i.block_hash,
+            tx_hash: Some(i.block_hash),
+            trace_path: format!("system:{}:{:#x}", sc.source, sc.address),
+            address: sc.address,
+            direction,
+            counterparty: sc.counterparty,
+            amount_wei: U256::from(amount),
+            kind: EthKind::System,
+            reverted: false,
+        });
+    }
+
     // (c) reconciliation — every touched watched address must balance
-    let sys: std::collections::HashMap<Address, i128> = i.system_signed.iter().copied().collect();
     for (addr, observed) in &i.account_deltas {
         if !i.watched.contains(addr) {
             continue;
@@ -463,8 +506,50 @@ pub fn process_committed_block_inner<S: StackAdapter>(
         }
     }
 
-    // ── (5) system_signed: recognised non-call credits (L1: empty).
-    let system_signed = adapter.system_credits();
+    // ── (5) system_signed: recognised non-call credits.
+    //   L1: beacon-chain withdrawals (post-Shanghai `body().withdrawals`,
+    //   amount GWEI→wei via `Withdrawal::amount_wei`) + the post-merge
+    //   block "reward" = Σ priority fee credited to the block
+    //   `beneficiary` (no captured CALL frame). Pre-merge fixed block
+    //   rewards are out of scope (forward-only on post-merge networks).
+    let system_signed = {
+        let beneficiary = block.header().beneficiary();
+        let base_fee_u128 = u128::from(base_fee.unwrap_or(0));
+
+        // Withdrawals: post-Shanghai blocks carry `Withdrawals`; each
+        // entry credits `address` with `amount` GWEI.
+        let withdrawals: Vec<(Address, U256)> = block
+            .body()
+            .withdrawals
+            .as_ref()
+            .map(|ws| ws.iter().map(|w| (w.address, w.amount_wei())).collect())
+            .unwrap_or_default();
+
+        // Per-tx (effective_gas_price, gas_used) for the beneficiary
+        // priority-fee sum (the post-merge block "reward").
+        let mut tx_fees: Vec<(u128, u64)> = Vec::new();
+        {
+            let receipts = outcome.receipts_by_block(block_number);
+            let mut prev_cumulative: u64 = 0;
+            for (tx_idx, tx) in block.body().transactions.iter().enumerate() {
+                let receipt = match receipts.get(tx_idx) {
+                    Some(r) => r,
+                    None => break,
+                };
+                let gas_used = receipt.cumulative_gas_used.saturating_sub(prev_cumulative);
+                prev_cumulative = receipt.cumulative_gas_used;
+                tx_fees.push((tx.effective_gas_price(base_fee), gas_used));
+            }
+        }
+
+        crate::system::l1_system_credits(
+            watched,
+            &withdrawals,
+            beneficiary,
+            base_fee_u128,
+            &tx_fees,
+        )
+    };
 
     process_block(BlockInputs {
         chain_id,

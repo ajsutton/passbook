@@ -1,9 +1,12 @@
 //! L1 (Ethereum) `StackAdapter`.
 //!
-//! A stateless, unit adapter: vanilla Ethereum has no OP-style L1 data fee
-//! and no stack-specific system balance credits, so `l1_data_fee_wei`
-//! always returns `None` and `system_credits` keeps the trait default
-//! (`Vec::new()`). The L1 binary (Task 8.4) supplies it to
+//! A stateless, unit adapter: vanilla Ethereum has no OP-style L1 data
+//! fee, so `l1_data_fee_wei` always returns `None`. Recognised L1 system
+//! balance credits (beacon withdrawals + the post-merge beneficiary
+//! priority-fee block reward) are NOT surfaced through this adapter — they
+//! need block/receipt input and are computed at the `ChainExec` seam
+//! (`passbook_core::system::l1_system_credits`). The L1 binary supplies it
+//! to
 //! `run_passbook` via a `|| EthereumStack` closure
 //! (`make_adapter: impl Fn() -> S + Send + Sync + 'static`), so the
 //! type is `Clone`/`Copy`/`Default` to satisfy that consumption trivially.
@@ -28,6 +31,5 @@ mod tests {
     #[test]
     fn ethereum_adapter_never_has_l1_fee() {
         assert_eq!(EthereumStack.l1_data_fee_wei(0), None);
-        assert!(EthereumStack.system_credits().is_empty());
     }
 }
