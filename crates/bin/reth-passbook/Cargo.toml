@@ -1,0 +1,18 @@
+[package]
+name = "reth-passbook"
+edition.workspace = true
+license.workspace = true
+version = "0.1.0"
+
+[[bin]]
+name = "reth-passbook"
+path = "src/main.rs"
+
+[dependencies]
+passbook-core = { path = "../../passbook-core" }
+passbook-stack-ethereum = { path = "../../passbook-stack-ethereum" }
+reth-ethereum.workspace = true
+clap.workspace = true
+eyre.workspace = true
+tokio.workspace = true
+futures.workspace = true

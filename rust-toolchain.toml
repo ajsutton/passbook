@@ -1,0 +1,7 @@
+[toolchain]
+# The optimism monorepo `rust/` workspace declares rust-version = "1.94".
+# System default `stable` = rustc 1.95.0. We pin explicitly to 1.95.0 for
+# reproducibility (bump only if a build error demands it; record the real
+# minimum in docs/reth-pin.md).
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

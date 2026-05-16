@@ -1,0 +1,22 @@
+# Keep the Docker build hermetic and reproducible from source.
+#
+# These four are EXCLUDED on purpose:
+#   - target/   : host build artifacts (wrong arch / stale; image builds fresh)
+#   - .git/     : not needed; build copies the working tree
+#   - .vendor/  : host-local gitignored shallow optimism mirror — the build
+#                 MUST re-seed it inside the build stage, never copy the host's
+#   - .cargo/   : host-local gitignored generated config.toml containing an
+#                 ABSOLUTE host path — copying it would break the in-image build
+target/
+.git/
+.vendor/
+.cargo/
+
+# Misc local cruft
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# Don't ship the Dockerfile/dockerignore into the build context
+Dockerfile
+.dockerignore

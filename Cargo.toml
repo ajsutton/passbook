@@ -1,0 +1,104 @@
+[workspace]
+resolver = "2"
+# Only crates that actually exist are listed. Task 0.3 creates the member
+# crates (passbook-core, the stack crates, the bin crates) and adds each one
+# to this list as it is created. Do NOT add members that do not exist yet —
+# listing a nonexistent member breaks `cargo metadata` / `--locked`.
+members = [
+    "crates/spike",
+    "crates/passbook-core",
+    "crates/passbook-stack-ethereum",
+    "crates/passbook-stack-optimism",
+    "crates/bin/reth-passbook",
+    "crates/bin/op-reth-passbook",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+# ── Single pin table ─────────────────────────────────────────────────────────
+# This `[workspace.dependencies]` table is the SINGLE source of truth for every
+# reth / op-reth / revm and third-party dependency the whole project uses.
+# Member crates always depend via `<crate>.workspace = true`; never re-pin a
+# version in a member manifest.
+#
+# Co-resolution strategy (see docs/reth-pin.md):
+#
+#   * The OP facade `reth-op` (v1.11.3) is NOT published to crates.io yet. We
+#     pull it from the ethereum-optimism/optimism monorepo at a pinned rev,
+#     declared here against the STABLE REMOTE url so a clean checkout is
+#     correct with no local state. The monorepo full clone is multi-GB; for
+#     speed `scripts/seed-vendor.sh` creates a shallow depth-1 local mirror at
+#     `.vendor/optimism` and writes a GITIGNORED `.cargo/config.toml`
+#     that source-replaces the whole optimism git source onto that mirror
+#     (covers `reth-op`, `reth-optimism-evm` AND every sibling monorepo crate).
+#     The mirror is a pure optimization, not a correctness requirement. Cargo
+#     locates the crate `reth-op` by name inside that repo's `rust/` workspace.
+#   * The L1 facade `reth-ethereum` (and `reth-exex-test-utils`) is pinned to
+#     paradigmxyz/reth at the EXACT SAME rev (88505c7…) that the monorepo's
+#     `rust/Cargo.toml` pins all of its upstream reth crates to. Because both
+#     facades resolve their shared transitive `reth-*` crates from one
+#     identical git rev, they unify into a single dependency graph (reth
+#     v2.2.0).
+#   * revm / revm-inspectors / alloy-evm are pinned to the exact crates.io
+#     versions the monorepo uses, so the shared revm stack also unifies.
+#   * The third-party alloy / jsonrpsee versions are pinned to the EXACT
+#     versions the reth v2.2.0 graph already resolved in the committed
+#     `Cargo.lock` (a mismatched alloy/revm version causes trait-coherence
+#     E0119 breakage — do not float). See "Workspace third-party pins" in
+#     docs/reth-pin.md for the recorded versions and Cargo.lock evidence.
+#
+# op-reth is not yet on crates.io — migrate `reth-op` to the published crate
+# when it exists (drop the local mirror + `.vendor/` machinery then).
+[workspace.dependencies]
+# ── reth / op-reth facades + monorepo crates ────────────────────────────────
+reth-op = { git = "https://github.com/ethereum-optimism/optimism", rev = "27bf9194a08aef70f3fdbff6b3d04bdd70af62ff", default-features = false, features = ["node", "cli"] }
+reth-optimism-evm = { git = "https://github.com/ethereum-optimism/optimism", rev = "27bf9194a08aef70f3fdbff6b3d04bdd70af62ff", default-features = false }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4", features = ["full", "cli"] }
+reth-exex-test-utils = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+
+# ── revm stack (exact crates.io versions the monorepo uses) ─────────────────
+revm = "38.0.0"
+revm-inspectors = "0.39.0"
+alloy-evm = "0.34.0"
+
+# ── alloy primitives/types (MUST match the reth v2.2.0 locked graph) ────────
+# Pinned to the exact versions already resolved in Cargo.lock for the reth
+# v2.2.0 graph. A mismatched alloy version causes E0119 trait-coherence
+# breakage — do not float these.
+alloy-primitives = "1.6.0"
+alloy-consensus = "2.0.4"
+alloy-eips = "2.0.4"
+
+# ── storage ─────────────────────────────────────────────────────────────────
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# ── JSON-RPC (version matches what reth v2.2.0 uses in Cargo.lock) ──────────
+jsonrpsee = { version = "0.26.0", features = ["server", "macros"] }
+
+# ── CLI / async / misc third-party ──────────────────────────────────────────
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+futures = "0.3"
+eyre = "0.6"
+
+# ── dev-dependencies ────────────────────────────────────────────────────────
+tempfile = "3"
+# Pinned to the exact versions the reth v2.2.0 graph already resolved in
+# Cargo.lock (both are pulled transitively by reth-exex-test-utils' alloy
+# stack), so adding them as dev-deps does NOT change Cargo.lock. Used only
+# by the passbook-core ExEx integration test (Task 6.4) to build a real,
+# signed, executable synthetic block + genesis allocation.
+alloy-signer-local = "2.0.4"
+alloy-network = "2.0.4"
+alloy-genesis = "2.0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

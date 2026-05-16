@@ -1,0 +1,10 @@
+[package]
+name = "passbook-stack-ethereum"
+edition.workspace = true
+license.workspace = true
+version = "0.1.0"
+
+[dependencies]
+passbook-core = { path = "../passbook-core" }
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true

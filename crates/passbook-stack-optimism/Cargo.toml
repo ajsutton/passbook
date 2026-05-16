@@ -1,0 +1,16 @@
+[package]
+name = "passbook-stack-optimism"
+edition.workspace = true
+license.workspace = true
+version = "0.1.0"
+
+[dependencies]
+passbook-core = { path = "../passbook-core" }
+reth-optimism-evm.workspace = true
+reth-op.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+revm.workspace = true
+eyre.workspace = true
+tracing.workspace = true

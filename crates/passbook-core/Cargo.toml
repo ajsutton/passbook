@@ -1,0 +1,29 @@
+[package]
+name = "passbook-core"
+edition.workspace = true
+license.workspace = true
+version = "0.1.0"
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+revm.workspace = true
+rusqlite.workspace = true
+jsonrpsee.workspace = true
+eyre.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+reth-ethereum.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+reth-exex-test-utils.workspace = true
+tempfile.workspace = true
+alloy-signer-local.workspace = true
+alloy-network.workspace = true
+alloy-genesis.workspace = true
