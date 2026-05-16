@@ -1534,6 +1534,112 @@ async fn restart_resumes_no_gap_no_dup() {
     }
 }
 
+/// Issue #7 (I3): a node that has captured a block into a temp-FILE ledger
+/// for one chain, then restarts pointed at the SAME db path but with a
+/// DIFFERENT `--chain`, must fail `Ledger::open` loudly instead of silently
+/// mixing chains. Mirrors the restart-safety scenario but flips the chain id
+/// on the reopen and asserts the abort + that durable state is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_with_different_chain_id_aborts() {
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address();
+    let watched = w_signer.address();
+
+    let chain_id = 0x5237u64;
+    let other_chain_id = 0x9999u64;
+    let gas_price = 1_000_000_000u128;
+    let amt = U256::from(2_500_000_000_000_000u64);
+
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    alloc.insert(watched, acct(funded, None));
+    let fwd = Address::repeat_byte(0xF0);
+    alloc.insert(
+        fwd,
+        acct(U256::ZERO, Some(selfdestruct_forwarder_code(watched))),
+    );
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    let tx = sign_legacy(
+        &s_signer,
+        chain_id,
+        0,
+        TxKind::Call(fwd),
+        amt,
+        200_000,
+        gas_price,
+        Bytes::new(),
+    );
+    let recovered = build_block(&chain_spec, 1, chain_spec.genesis_hash(), 12, vec![tx]);
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let exec_out = evm_config
+        .executor(genesis_state(&chain_spec))
+        .execute(&recovered)
+        .expect("block execution");
+    let outcome = ExecutionOutcome::single(1, exec_out);
+    let chain = Chain::new(
+        vec![recovered.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
+
+    // ── Run 1: capture block 1 into the ledger bound to `chain_id`.
+    let n_eth = {
+        let ledger = Arc::new(Mutex::new(
+            Ledger::open(&db_path, chain_id).expect("ledger open 1"),
+        ));
+        let (driver, mut handle) = spawn_driver(&chain_spec, &cfg, &ledger).await;
+        handle
+            .send_notification_chain_committed(chain.clone())
+            .await
+            .expect("send committed run1");
+        wait_finished_height(&mut handle, 1).await;
+        driver.abort();
+        let _ = driver.await;
+
+        let g = ledger.lock().unwrap();
+        let e: i64 = g
+            .conn()
+            .query_row("SELECT COUNT(*) FROM eth_transfers", [], |r| r.get(0))
+            .unwrap();
+        e
+    };
+    assert!(n_eth >= 1, "run 1 must have written at least one eth row");
+
+    // ── Run 2: reopen the SAME db file with a DIFFERENT chain id. This must
+    //    be a hard error — not a silent mixed-chain ledger.
+    let err_msg = match Ledger::open(&db_path, other_chain_id) {
+        Ok(_) => panic!("reopening with a mismatched chain id must fail"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err_msg.contains("chain-id mismatch"),
+        "unexpected error: {err_msg}"
+    );
+
+    // Durable state is untouched: reopening with the ORIGINAL chain id still
+    // works and retains run 1's rows.
+    let ledger = Ledger::open(&db_path, chain_id).expect("reopen with original chain id");
+    let e: i64 = ledger
+        .conn()
+        .query_row("SELECT COUNT(*) FROM eth_transfers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(e, n_eth, "rejected reopen left durable state intact");
+    let stored: String = ledger
+        .conn()
+        .query_row("SELECT v FROM meta WHERE k='chain_id'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, chain_id.to_string(), "stored chain_id unchanged");
+}
+
 /// TOKEN bytecode: emit `LOG3(Transfer, from, to)` with `amount` as data.
 fn token_code(from: Address, to: Address, amount: U256) -> Bytes {
     let mut c = Vec::new();

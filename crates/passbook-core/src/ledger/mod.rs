@@ -62,6 +62,21 @@ impl Ledger {
             if v != schema::SCHEMA_VERSION {
                 eyre::bail!("unsupported schema version {v}");
             }
+            // Fail-closed chain-id guard: an existing ledger is bound to the
+            // chain it was created for. `delete_blocks`/queries are
+            // `chain_id`-scoped, so reopening with a different `--chain`
+            // would silently mix chains in one DB. Abort loudly (spec's
+            // stated preference) rather than corrupt a mixed ledger.
+            let stored_chain_id: String =
+                conn.query_row("SELECT v FROM meta WHERE k='chain_id'", [], |r| {
+                    r.get(0)
+                })?;
+            if stored_chain_id != chain_id.to_string() {
+                eyre::bail!(
+                    "chain-id mismatch: existing ledger is for chain {stored_chain_id}, \
+                     but configured chain is {chain_id}"
+                );
+            }
         }
         Ok(Self { conn })
     }
@@ -93,6 +108,34 @@ mod tests {
             })
             .unwrap();
         assert_eq!(v, schema::SCHEMA_VERSION);
+    }
+
+    /// Issue #7 (I3): reopening an existing ledger with a different
+    /// `chain_id` must fail loudly rather than silently mix chains.
+    #[test]
+    fn reopen_with_mismatched_chain_id_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.db");
+        // Create the ledger bound to chain 1.
+        drop(Ledger::open(&path, 1).unwrap());
+        // Reopening with the SAME chain id succeeds.
+        drop(Ledger::open(&path, 1).expect("reopen with same chain id"));
+        // Reopening with a DIFFERENT chain id is a hard error and the
+        // stored chain_id is left untouched.
+        let msg = match Ledger::open(&path, 999) {
+            Ok(_) => panic!("reopen with mismatched chain id must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("chain-id mismatch"),
+            "unexpected error: {msg}"
+        );
+        let stored: String = {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.query_row("SELECT v FROM meta WHERE k='chain_id'", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(stored, "1", "stored chain_id must be left unchanged");
     }
 
     /// Issue #4 (C3): opening a legacy v1 DB must transparently migrate it
