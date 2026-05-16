@@ -59,6 +59,21 @@ pub fn write_block(conn: &mut Connection, b: &BlockBatch) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Single-row write for an unexplained-residual block. The ExEx loop calls
+/// this when `process_one_committed_block` returns `UnexplainedResidual`
+/// (it then stalls and retries — this row records the stall for the health
+/// query). INSERT OR REPLACE on the natural PK keeps retries idempotent.
+pub fn write_unattributed(
+    conn: &mut Connection, r: &UnattributedDeltaRow,
+) -> eyre::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO unattributed_deltas VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        rusqlite::params![
+            r.chain_id, r.block_number, h(&r.block_hash), a(&r.address),
+            u(&r.observed_wei), u(&r.attributed_wei), u(&r.residual_wei)])?;
+    Ok(())
+}
+
 /// Reorg handling: drop every row for the reverted block hashes.
 pub fn delete_blocks(
     conn: &mut Connection, chain_id: u64, hashes: &[alloy_primitives::B256],
@@ -110,6 +125,21 @@ mod tests {
         let last: String = l.conn().query_row(
             "SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0)).unwrap();
         assert_eq!(last, "100");
+    }
+
+    #[test]
+    fn write_unattributed_is_queryable() {
+        let (mut l, _tmp) = ledger();
+        let row = UnattributedDeltaRow {
+            chain_id: 1, block_number: 42, block_hash: B256::repeat_byte(4),
+            address: Address::repeat_byte(0xab), observed_wei: U256::from(7),
+            attributed_wei: U256::ZERO, residual_wei: U256::from(7),
+        };
+        write_unattributed(l.conn_mut(), &row).unwrap();
+        write_unattributed(l.conn_mut(), &row).unwrap(); // retry -> no dup
+        let n: i64 = l.conn().query_row(
+            "SELECT count(*) FROM unattributed_deltas", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

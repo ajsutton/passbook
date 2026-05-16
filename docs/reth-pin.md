@@ -437,3 +437,105 @@ instead of private-field access, and the `CreateScheme` import path
 (`context_interface`, not `interpreter`) — plus awareness that the trait
 carries three defaulted generic params. Task 6.4 should expect to pass an
 `EthInterpreter`-typed context for the default impl to apply.
+
+## reth v2.2.0 ExEx API deltas (Task 6.3)
+
+How the real reth **v2.2.0** ExEx surface (paradigmxyz/reth rev
+`88505c7…`, facade `reth-ethereum 2.2.0`) differed from the plan
+candidate, verified against the pinned source under
+`~/.cargo/git/checkouts/reth-e231042ee7db3fb7/88505c7/` (and
+`reth-primitives-traits 0.3.1` from crates.io for `RecoveredBlock`).
+**Load-bearing for Task 6.4** (it writes the `process_one_committed_block`
+body and the integration harness).
+
+### Verified module paths (facade `reth-ethereum`)
+
+| Symbol | Path the loop compiles against | Source |
+|--------|--------------------------------|--------|
+| `ExExContext`, `ExExEvent` | `reth_ethereum::exex::{ExExContext, ExExEvent}` | `pub use reth_exex as exex;` (facade lib.rs:65) |
+| `ExExNotification` | `reth_ethereum::exex::ExExNotification` | same re-export |
+| `FullNodeComponents` | `reth_ethereum::node::api::FullNodeComponents` | `node` mod → `pub use reth_node_api as api;` |
+| `EthChainSpec` | `reth_ethereum::chainspec::EthChainSpec` | `chainspec` mod → `pub use reth_chainspec::*;` |
+
+### Deltas vs the candidate
+
+- **`ExExContext` field types (exact).** `crates/exex/exex/src/context.rs`:
+  `pub struct ExExContext<Node: FullNodeComponents>` with
+  `pub notifications: ExExNotifications<Node::Provider, Node::Evm>`,
+  `pub events: UnboundedSender<ExExEvent>`,
+  `pub config: NodeConfig<<Node::Types as NodeTypes>::ChainSpec>`,
+  `pub components: Node`. Matches the candidate's assumed field names.
+
+- **`notifications` Stream item type.** `ExExNotifications<P, E>` implements
+  `Stream` with **`type Item = eyre::Result<ExExNotification<E::Primitives>>`**
+  (`crates/exex/exex/src/notifications.rs:178`). So
+  `while let Some(notification) = ctx.notifications.try_next().await? {`
+  (via `futures::TryStreamExt`) is correct verbatim — the `?` unwraps the
+  inner `eyre::Result`. Confirmed identical to the spike compile-gate.
+
+- **`ExExNotification` chain accessors.** `crates/exex/exex/src/notification.rs`:
+  `pub fn committed_chain(&self) -> Option<Arc<Chain<N>>>` and
+  `pub fn reverted_chain(&self) -> Option<Arc<Chain<N>>>` — exactly the
+  candidate's shapes. `N` defaults to `reth_chain_state::EthPrimitives`;
+  the generic flows from `ExExNotification<E::Primitives>`.
+
+- **`Chain` methods.** `crates/evm/execution-types/src/chain.rs`:
+  `pub fn blocks_iter(&self) -> impl Iterator<Item = &RecoveredBlock<N::Block>>`,
+  `pub fn tip(&self) -> &RecoveredBlock<N::Block>`,
+  `pub fn range(&self) -> RangeInclusive<BlockNumber>`. The candidate's
+  `chain.blocks_iter()` / `chain.tip()` are correct. Note `blocks_iter()`
+  yields **`&RecoveredBlock`** (a *recovered* block, not a bare `SealedBlock`)
+  — Task 6.4's body builds `BlockInputs` from `&RecoveredBlock`.
+
+- **Block hash / num_hash.** `RecoveredBlock`
+  (`reth-primitives-traits 0.3.1` `src/block/recovered.rs`) provides
+  `pub fn hash(&self) -> BlockHash` (= `B256`) and
+  `pub fn num_hash(&self) -> BlockNumHash`. The loop uses `block.hash()`
+  for the per-block hash (reverted-chain deletes and the
+  `UnattributedDeltaRow`) and `chain.tip().num_hash()` for
+  `FinishedHeight` — both compile, matching the candidate's
+  `block.hash()` / `chain.tip().num_hash()` hints.
+
+- **`ExExEvent::FinishedHeight(BlockNumHash)`.**
+  `crates/exex/exex/src/event.rs:5`: `pub enum ExExEvent { … FinishedHeight(BlockNumHash) }`
+  (`BlockNumHash` = `alloy_eips::BlockNumHash`). `ctx.events` is an
+  `UnboundedSender<ExExEvent>`, so `ctx.events.send(ExExEvent::FinishedHeight(
+  chain.tip().num_hash()))?` is verbatim correct.
+
+- **chain id accessor — the one real correction.** The candidate suggested
+  `ctx.config.chain.chain().id()`. In v2.2.0 `ctx.config.chain` is
+  `Arc<<Node::Types as NodeTypes>::ChainSpec>`. That associated type is
+  bound `EthChainSpec` (`crates/node/types/src/lib.rs:31`), and
+  `EthChainSpec` (`crates/chainspec/src/api.rs:14`) provides a **direct
+  `fn chain_id(&self) -> u64`** (default impl over `fn chain(&self) -> Chain`).
+  The loop uses `ctx.config.chain.chain_id()` — but this **requires the
+  `EthChainSpec` trait to be in scope**: `use
+  reth_ethereum::chainspec::EthChainSpec;`. Without that import the build
+  fails `E0599: no method named chain_id … trait EthChainSpec … not in
+  scope`. (`.chain().id()` would also work but pulls in `alloy_chains::Chain`;
+  `chain_id()` is the minimal, generic, node-agnostic path and is what
+  Task 6.4 / the OP binary should use.)
+
+### Node-generic checkpoint (CRITICAL — PASSED)
+
+`pub async fn run_passbook<Node, S>(mut ctx: ExExContext<Node>, …) where
+Node: FullNodeComponents, S: StackAdapter` compiles cleanly against the
+re-exported upstream ExEx / node-api surface of the **L1 facade
+`reth-ethereum` only** — no extra upstream-reth crate was needed in
+`passbook-core` (the existing `reth-ethereum` dep + `EthChainSpec` from its
+own `chainspec` re-export sufficed). This is the same node-generic
+signature shape the spike already proved type-checks for **both**
+`EthereumNode` and `OpNode`, so the dependency boundary flagged in Task 0.3
+holds: one ExEx fn body in `passbook-core` is usable by both stacks. No
+restructuring of the dependency boundary was required.
+
+`process_one_committed_block` is a `todo!()` stub. Its `chain`/`block`
+params are kept as **inferred generics** (`C`/`B`) rather than naming
+`Arc<Chain<N>>` / `RecoveredBlock<N::Block>` explicitly — this lets the
+signature unify with the call site for any node primitive set without
+importing the upstream `Chain` generic into `passbook-core` yet. Task 6.4
+replaces the stub: it will need to name the concrete reth types (likely
+`reth_ethereum::provider`/execution-types `Chain` and
+`reth_ethereum::primitives` `RecoveredBlock`) and add the real trait
+bounds, plus thread the revm `ValueInspector` (see "revm 38 API deltas",
+`EthInterpreter`-typed context).
