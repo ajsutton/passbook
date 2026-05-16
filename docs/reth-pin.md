@@ -729,3 +729,85 @@ passbook-core --offline` locked **0 packages** (no version/rev change) —
 the only `Cargo.lock` change is the 3 new dependency-edge lines under the
 `passbook-core` package entry. `--locked` stays green; pinned reth/op
 revs untouched.
+
+## jsonrpsee 0.26 RPC API (Task 7.1 — load-bearing for Tasks 8.4 / 8.5)
+
+The `passbook` namespace lives in `crates/passbook-core/src/rpc.rs`. Tasks
+8.4/8.5 register it into reth's RPC server via `extend_rpc_modules` using
+`PassbookApiServer::into_rpc()`. The exact pinned-jsonrpsee-0.26 API used
+(verified against the registry source at
+`~/.cargo/registry/src/index.crates.io-*/jsonrpsee-{proc-macros,core,types}-0.26.0`):
+
+- **Macro:** `#[jsonrpsee::proc_macros::rpc(server, namespace = "passbook")]`
+  on a `pub trait PassbookApi` with `#[method(name = "...")]` on each fn.
+  Default namespace separator `_`, so the wire method names are
+  `passbook_health` and `passbook_getTransfers`.
+  (`jsonrpsee-proc-macros-0.26.0/src/lib.rs:64` — server trait is named
+  `<Trait>Server`.)
+- **Server trait:** the macro generates **`PassbookApiServer`** (input trait
+  name + `Server`). It supplies a provided `fn into_rpc(self) ->
+  RpcModule<Self>` — that is the registration entry point for 8.4/8.5.
+- **Result type:** `jsonrpsee::core::RpcResult<T>` =
+  `Result<T, jsonrpsee::types::ErrorObjectOwned>`
+  (`jsonrpsee-core-0.26.0/src/lib.rs:67`).
+- **`#[async_trait::async_trait]` IS required** on the `impl
+  PassbookApiServer for PassbookRpc` block. jsonrpsee 0.26 still desugars
+  async trait methods via `async-trait`; `jsonrpsee::core::async_trait`
+  (`jsonrpsee-core-0.26.0/src/lib.rs:63`) re-exports the same macro. We use
+  the direct `async-trait` workspace dep — either is equivalent.
+- **Error constructor:** `jsonrpsee::types::ErrorObjectOwned::owned(code:
+  i32, message: impl Into<String>, data: Option<S: Serialize>)`
+  (`jsonrpsee-types-0.26.0/src/error.rs:70`). We use code `-32000`
+  (application-error range) and `None::<()>` for data.
+- **DELTA vs the Task 7.1 candidate (the one material difference):**
+  jsonrpsee 0.26's `IntoResponse` blanket impl
+  (`jsonrpsee-core-0.26.0/src/server/mod.rs:63`) bounds the success type
+  `T: serde::Serialize + Clone`. The candidate's return types (`Health`,
+  `TransfersPage`, and transitively `TransferRowOut`) derived only
+  `Serialize`, so the `#[rpc]` macro failed to compile with `the trait
+  bound TransfersPage: Clone is not satisfied`. **Fix:** added `Clone` to
+  the `#[derive(...)]` of `Health`, `TransferRowOut`, `TransfersPage` in
+  `queries.rs` (now `#[derive(Debug, Clone, Serialize)]`). No other
+  deviation from the candidate — server trait name, `async_trait` need,
+  error type, and macro form are all exactly as the candidate predicted.
+- **Errors never swallowed:** every fallible step (mutex lock poison; the
+  `health` / `get_transfers` query) is mapped through the `err(...)` helper
+  into an `ErrorObjectOwned` and returned as a JSON-RPC error. There is no
+  `unwrap`, no `Default`, no empty-result-on-error path. A unit test
+  (`poisoned_lock_is_a_jsonrpc_error_not_swallowed`) poisons the shared
+  mutex and asserts the call returns an error with code `-32000` rather
+  than panicking or returning an empty page.
+- `PassbookRpc { ledger: Arc<Mutex<Ledger>>, chain_id: u64 }` holds the
+  **same** `Arc<Mutex<Ledger>>` the ExEx writer uses; the RPC side is
+  read-only (the ExEx is the sole writer). `getTransfers` calls
+  `get_transfers(..., 500)` (server-side soft page target).
+
+## `get_transfers` is now block-complete (Task 1.6 plan amendment — RESOLVED)
+
+The Task 1.6 review flagged that the original `get_transfers` applied
+`LIMIT lim` to each of the 4 category queries independently, merged, sorted
+by block, and set `next_cursor = last_block + 1` — which **silently skipped
+caller rows** in two ways: (a) per-category truncation when one category
+alone exceeded `lim` in the window; (b) the `+1` skipped the remainder of a
+block whose rows straddled the page boundary.
+
+**Amendment resolved in Task 7.1.** `crates/passbook-core/src/ledger/queries.rs`
+now issues a single `UNION ALL` over the 4 category subqueries (projected to
+the common `TransferRowOut` shape), ordered by `(block_number, category,
+rowid)` — a total deterministic order — and uses a **block-complete cursor**:
+fetch `lim+1` rows; if `<= lim` the page is the whole remaining stream
+(`next_cursor = None`); if `lim+1`, a block is never split — emit all rows of
+fully-present blocks and resume the cursor at the first untouched block, and
+when a single block alone exceeds `lim` re-query that block in full so it is
+emitted whole (the page may legitimately exceed `lim` to complete a block).
+The invariant — following `next_cursor` to `None` yields every matching row
+exactly once, no skip, no dup, blocks never split — is proven by 5 unit
+tests in `queries.rs` (single-category > lim across blocks; single block
+> lim at a page boundary never split; multi-category merged/complete; kind
+filter; empty/out-of-range). The `TransferRowOut` / `TransfersPage` /
+`Health` shapes are unchanged except for the added `Clone` derive (required
+by jsonrpsee 0.26, above). The `kind` filter still selects the *category*
+(`None` = all; `Some("eth"|"erc20"|"gas"|"unattributed")`); the eth-internal
+`kind` sub-values (`top_level`/`internal`/`system`) are surfaced verbatim in
+the output `kind` field and were never used as a filter value (behaviour
+preserved).
