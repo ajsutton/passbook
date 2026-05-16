@@ -2,28 +2,49 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Health { pub last_block: Option<u64>, pub chain_id: Option<u64> }
+pub struct Health {
+    pub last_block: Option<u64>,
+    pub chain_id: Option<u64>,
+}
 
 pub fn health(conn: &Connection) -> eyre::Result<Health> {
-    let last_block = conn.query_row(
-        "SELECT v FROM meta WHERE k='last_block'", [], |r| r.get::<_,String>(0))
-        .ok().and_then(|s| s.parse().ok());
-    let chain_id = conn.query_row(
-        "SELECT v FROM meta WHERE k='chain_id'", [], |r| r.get::<_,String>(0))
-        .ok().and_then(|s| s.parse().ok());
-    Ok(Health { last_block, chain_id })
+    let last_block = conn
+        .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let chain_id = conn
+        .query_row("SELECT v FROM meta WHERE k='chain_id'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|s| s.parse().ok());
+    Ok(Health {
+        last_block,
+        chain_id,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferRowOut {
-    pub category: &'static str, pub block_number: u64, pub block_hash: String,
-    pub tx_hash: Option<String>, pub address: String, pub direction: Option<String>,
-    pub counterparty: Option<String>, pub token: Option<String>,
-    pub amount: String, pub kind: Option<String>,
+    pub category: &'static str,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub tx_hash: Option<String>,
+    pub address: String,
+    pub direction: Option<String>,
+    pub counterparty: Option<String>,
+    pub token: Option<String>,
+    pub amount: String,
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct TransfersPage { pub rows: Vec<TransferRowOut>, pub next_cursor: Option<u64> }
+pub struct TransfersPage {
+    pub rows: Vec<TransferRowOut>,
+    pub next_cursor: Option<u64>,
+}
 
 /// The `category` column carries an integer tag in the UNION ALL so we can use
 /// it as a stable, cheap secondary sort key without string comparison. The map
@@ -82,10 +103,17 @@ fn category_str(tag: i64) -> &'static str {
 /// behaviour where `kind=Some("erc20"|"gas"|"unattributed")` picked a
 /// category and the eth `kind` sub-values were never used as a filter value
 /// (they are surfaced verbatim in the output `kind` field for eth rows).
+// signature is the spec-mandated query contract
+#[allow(clippy::too_many_arguments)]
 pub fn get_transfers(
-    conn: &Connection, chain_id: u64, address: &str,
-    from_block: Option<u64>, to_block: Option<u64>,
-    kind: Option<&str>, cursor: Option<u64>, limit: u32,
+    conn: &Connection,
+    chain_id: u64,
+    address: &str,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    kind: Option<&str>,
+    cursor: Option<u64>,
+    limit: u32,
 ) -> eyre::Result<TransfersPage> {
     let lo = cursor.or(from_block).unwrap_or(0) as i64;
     let hi = to_block.unwrap_or(u64::MAX).min(i64::MAX as u64) as i64;
@@ -133,23 +161,26 @@ pub fn get_transfers(
         let bn: i64 = r.get(1)?;
         let cat = category_str(tag);
         let kind: Option<String> = match tag {
-            0 => r.get(9)?,                         // eth: the eth_transfers.kind value
+            0 => r.get(9)?, // eth: the eth_transfers.kind value
             1 => Some("erc20".into()),
             2 => Some("gas".into()),
             _ => Some("unattributed".into()),
         };
-        Ok((bn, TransferRowOut {
-            category: cat,
-            block_number: bn as u64,
-            block_hash: r.get(2)?,
-            tx_hash: r.get(3)?,
-            address: r.get(4)?,
-            direction: r.get(5)?,
-            counterparty: r.get(6)?,
-            token: r.get(7)?,
-            amount: r.get(8)?,
-            kind,
-        }))
+        Ok((
+            bn,
+            TransferRowOut {
+                category: cat,
+                block_number: bn as u64,
+                block_hash: r.get(2)?,
+                tx_hash: r.get(3)?,
+                address: r.get(4)?,
+                direction: r.get(5)?,
+                counterparty: r.get(6)?,
+                token: r.get(7)?,
+                amount: r.get(8)?,
+                kind,
+            },
+        ))
     }
 
     // Fetch lim+1 ordered rows to detect "is there more?".
@@ -159,13 +190,17 @@ pub fn get_transfers(
            FROM ({UNION_SQL}) \
           WHERE (?5 < 0 OR category=?5) \
           ORDER BY block_number, category, rid \
-          LIMIT ?6");
+          LIMIT ?6"
+    );
     let mut stmt = conn.prepare(&sql)?;
     let mut fetched: Vec<(i64, TransferRowOut)> = Vec::new();
     let it = stmt.query_map(
         rusqlite::params![chain_id, address, lo, hi, want, lim + 1],
-        map_row)?;
-    for x in it { fetched.push(x?); }
+        map_row,
+    )?;
+    for x in it {
+        fetched.push(x?);
+    }
 
     // <= lim rows => the whole remaining stream fits; nothing was truncated.
     if (fetched.len() as i64) <= lim {
@@ -181,13 +216,17 @@ pub fn get_transfers(
 
     if cut > first_block {
         // Every row with block_number < cut is fully present. Emit those.
-        let rows: Vec<TransferRowOut> = fetched.into_iter()
+        let rows: Vec<TransferRowOut> = fetched
+            .into_iter()
             .filter(|(b, _)| *b < cut)
             .map(|(_, r)| r)
             .collect();
         // Resume AT `cut` (no row of `cut` was emitted). There is guaranteed
         // more (the lim+1-th row itself is at `cut`).
-        return Ok(TransfersPage { rows, next_cursor: Some(cut as u64) });
+        return Ok(TransfersPage {
+            rows,
+            next_cursor: Some(cut as u64),
+        });
     }
 
     // cut == first_block: a single block has more than `lim` rows. We must
@@ -197,21 +236,28 @@ pub fn get_transfers(
                 counterparty,token,amount,ek,rid \
            FROM ({UNION_SQL}) \
           WHERE (?5 < 0 OR category=?5) AND block_number=?6 \
-          ORDER BY block_number, category, rid");
+          ORDER BY block_number, category, rid"
+    );
     let mut bstmt = conn.prepare(&block_sql)?;
     let mut block_rows: Vec<TransferRowOut> = Vec::new();
     let it = bstmt.query_map(
         rusqlite::params![chain_id, address, lo, hi, want, cut],
-        map_row)?;
-    for x in it { block_rows.push(x?.1); }
+        map_row,
+    )?;
+    for x in it {
+        block_rows.push(x?.1);
+    }
 
     // Is there any row strictly after `cut` within range/filter?
     let more: bool = conn.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM ({UNION_SQL}) \
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM ({UNION_SQL}) \
                   WHERE (?5 < 0 OR category=?5) AND block_number>?6 \
-                    AND block_number<=?7)"),
+                    AND block_number<=?7)"
+        ),
         rusqlite::params![chain_id, address, lo, hi, want, cut, hi],
-        |r| r.get::<_, i64>(0))? != 0;
+        |r| r.get::<_, i64>(0),
+    )? != 0;
 
     Ok(TransfersPage {
         rows: block_rows,
@@ -236,20 +282,32 @@ mod tests {
 
     fn eth_row(bn: u64, nonce: u8) -> EthTransferRow {
         EthTransferRow {
-            chain_id: 1, block_number: bn, block_hash: B256::repeat_byte(bn as u8),
-            tx_hash: Some(B256::repeat_byte(nonce)), trace_path: nonce.to_string(),
-            address: Address::repeat_byte(ADDR), direction: Direction::In,
-            counterparty: Address::repeat_byte(0xbb), amount_wei: U256::from(nonce as u64 + 1),
-            kind: EthKind::TopLevel, reverted: false,
+            chain_id: 1,
+            block_number: bn,
+            block_hash: B256::repeat_byte(bn as u8),
+            tx_hash: Some(B256::repeat_byte(nonce)),
+            trace_path: nonce.to_string(),
+            address: Address::repeat_byte(ADDR),
+            direction: Direction::In,
+            counterparty: Address::repeat_byte(0xbb),
+            amount_wei: U256::from(nonce as u64 + 1),
+            kind: EthKind::TopLevel,
+            reverted: false,
         }
     }
     fn erc20_row(bn: u64, log: u64) -> Erc20TransferRow {
         Erc20TransferRow {
-            chain_id: 1, block_number: bn, block_hash: B256::repeat_byte(bn as u8),
-            tx_hash: B256::repeat_byte((log + 1) as u8), log_index: log,
-            token: Address::repeat_byte(0xcc), from: Address::repeat_byte(0xdd),
-            to: Address::repeat_byte(ADDR), amount: U256::from(log + 1),
-            address: Address::repeat_byte(ADDR), direction: Direction::In,
+            chain_id: 1,
+            block_number: bn,
+            block_hash: B256::repeat_byte(bn as u8),
+            tx_hash: B256::repeat_byte((log + 1) as u8),
+            log_index: log,
+            token: Address::repeat_byte(0xcc),
+            from: Address::repeat_byte(0xdd),
+            to: Address::repeat_byte(ADDR),
+            amount: U256::from(log + 1),
+            address: Address::repeat_byte(ADDR),
+            direction: Direction::In,
         }
     }
 
@@ -260,22 +318,39 @@ mod tests {
             eth.push(eth_row(bn, i as u8));
         }
         let b = BlockBatch {
-            chain_id: 1, block_number: bn, block_hash: B256::repeat_byte(bn as u8),
-            eth, erc20: vec![], gas: vec![], unattributed: vec![],
+            chain_id: 1,
+            block_number: bn,
+            block_hash: B256::repeat_byte(bn as u8),
+            eth,
+            erc20: vec![],
+            gas: vec![],
+            unattributed: vec![],
         };
         write_block(l.conn_mut(), &b).unwrap();
     }
 
     /// Walk the whole result set by following next_cursor; assert no skip,
     /// no dup, blocks never split, total == expected. Returns flattened rows.
-    fn drain(l: &crate::ledger::Ledger, kind: Option<&str>, lim: u32)
-        -> Vec<(u64, &'static str, String)> {
+    fn drain(
+        l: &crate::ledger::Ledger,
+        kind: Option<&str>,
+        lim: u32,
+    ) -> Vec<(u64, &'static str, String)> {
         let mut all: Vec<(u64, &'static str, String)> = Vec::new();
         let mut cursor: Option<u64> = None;
         let mut pages = 0;
         loop {
-            let p = get_transfers(l.conn(), 1, &format!("{:#x}", Address::repeat_byte(ADDR)),
-                None, None, kind, cursor, lim).unwrap();
+            let p = get_transfers(
+                l.conn(),
+                1,
+                &format!("{:#x}", Address::repeat_byte(ADDR)),
+                None,
+                None,
+                kind,
+                cursor,
+                lim,
+            )
+            .unwrap();
             // A block must never be split across a page boundary: the set of
             // block_numbers in this page and the next must be disjoint. We
             // enforce by recording the page's max block and asserting the
@@ -291,8 +366,10 @@ mod tests {
                     // every emitted block in this page is < c OR == c only if
                     // the page emitted that block whole. Cursor must advance.
                     if let Some(maxb) = p.rows.iter().map(|r| r.block_number).max() {
-                        assert!(c > maxb || c == maxb + 1 || c == maxb,
-                            "cursor {c} did not advance past page max {maxb}");
+                        assert!(
+                            c > maxb || c == maxb + 1 || c == maxb,
+                            "cursor {c} did not advance past page max {maxb}"
+                        );
                     }
                     cursor = Some(c);
                 }
@@ -305,9 +382,13 @@ mod tests {
     #[test]
     fn health_reports_last_block() {
         let (l, _t) = ledger();
-        l.conn().execute(
-            "INSERT INTO meta(k,v) VALUES('last_block','42')
-             ON CONFLICT(k) DO UPDATE SET v=excluded.v", []).unwrap();
+        l.conn()
+            .execute(
+                "INSERT INTO meta(k,v) VALUES('last_block','42')
+             ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                [],
+            )
+            .unwrap();
         assert_eq!(health(l.conn()).unwrap().last_block, Some(42));
     }
 
@@ -317,14 +398,19 @@ mod tests {
     fn single_category_over_limit_no_skip_no_dup() {
         let (mut l, _t) = ledger();
         // 50 blocks, 3 eth rows each = 150 rows; lim = 10.
-        for bn in 1..=50u64 { write_eth(&mut l, bn, 3); }
+        for bn in 1..=50u64 {
+            write_eth(&mut l, bn, 3);
+        }
         let got = drain(&l, Some("eth"), 10);
         assert_eq!(got.len(), 150, "must return every row exactly once");
         // Build the expected multiset and compare.
         let mut expected: Vec<(u64, &'static str)> = Vec::new();
-        for bn in 1..=50u64 { for _ in 0..3 { expected.push((bn, "eth")); } }
-        let mut got_bc: Vec<(u64, &'static str)> =
-            got.iter().map(|(b, c, _)| (*b, *c)).collect();
+        for bn in 1..=50u64 {
+            for _ in 0..3 {
+                expected.push((bn, "eth"));
+            }
+        }
+        let mut got_bc: Vec<(u64, &'static str)> = got.iter().map(|(b, c, _)| (*b, *c)).collect();
         got_bc.sort();
         expected.sort();
         assert_eq!(got_bc, expected, "exact multiset: no skip, no dup");
@@ -339,14 +425,13 @@ mod tests {
     #[test]
     fn single_block_over_limit_never_split() {
         let (mut l, _t) = ledger();
-        write_eth(&mut l, 1, 3);     // small block first
-        write_eth(&mut l, 2, 25);    // fat block: 25 rows, lim = 5
-        write_eth(&mut l, 3, 2);     // tail
+        write_eth(&mut l, 1, 3); // small block first
+        write_eth(&mut l, 2, 25); // fat block: 25 rows, lim = 5
+        write_eth(&mut l, 3, 2); // tail
         let addr = format!("{:#x}", Address::repeat_byte(ADDR));
 
         // Page 1: lim=5, block 1 (3) then we must complete block 2 (25) whole.
-        let p1 = get_transfers(l.conn(), 1, &addr, None, None, Some("eth"),
-            None, 5).unwrap();
+        let p1 = get_transfers(l.conn(), 1, &addr, None, None, Some("eth"), None, 5).unwrap();
         // The fat block must be entirely present in whichever page first
         // touches it; it must NOT be split. Walk pages and verify each block
         // appears in exactly one page in full.
@@ -361,14 +446,15 @@ mod tests {
         }
         let mut page_idx = 1;
         while let Some(c) = cursor {
-            let p = get_transfers(l.conn(), 1, &addr, None, None, Some("eth"),
-                Some(c), 5).unwrap();
+            let p = get_transfers(l.conn(), 1, &addr, None, None, Some("eth"), Some(c), 5).unwrap();
             for r in &p.rows {
                 *seen_by_block.entry(r.block_number).or_default() += 1;
                 let pg = *page_of_block.entry(r.block_number).or_insert(page_idx);
-                assert_eq!(pg, page_idx,
+                assert_eq!(
+                    pg, page_idx,
                     "block {} appeared in >1 page — block was split!",
-                    r.block_number);
+                    r.block_number
+                );
             }
             cursor = p.next_cursor;
             page_idx += 1;
@@ -389,20 +475,31 @@ mod tests {
         let (mut l, _t) = ledger();
         for bn in 1..=20u64 {
             let b = BlockBatch {
-                chain_id: 1, block_number: bn, block_hash: B256::repeat_byte(bn as u8),
+                chain_id: 1,
+                block_number: bn,
+                block_hash: B256::repeat_byte(bn as u8),
                 eth: vec![eth_row(bn, 0), eth_row(bn, 1)],
                 erc20: vec![erc20_row(bn, 0), erc20_row(bn, 1)],
                 gas: vec![GasPaymentRow {
-                    chain_id: 1, block_number: bn, block_hash: B256::repeat_byte(bn as u8),
-                    tx_hash: B256::repeat_byte(7), address: Address::repeat_byte(ADDR),
-                    gas_used: 21000, effective_gas_price: 1u128,
-                    l2_fee_wei: U256::from(21000), l1_fee_wei: None,
+                    chain_id: 1,
+                    block_number: bn,
+                    block_hash: B256::repeat_byte(bn as u8),
+                    tx_hash: B256::repeat_byte(7),
+                    address: Address::repeat_byte(ADDR),
+                    gas_used: 21000,
+                    effective_gas_price: 1u128,
+                    l2_fee_wei: U256::from(21000),
+                    l1_fee_wei: None,
                     total_wei: U256::from(21000),
                 }],
                 unattributed: vec![UnattributedDeltaRow {
-                    chain_id: 1, block_number: bn, block_hash: B256::repeat_byte(bn as u8),
-                    address: Address::repeat_byte(ADDR), observed_wei: U256::from(1),
-                    attributed_wei: U256::ZERO, residual_wei: U256::from(1),
+                    chain_id: 1,
+                    block_number: bn,
+                    block_hash: B256::repeat_byte(bn as u8),
+                    address: Address::repeat_byte(ADDR),
+                    observed_wei: U256::from(1),
+                    attributed_wei: U256::ZERO,
+                    residual_wei: U256::from(1),
                 }],
             };
             write_block(l.conn_mut(), &b).unwrap();
@@ -429,14 +526,22 @@ mod tests {
         let (mut l, _t) = ledger();
         for bn in 1..=5u64 {
             let b = BlockBatch {
-                chain_id: 1, block_number: bn, block_hash: B256::repeat_byte(bn as u8),
+                chain_id: 1,
+                block_number: bn,
+                block_hash: B256::repeat_byte(bn as u8),
                 eth: vec![eth_row(bn, 0)],
                 erc20: vec![erc20_row(bn, 0)],
                 gas: vec![GasPaymentRow {
-                    chain_id: 1, block_number: bn, block_hash: B256::repeat_byte(bn as u8),
-                    tx_hash: B256::repeat_byte(7), address: Address::repeat_byte(ADDR),
-                    gas_used: 1, effective_gas_price: 1u128,
-                    l2_fee_wei: U256::from(1), l1_fee_wei: None, total_wei: U256::from(1),
+                    chain_id: 1,
+                    block_number: bn,
+                    block_hash: B256::repeat_byte(bn as u8),
+                    tx_hash: B256::repeat_byte(7),
+                    address: Address::repeat_byte(ADDR),
+                    gas_used: 1,
+                    effective_gas_price: 1u128,
+                    l2_fee_wei: U256::from(1),
+                    l1_fee_wei: None,
+                    total_wei: U256::from(1),
                 }],
                 unattributed: vec![],
             };
@@ -448,16 +553,35 @@ mod tests {
         assert_eq!(drain(&l, Some("unattributed"), 100).len(), 0);
         assert_eq!(drain(&l, None, 100).len(), 15);
         // Unknown kind => empty page, no cursor.
-        let p = get_transfers(l.conn(), 1,
+        let p = get_transfers(
+            l.conn(),
+            1,
             &format!("{:#x}", Address::repeat_byte(ADDR)),
-            None, None, Some("nope"), None, 100).unwrap();
+            None,
+            None,
+            Some("nope"),
+            None,
+            100,
+        )
+        .unwrap();
         assert!(p.rows.is_empty());
         assert_eq!(p.next_cursor, None);
         // eth rows carry the internal kind value verbatim.
-        let p = get_transfers(l.conn(), 1,
+        let p = get_transfers(
+            l.conn(),
+            1,
             &format!("{:#x}", Address::repeat_byte(ADDR)),
-            None, None, Some("eth"), None, 100).unwrap();
-        assert!(p.rows.iter().all(|r| r.kind.as_deref() == Some("top_level")));
+            None,
+            None,
+            Some("eth"),
+            None,
+            100,
+        )
+        .unwrap();
+        assert!(p
+            .rows
+            .iter()
+            .all(|r| r.kind.as_deref() == Some("top_level")));
     }
 
     /// (5) Empty / out-of-range => empty page, next_cursor None.
@@ -467,21 +591,26 @@ mod tests {
         write_eth(&mut l, 100, 2);
         let addr = format!("{:#x}", Address::repeat_byte(ADDR));
         // No matching address.
-        let p = get_transfers(l.conn(), 1,
+        let p = get_transfers(
+            l.conn(),
+            1,
             &format!("{:#x}", Address::repeat_byte(0x11)),
-            None, None, None, None, 50).unwrap();
+            None,
+            None,
+            None,
+            None,
+            50,
+        )
+        .unwrap();
         assert!(p.rows.is_empty() && p.next_cursor.is_none());
         // Range entirely below the only block.
-        let p = get_transfers(l.conn(), 1, &addr, Some(1), Some(50),
-            None, None, 50).unwrap();
+        let p = get_transfers(l.conn(), 1, &addr, Some(1), Some(50), None, None, 50).unwrap();
         assert!(p.rows.is_empty() && p.next_cursor.is_none());
         // Range entirely above.
-        let p = get_transfers(l.conn(), 1, &addr, Some(200), Some(300),
-            None, None, 50).unwrap();
+        let p = get_transfers(l.conn(), 1, &addr, Some(200), Some(300), None, None, 50).unwrap();
         assert!(p.rows.is_empty() && p.next_cursor.is_none());
         // Exact hit, fits in one page.
-        let p = get_transfers(l.conn(), 1, &addr, Some(100), Some(100),
-            None, None, 50).unwrap();
+        let p = get_transfers(l.conn(), 1, &addr, Some(100), Some(100), None, None, 50).unwrap();
         assert_eq!(p.rows.len(), 2);
         assert_eq!(p.next_cursor, None);
     }

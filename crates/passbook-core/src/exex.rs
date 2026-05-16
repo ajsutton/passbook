@@ -1,38 +1,40 @@
+use crate::config::PassbookConfig;
+use crate::erc20::{decode_transfer, RawLog};
+use crate::inspector::CapturedFrame;
+use crate::ledger::writer::BlockBatch;
+use crate::ledger::writer::{delete_blocks, write_block, write_unattributed};
+use crate::ledger::Ledger;
+use crate::model::UnattributedDeltaRow;
+use crate::model::{Direction, Erc20TransferRow, GasPaymentRow};
+use crate::reconcile::{reconcile_account, ReconcileInput};
+use crate::stack::StackAdapter;
 use alloy_primitives::{Address, B256, U256};
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use futures::TryStreamExt;
+use reth_ethereum::chainspec::{ChainSpec, EthChainSpec};
 use reth_ethereum::exex::{ExExContext, ExExEvent};
-use reth_ethereum::node::api::{FullNodeComponents, NodeTypes};
-use reth_ethereum::chainspec::{EthChainSpec, ChainSpec};
 use reth_ethereum::node::api::NodePrimitives;
+use reth_ethereum::node::api::{FullNodeComponents, NodeTypes};
 use reth_ethereum::primitives::RecoveredBlock;
 use reth_ethereum::provider::Chain;
 use reth_ethereum::storage::{StateProviderBox, StateProviderFactory};
-use crate::config::PassbookConfig;
-use crate::stack::StackAdapter;
-use crate::ledger::Ledger;
-use crate::ledger::writer::{delete_blocks, write_block, write_unattributed};
-use crate::model::UnattributedDeltaRow;
-use crate::erc20::{decode_transfer, RawLog};
-use crate::inspector::CapturedFrame;
-use crate::model::{Direction, Erc20TransferRow, GasPaymentRow};
-use crate::reconcile::{reconcile_account, ReconcileInput};
-use crate::ledger::writer::BlockBatch;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Backoff floor / ceiling for the retry-until-success writer loop.
 const BACKOFF_START: Duration = Duration::from_millis(200);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 pub struct BlockInputs {
-    pub chain_id: u64, pub block_number: u64, pub block_hash: B256,
+    pub chain_id: u64,
+    pub block_number: u64,
+    pub block_hash: B256,
     pub watched: HashSet<Address>,
-    pub erc20_logs: Vec<(Option<B256>, u64, RawLog)>,      // (tx_hash, log_index, log)
-    pub frames: Vec<(Option<B256>, bool, CapturedFrame)>,  // (tx_hash, reverted, frame)
+    pub erc20_logs: Vec<(Option<B256>, u64, RawLog)>, // (tx_hash, log_index, log)
+    pub frames: Vec<(Option<B256>, bool, CapturedFrame)>, // (tx_hash, reverted, frame)
     pub gas: Vec<GasPaymentRow>,
-    pub account_deltas: Vec<(Address, i128)>,              // watched accounts touched
-    pub system_signed: Vec<(Address, i128)>,              // recognised system credits
+    pub account_deltas: Vec<(Address, i128)>, // watched accounts touched
+    pub system_signed: Vec<(Address, i128)>,  // recognised system credits
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +43,11 @@ pub enum ProcessingError {
     #[error("erc20 decode failure at block {block}")]
     Decode { block: u64 },
     #[error("unexplained reconciliation residual for {address} at block {block}: {residual}")]
-    UnexplainedResidual { block: u64, address: Address, residual: i128 },
+    UnexplainedResidual {
+        block: u64,
+        address: Address,
+        residual: i128,
+    },
 }
 
 /// Pure: deterministic transform of one block's inputs into a durable batch.
@@ -53,11 +59,18 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
         if let Some(d) = decode_transfer(log, &i.watched) {
             for (addr, dir) in d.matched {
                 erc20.push(Erc20TransferRow {
-                    chain_id: i.chain_id, block_number: i.block_number,
+                    chain_id: i.chain_id,
+                    block_number: i.block_number,
                     block_hash: i.block_hash,
                     tx_hash: tx.expect("erc20 log always in a tx"),
-                    log_index: *log_index, token: d.token, from: d.from, to: d.to,
-                    amount: d.amount, address: addr, direction: dir });
+                    log_index: *log_index,
+                    token: d.token,
+                    from: d.from,
+                    to: d.to,
+                    amount: d.amount,
+                    address: addr,
+                    direction: dir,
+                });
             }
         }
     }
@@ -68,10 +81,17 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
     for (tx, reverted, f) in &i.frames {
         let fr = [f.clone()];
         let rows = crate::attribution::attribute_eth_frames(
-            i.chain_id, i.block_number, i.block_hash, *tx, *reverted, &fr, &i.watched);
+            i.chain_id,
+            i.block_number,
+            i.block_hash,
+            *tx,
+            *reverted,
+            &fr,
+            &i.watched,
+        );
         for r in &rows {
             match r.direction {
-                Direction::In  => *eth_in.entry(r.address).or_default()  += r.amount_wei,
+                Direction::In => *eth_in.entry(r.address).or_default() += r.amount_wei,
                 Direction::Out => *eth_out.entry(r.address).or_default() += r.amount_wei,
             }
         }
@@ -79,28 +99,43 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
     }
     // gas per watched address
     let mut gas_paid: std::collections::HashMap<Address, U256> = Default::default();
-    for g in &i.gas { *gas_paid.entry(g.address).or_default() += g.total_wei; }
+    for g in &i.gas {
+        *gas_paid.entry(g.address).or_default() += g.total_wei;
+    }
 
     // (c) reconciliation — every touched watched address must balance
-    let sys: std::collections::HashMap<Address, i128> =
-        i.system_signed.iter().copied().collect();
+    let sys: std::collections::HashMap<Address, i128> = i.system_signed.iter().copied().collect();
     for (addr, observed) in &i.account_deltas {
-        if !i.watched.contains(addr) { continue; }
+        if !i.watched.contains(addr) {
+            continue;
+        }
         if let Some(_row) = reconcile_account(ReconcileInput {
-            chain_id: i.chain_id, block_number: i.block_number,
-            block_hash: i.block_hash, address: *addr, observed_delta: *observed,
+            chain_id: i.chain_id,
+            block_number: i.block_number,
+            block_hash: i.block_hash,
+            address: *addr,
+            observed_delta: *observed,
             eth_in: eth_in.get(addr).copied().unwrap_or(U256::ZERO),
             eth_out: eth_out.get(addr).copied().unwrap_or(U256::ZERO),
             gas_paid: gas_paid.get(addr).copied().unwrap_or(U256::ZERO),
             system_signed: sys.get(addr).copied().unwrap_or(0),
         }) {
             return Err(ProcessingError::UnexplainedResidual {
-                block: i.block_number, address: *addr, residual: *observed });
+                block: i.block_number,
+                address: *addr,
+                residual: *observed,
+            });
         }
     }
     Ok(BlockBatch {
-        chain_id: i.chain_id, block_number: i.block_number, block_hash: i.block_hash,
-        eth, erc20, gas: i.gas, unattributed: Vec::new() })
+        chain_id: i.chain_id,
+        block_number: i.block_number,
+        block_hash: i.block_hash,
+        eth,
+        erc20,
+        gas: i.gas,
+        unattributed: Vec::new(),
+    })
 }
 
 /// The CHAIN-SPECIFIC seam.
@@ -173,16 +208,14 @@ pub async fn run_passbook<Node, C>(
 where
     C: ChainExec,
     Node: FullNodeComponents,
-    Node::Types:
-        NodeTypes<Primitives = C::Primitives, ChainSpec = C::ChainSpec>,
+    Node::Types: NodeTypes<Primitives = C::Primitives, ChainSpec = C::ChainSpec>,
 {
     let chain_id = ctx.config.chain.chain_id();
 
     while let Some(notification) = ctx.notifications.try_next().await? {
         // Reorg handling FIRST: drop every row for the reverted blocks.
         if let Some(reverted) = notification.reverted_chain() {
-            let hashes: Vec<B256> =
-                reverted.blocks_iter().map(|b| b.hash()).collect();
+            let hashes: Vec<B256> = reverted.blocks_iter().map(|b| b.hash()).collect();
             delete_blocks(ledger.lock().unwrap().conn_mut(), chain_id, &hashes)?;
         }
 
@@ -199,10 +232,7 @@ where
                         use alloy_consensus::BlockHeader;
                         chain.first().header().parent_hash()
                     };
-                    let parent_state = match ctx
-                        .provider()
-                        .history_by_block_hash(parent_hash)
-                    {
+                    let parent_state = match ctx.provider().history_by_block_hash(parent_hash) {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!(
@@ -223,9 +253,7 @@ where
                         parent_state,
                     ) {
                         Ok(batch) => {
-                            write_block(
-                                ledger.lock().unwrap().conn_mut(), &batch,
-                            )?;
+                            write_block(ledger.lock().unwrap().conn_mut(), &batch)?;
                             break;
                         }
                         Err(ProcessingError::UnexplainedResidual {
@@ -242,9 +270,7 @@ where
                                 attributed_wei: U256::ZERO,
                                 residual_wei: U256::from(residual.unsigned_abs()),
                             };
-                            write_unattributed(
-                                ledger.lock().unwrap().conn_mut(), &row,
-                            )?;
+                            write_unattributed(ledger.lock().unwrap().conn_mut(), &row)?;
                             tracing::error!(
                                 block = bn,
                                 %address,
@@ -319,9 +345,12 @@ pub fn process_committed_block_inner<S: StackAdapter>(
     // Per-block execution outcome (the committed `Chain` bundle is a
     // MULTI-block aggregate; split to THIS block only so deltas/receipts
     // are for this block).
-    let outcome = chain
-        .execution_outcome_at_block(block_number)
-        .ok_or(ProcessingError::Decode { block: block_number })?;
+    let outcome =
+        chain
+            .execution_outcome_at_block(block_number)
+            .ok_or(ProcessingError::Decode {
+                block: block_number,
+            })?;
 
     // ── (1) ERC20: receipts + logs for THIS block (always, no tracing).
     let mut erc20_logs: Vec<(Option<B256>, u64, RawLog)> = Vec::new();
@@ -329,11 +358,7 @@ pub fn process_committed_block_inner<S: StackAdapter>(
         let receipts = outcome.receipts_by_block(block_number);
         let mut log_index: u64 = 0;
         for (tx_idx, receipt) in receipts.iter().enumerate() {
-            let tx_hash = block
-                .body()
-                .transactions
-                .get(tx_idx)
-                .map(|t| *t.tx_hash());
+            let tx_hash = block.body().transactions.get(tx_idx).map(|t| *t.tx_hash());
             for log in &receipt.logs {
                 erc20_logs.push((
                     tx_hash,
@@ -369,35 +394,30 @@ pub fn process_committed_block_inner<S: StackAdapter>(
         if old_bal != new_bal || old_nonce != new_nonce {
             any_watched_changed = true;
         }
-        let delta = i128::try_from(new_bal)
-            .map_err(|_| ProcessingError::Decode { block: block_number })?
-            - i128::try_from(old_bal)
-                .map_err(|_| ProcessingError::Decode { block: block_number })?;
+        let delta = i128::try_from(new_bal).map_err(|_| ProcessingError::Decode {
+            block: block_number,
+        })? - i128::try_from(old_bal).map_err(|_| ProcessingError::Decode {
+            block: block_number,
+        })?;
         account_deltas.push((addr, delta));
     }
 
     // ── (3) Gated re-execution → ValueInspector frames.
     let mut frames: Vec<(Option<B256>, bool, CapturedFrame)> = Vec::new();
     if any_watched_changed {
-        let captured = crate::reexec::reexecute_block_frames(
-            chain_spec.clone(),
-            chain,
-            block,
-            parent_state,
-        )
-        .map_err(|e| {
-            tracing::error!(error = %e, block = block_number, "re-execution failed");
-            ProcessingError::Decode { block: block_number }
-        })?;
+        let captured =
+            crate::reexec::reexecute_block_frames(chain_spec.clone(), chain, block, parent_state)
+                .map_err(|e| {
+                tracing::error!(error = %e, block = block_number, "re-execution failed");
+                ProcessingError::Decode {
+                    block: block_number,
+                }
+            })?;
         // Tag top-level (depth-0 / call originating from a tx) frames so
         // attribution records kind=TopLevel; internal frames keep the
         // inspector's sequence path → kind=Internal.
         for cf in captured.frames {
-            let tx_hash = captured
-                .tx_hashes
-                .get(cf.tx_index)
-                .copied()
-                .flatten();
+            let tx_hash = captured.tx_hashes.get(cf.tx_index).copied().flatten();
             let reverted = captured
                 .tx_reverted
                 .get(cf.tx_index)
@@ -421,9 +441,7 @@ pub fn process_committed_block_inner<S: StackAdapter>(
                 Some(r) => r,
                 None => break,
             };
-            let gas_used = receipt
-                .cumulative_gas_used
-                .saturating_sub(prev_cumulative);
+            let gas_used = receipt.cumulative_gas_used.saturating_sub(prev_cumulative);
             prev_cumulative = receipt.cumulative_gas_used;
             if !watched.contains(sender) {
                 continue;
@@ -470,10 +488,15 @@ mod tests {
     fn clean_block_produces_batch() {
         let w = Address::repeat_byte(0xcc);
         let inp = BlockInputs {
-            chain_id:1, block_number:10, block_hash:B256::repeat_byte(3),
+            chain_id: 1,
+            block_number: 10,
+            block_hash: B256::repeat_byte(3),
             watched: [w].into_iter().collect(),
-            erc20_logs: vec![], frames: vec![], gas: vec![],
-            account_deltas: vec![(w, 0i128)], system_signed: vec![],
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            account_deltas: vec![(w, 0i128)],
+            system_signed: vec![],
         };
         let r = process_block(inp).expect("clean");
         assert_eq!(r.block_number, 10);
@@ -484,10 +507,15 @@ mod tests {
     fn unexplained_residual_is_processing_error() {
         let w = Address::repeat_byte(0xcc);
         let inp = BlockInputs {
-            chain_id:1, block_number:10, block_hash:B256::repeat_byte(3),
+            chain_id: 1,
+            block_number: 10,
+            block_hash: B256::repeat_byte(3),
             watched: [w].into_iter().collect(),
-            erc20_logs: vec![], frames: vec![], gas: vec![],
-            account_deltas: vec![(w, 999i128)], system_signed: vec![],
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            account_deltas: vec![(w, 999i128)],
+            system_signed: vec![],
         };
         let err = process_block(inp).unwrap_err();
         assert!(matches!(err, ProcessingError::UnexplainedResidual { .. }));

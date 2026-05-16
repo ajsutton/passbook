@@ -1,0 +1,87 @@
+name: CI
+
+# Gate every push and PR on the EXACT commands run locally in Task 9.2:
+#   cargo fmt --all --check
+#   cargo clippy --workspace --all-targets --locked -- -D warnings
+#   cargo test --workspace --locked
+# plus the multi-stage Docker image builds + in-image smokes (Task 9.1).
+on:
+  push:
+  pull_request:
+
+# `.vendor/` and `.cargo/` are gitignored: every cargo invocation MUST be
+# preceded by `bash scripts/seed-vendor.sh`, which shallow-clones the pinned
+# optimism monorepo rev and writes the machine-local .cargo/config.toml. It
+# needs the system git binary, so git-fetch-with-cli is forced job-wide.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pinned toolchain — matches rust-toolchain.toml channel 1.95.0 and its
+      # rustfmt + clippy components (the gates below need both).
+      - name: Install pinned Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      # Cache the cargo registry + git DB keyed on Cargo.lock. This does NOT
+      # break `--locked`: the cache only pre-populates ~/.cargo/{registry,git}
+      # (download cache); Cargo.lock itself is committed and untouched, and
+      # `--locked` still fails the build if anything would change it. The
+      # reth/optimism git compile is very long, so this materially speeds reruns.
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      # REQUIRED before ANY cargo command: .vendor/ + .cargo/config.toml are
+      # gitignored and regenerated per machine/CI. ubuntu-latest ships git.
+      - name: Seed vendor mirror (.vendor + .cargo/config.toml)
+        run: bash scripts/seed-vendor.sh
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test --workspace --locked
+        run: cargo test --workspace --locked
+
+  images:
+    name: docker images + smokes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The Dockerfile self-seeds (its build stage runs scripts/seed-vendor.sh),
+      # so no host seed step is needed for this job.
+      - name: Build reth-passbook image
+        run: docker build --target reth-passbook -t reth-passbook:ci .
+
+      - name: Build op-reth-passbook image
+        run: docker build --target op-reth-passbook -t op-reth-passbook:ci .
+
+      - name: Smoke — reth-passbook node --help exposes passbook.addresses
+        run: docker run --rm reth-passbook:ci node --help | grep -q passbook.addresses
+
+      - name: Smoke — op-reth-passbook node --help exposes passbook.addresses
+        run: docker run --rm op-reth-passbook:ci node --help | grep -q passbook.addresses
+
+      - name: Smoke — reth-passbook top-level --help preserves reth subcommands
+        run: docker run --rm reth-passbook:ci --help | grep -qiE 'init|db|stage'

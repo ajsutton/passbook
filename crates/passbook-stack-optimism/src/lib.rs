@@ -46,16 +46,20 @@
 mod op_chain;
 pub use op_chain::OpChainExec;
 
-use passbook_core::stack::StackAdapter;
 use alloy_primitives::U256;
+use passbook_core::stack::StackAdapter;
 
 /// Per-tx L1 data fees for ONE block, precomputed by the OP binary via
 /// reth-optimism-evm. Deposit txs → None. A plain table so core stays OP-free.
 #[derive(Debug, Clone, Default)]
-pub struct OptimismStack { fees: Vec<Option<U256>> }
+pub struct OptimismStack {
+    fees: Vec<Option<U256>>,
+}
 
 impl OptimismStack {
-    pub fn from_fees(fees: Vec<Option<U256>>) -> Self { Self { fees } }
+    pub fn from_fees(fees: Vec<Option<U256>>) -> Self {
+        Self { fees }
+    }
 }
 
 impl StackAdapter for OptimismStack {
@@ -87,13 +91,15 @@ where
 {
     let fees = txs
         .into_iter()
-        .map(|(is_deposit, raw_2718)| {
-            if is_deposit {
-                None
-            } else {
-                fee_of(&raw_2718)
-            }
-        })
+        .map(
+            |(is_deposit, raw_2718)| {
+                if is_deposit {
+                    None
+                } else {
+                    fee_of(&raw_2718)
+                }
+            },
+        )
         .collect();
     OptimismStack::from_fees(fees)
 }
@@ -121,7 +127,11 @@ mod tests {
             (false, vec![0x02, 0xbb]),
         ];
         let table = build_block_l1_fee_table(txs, |raw| {
-            if raw == [0x02, 0xaa] { Some(U256::from(777)) } else { None }
+            if raw == [0x02, 0xaa] {
+                Some(U256::from(777))
+            } else {
+                None
+            }
         });
         assert_eq!(table.l1_data_fee_wei(0), None);
         assert_eq!(table.l1_data_fee_wei(1), Some(U256::from(777)));

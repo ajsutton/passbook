@@ -4,13 +4,20 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Args)]
 pub struct PassbookArgs {
     /// Comma-separated watched addresses (≤10). Absent ⇒ ExEx disabled.
-    #[arg(long = "passbook.addresses", env = "PASSBOOK_ADDRESSES",
-          value_delimiter = ',', default_value = "")]
+    #[arg(
+        long = "passbook.addresses",
+        env = "PASSBOOK_ADDRESSES",
+        value_delimiter = ',',
+        default_value = ""
+    )]
     pub addresses: Vec<String>,
 
     /// Ledger SQLite path.
-    #[arg(long = "passbook.db-path", env = "PASSBOOK_DB_PATH",
-          default_value = "/data/passbook.db")]
+    #[arg(
+        long = "passbook.db-path",
+        env = "PASSBOOK_DB_PATH",
+        default_value = "/data/passbook.db"
+    )]
     pub db_path: PathBuf,
 }
 
@@ -41,8 +48,7 @@ mod tests {
         let w = W::parse_from(["x"]);
         // Absent ⇒ empty or [""]; PassbookConfig::from_parts trims+skips empties,
         // so either form yields an empty watched set (ExEx disabled).
-        assert!(w.p.addresses.iter().all(|s| s.trim().is_empty())
-            || w.p.addresses.is_empty());
+        assert!(w.p.addresses.iter().all(|s| s.trim().is_empty()) || w.p.addresses.is_empty());
         assert_eq!(w.p.db_path.to_str().unwrap(), "/data/passbook.db");
     }
 }

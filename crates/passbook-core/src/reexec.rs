@@ -28,10 +28,10 @@
 //! `passbook-stack-optimism`, reusing all of the above verbatim.
 
 use alloy_primitives::{B256, U256};
+use reth_ethereum::evm::revm::database::StateProviderDatabase;
 use reth_ethereum::node::api::NodePrimitives;
 use reth_ethereum::provider::Chain;
 use reth_ethereum::storage::StateProviderBox;
-use reth_ethereum::evm::revm::database::StateProviderDatabase;
 use revm::database::CacheDB;
 use revm::state::AccountInfo;
 
@@ -160,21 +160,16 @@ pub fn build_prestate_cache<N>(
 where
     N: NodePrimitives,
 {
-    let mut cache: PreStateDb =
-        CacheDB::new(StateProviderDatabase::new(parent_state));
+    let mut cache: PreStateDb = CacheDB::new(StateProviderDatabase::new(parent_state));
 
     if block_number > 0 {
-        if let Some(prior) = chain.execution_outcome_at_block(block_number - 1)
-        {
+        if let Some(prior) = chain.execution_outcome_at_block(block_number - 1) {
             let bundle = prior.state();
             for (addr, acct) in bundle.state.iter() {
                 if let Some(post) = &acct.info {
                     let mut info: AccountInfo = post.clone();
-                    if info.code.is_none()
-                        && info.code_hash != revm::primitives::KECCAK_EMPTY
-                    {
-                        if let Some(bc) = bundle.contracts.get(&info.code_hash)
-                        {
+                    if info.code.is_none() && info.code_hash != revm::primitives::KECCAK_EMPTY {
+                        if let Some(bc) = bundle.contracts.get(&info.code_hash) {
                             info.code = Some(bc.clone());
                         }
                     }
@@ -182,11 +177,7 @@ where
                 }
                 for (slot, sv) in acct.storage.iter() {
                     cache
-                        .insert_account_storage(
-                            *addr,
-                            *slot,
-                            sv.present_value,
-                        )
+                        .insert_account_storage(*addr, *slot, sv.present_value)
                         .ok();
                 }
             }
@@ -248,9 +239,7 @@ pub fn reexecute_block_frames(
     //    reverted status.
     let this_outcome = chain
         .execution_outcome_at_block(block_number)
-        .ok_or_else(|| {
-            eyre::eyre!("no execution outcome for block {block_number}")
-        })?;
+        .ok_or_else(|| eyre::eyre!("no execution outcome for block {block_number}"))?;
     let receipts = this_outcome.receipts_by_block(block_number);
     let mut frames: Vec<TaggedFrame> = Vec::new();
     let mut tx_hashes: Vec<Option<B256>> = Vec::new();
@@ -260,11 +249,10 @@ pub fn reexecute_block_frames(
         tx_reverted.push(receipts.get(i).map(|r| !r.success).unwrap_or(false));
     }
 
-    let mut tracer = evm_config.evm_factory().create_tracer(
-        &mut state,
-        evm_env,
-        TaggingInspector::default(),
-    );
+    let mut tracer =
+        evm_config
+            .evm_factory()
+            .create_tracer(&mut state, evm_env, TaggingInspector::default());
     let collected: Vec<(usize, Vec<(CapturedFrame, bool)>)> = {
         let mut idx = 0usize;
         tracer
@@ -278,9 +266,7 @@ pub fn reexecute_block_frames(
                         .into_frames()
                         .into_iter()
                         .enumerate()
-                        .map(|(k, f)| {
-                            (f, tags.get(k).copied().unwrap_or(false))
-                        })
+                        .map(|(k, f)| (f, tags.get(k).copied().unwrap_or(false)))
                         .collect();
                     let this = idx;
                     idx += 1;
@@ -293,8 +279,16 @@ pub fn reexecute_block_frames(
 
     for (tx_index, fs) in collected {
         for (frame, top_level) in fs {
-            frames.push(TaggedFrame { frame, tx_index, top_level });
+            frames.push(TaggedFrame {
+                frame,
+                tx_index,
+                top_level,
+            });
         }
     }
-    Ok(Captured { frames, tx_hashes, tx_reverted })
+    Ok(Captured {
+        frames,
+        tx_hashes,
+        tx_reverted,
+    })
 }

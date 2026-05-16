@@ -20,6 +20,7 @@
 //!        (proves nested value-CALL frames to codeless EOAs are captured).
 //!      * tx3: `W -> SINK` plain value transfer — `tx.from == W` ⇒ a
 //!        `gas_payments` row + a top-level eth out of W.
+//!
 //!    Reconciliation nets to zero for `W`.
 //!
 //! 2. `parent_state_readonly_two_block_chain_zero_residual` — a 2-block
@@ -292,19 +293,43 @@ async fn erc20_internal_gas_capture_zero_residual() {
     // ── Build the block's transactions ─────────────────────────────────
     let gas_limit = 200_000u64;
     let tx0 = sign_legacy(
-        &s_signer, chain_id, 0, TxKind::Call(token), U256::ZERO, gas_limit, gas_price,
+        &s_signer,
+        chain_id,
+        0,
+        TxKind::Call(token),
+        U256::ZERO,
+        gas_limit,
+        gas_price,
         Bytes::new(),
     );
     let tx1 = sign_legacy(
-        &s_signer, chain_id, 1, TxKind::Call(sdfwd), sd_value, gas_limit, gas_price,
+        &s_signer,
+        chain_id,
+        1,
+        TxKind::Call(sdfwd),
+        sd_value,
+        gas_limit,
+        gas_price,
         Bytes::new(),
     );
     let tx2 = sign_legacy(
-        &s_signer, chain_id, 2, TxKind::Call(cfwd), call_value, gas_limit, gas_price,
+        &s_signer,
+        chain_id,
+        2,
+        TxKind::Call(cfwd),
+        call_value,
+        gas_limit,
+        gas_price,
         Bytes::new(),
     );
     let tx3 = sign_legacy(
-        &w_signer, chain_id, 0, TxKind::Call(sink), w_send_value, gas_limit, gas_price,
+        &w_signer,
+        chain_id,
+        0,
+        TxKind::Call(sink),
+        w_send_value,
+        gas_limit,
+        gas_price,
         Bytes::new(),
     );
 
@@ -332,8 +357,8 @@ async fn erc20_internal_gas_capture_zero_residual() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("passbook.db");
-    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
-        .expect("cfg");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
 
     // ── Harness first: we need a REAL parent (= genesis) state provider
     //    for the deterministic direct check below. ──────────────────────
@@ -372,9 +397,11 @@ async fn erc20_internal_gas_capture_zero_residual() {
     let internal_in: Vec<&_> = batch
         .eth
         .iter()
-        .filter(|r| r.address == watched
-            && matches!(r.direction, passbook_core::model::Direction::In)
-            && matches!(r.kind, passbook_core::model::EthKind::Internal))
+        .filter(|r| {
+            r.address == watched
+                && matches!(r.direction, passbook_core::model::Direction::In)
+                && matches!(r.kind, passbook_core::model::EthKind::Internal)
+        })
         .collect();
     assert_eq!(
         internal_in.len(),
@@ -385,7 +412,10 @@ async fn erc20_internal_gas_capture_zero_residual() {
     got.sort();
     let mut want = [sd_value, call_value];
     want.sort();
-    assert_eq!(got, want, "internal-in amounts = SELFDESTRUCT + CALL values");
+    assert_eq!(
+        got, want,
+        "internal-in amounts = SELFDESTRUCT + CALL values"
+    );
     assert_eq!(
         batch.gas.iter().filter(|r| r.address == watched).count(),
         1,
@@ -505,14 +535,27 @@ async fn parent_state_readonly_two_block_chain_zero_residual() {
     let gas_limit = 300_000u64;
     // Block 1: deploy the forwarder (CREATE).
     let b1_tx = sign_legacy(
-        &s_signer, chain_id, 0, TxKind::Create, U256::ZERO, gas_limit, gas_price, initcode,
+        &s_signer,
+        chain_id,
+        0,
+        TxKind::Create,
+        U256::ZERO,
+        gas_limit,
+        gas_price,
+        initcode,
     );
     let b1 = build_block(&chain_spec, 1, chain_spec.genesis_hash(), 12, vec![b1_tx]);
 
     // Block 2: call the deployed forwarder with value (its code is read,
     // not modified, by block 2).
     let b2_tx = sign_legacy(
-        &s_signer, chain_id, 1, TxKind::Call(deployed), fwd_value, gas_limit, gas_price,
+        &s_signer,
+        chain_id,
+        1,
+        TxKind::Call(deployed),
+        fwd_value,
+        gas_limit,
+        gas_price,
         Bytes::new(),
     );
     let b2 = build_block(&chain_spec, 2, b1.hash(), 24, vec![b2_tx]);
@@ -534,8 +577,8 @@ async fn parent_state_readonly_two_block_chain_zero_residual() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("passbook.db");
-    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
-        .expect("cfg");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
 
     let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
         .await
@@ -568,9 +611,11 @@ async fn parent_state_readonly_two_block_chain_zero_residual() {
     let b2_internal_in: Vec<&_> = batch2
         .eth
         .iter()
-        .filter(|r| r.address == watched
-            && matches!(r.direction, passbook_core::model::Direction::In)
-            && matches!(r.kind, passbook_core::model::EthKind::Internal))
+        .filter(|r| {
+            r.address == watched
+                && matches!(r.direction, passbook_core::model::Direction::In)
+                && matches!(r.kind, passbook_core::model::EthKind::Internal)
+        })
         .collect();
     assert_eq!(
         b2_internal_in.len(),
@@ -659,6 +704,8 @@ async fn spawn_driver(
 /// real post-state balance delta (the priority fee) that has NO captured
 /// CALL/SELFDESTRUCT frame and is NOT a recognised `system_credits` entry
 /// for the L1 adapter — `reconcile_account` therefore yields a residual.
+// test fixture builder: each arg is an independent block/tx input knob
+#[allow(clippy::too_many_arguments)]
 fn coinbase_fee_block(
     chain_spec: &Arc<ChainSpec>,
     number: u64,
@@ -668,10 +715,7 @@ fn coinbase_fee_block(
     s_signer: &PrivateKeySigner,
     s_nonce: u64,
     chain_id: u64,
-) -> (
-    RecoveredBlock<Block<TransactionSigned>>,
-    Chain,
-) {
+) -> (RecoveredBlock<Block<TransactionSigned>>, Chain) {
     // A plain value transfer S -> sink. The 21000-gas tx pays a priority
     // fee (gas_price 1 gwei vs base_fee 7 wei) to the beneficiary = W.
     let sink = Address::repeat_byte(0x51);
@@ -742,8 +786,8 @@ async fn fault_injected_residual_stalls_without_advancing() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("passbook.db");
-    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
-        .expect("cfg");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
 
     // Deterministic core check: the pure pipeline against the real genesis
     // provider MUST surface an UnexplainedResidual for W (proves the
@@ -766,10 +810,9 @@ async fn fault_injected_residual_stalls_without_advancing() {
         parent_state,
     );
     match direct {
-        Err(passbook_core::exex::ProcessingError::UnexplainedResidual {
-            address,
-            ..
-        }) => assert_eq!(address, watched, "residual must be for W"),
+        Err(passbook_core::exex::ProcessingError::UnexplainedResidual { address, .. }) => {
+            assert_eq!(address, watched, "residual must be for W")
+        }
         other => panic!(
             "expected an UnexplainedResidual for the uncaptured coinbase \
              fee credit to W, got {other:?}"
@@ -826,11 +869,7 @@ async fn fault_injected_residual_stalls_without_advancing() {
         //     write happened — it is either absent or < 1).
         let last: Option<String> = g
             .conn()
-            .query_row(
-                "SELECT v FROM meta WHERE k='last_block'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
             .ok();
         assert!(
             last.is_none() || last.as_deref() != Some("1"),
@@ -883,7 +922,10 @@ async fn reorg_replaces_rows_no_dup() {
     alloc.insert(watched, acct(funded, None));
     // SELFDESTRUCT forwarder → W (reliable internal inbound credit).
     let fwd = Address::repeat_byte(0xF0);
-    alloc.insert(fwd, acct(U256::ZERO, Some(selfdestruct_forwarder_code(watched))));
+    alloc.insert(
+        fwd,
+        acct(U256::ZERO, Some(selfdestruct_forwarder_code(watched))),
+    );
     let chain_spec: Arc<ChainSpec> =
         Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
 
@@ -924,8 +966,8 @@ async fn reorg_replaces_rows_no_dup() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("passbook.db");
-    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
-        .expect("cfg");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
     let ledger = Arc::new(Mutex::new(
         Ledger::open(&db_path, chain_id).expect("ledger open"),
     ));
@@ -977,7 +1019,12 @@ async fn reorg_replaces_rows_no_dup() {
         let g = ledger.lock().unwrap();
 
         // All rows keyed to A are GONE (reorg-first delete_blocks).
-        for table in ["eth_transfers", "erc20_transfers", "gas_payments", "unattributed_deltas"] {
+        for table in [
+            "eth_transfers",
+            "erc20_transfers",
+            "gas_payments",
+            "unattributed_deltas",
+        ] {
             let a_n: i64 = g
                 .conn()
                 .query_row(
@@ -1009,7 +1056,11 @@ async fn reorg_replaces_rows_no_dup() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(b_amt, amt_b.to_string(), "B's inbound amount differs from A's");
+        assert_eq!(
+            b_amt,
+            amt_b.to_string(),
+            "B's inbound amount differs from A's"
+        );
 
         // No duplicates: exactly one inbound internal eth row total (only B).
         let total_in: i64 = g
@@ -1031,7 +1082,10 @@ async fn reorg_replaces_rows_no_dup() {
             .conn()
             .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(last, "1", "meta.last_block consistent at the reorged height");
+        assert_eq!(
+            last, "1",
+            "meta.last_block consistent at the reorged height"
+        );
     }
 
     driver.abort();
@@ -1058,7 +1112,10 @@ async fn restart_resumes_no_gap_no_dup() {
     alloc.insert(sender, acct(funded, None));
     alloc.insert(watched, acct(funded, None));
     let fwd = Address::repeat_byte(0xF0);
-    alloc.insert(fwd, acct(U256::ZERO, Some(selfdestruct_forwarder_code(watched))));
+    alloc.insert(
+        fwd,
+        acct(U256::ZERO, Some(selfdestruct_forwarder_code(watched))),
+    );
     let chain_spec: Arc<ChainSpec> =
         Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
 
@@ -1088,8 +1145,8 @@ async fn restart_resumes_no_gap_no_dup() {
     // Persistent temp-FILE db (NOT in-memory) so it survives the restart.
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("passbook.db");
-    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
-        .expect("cfg");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
 
     // ── Run 1: process block 1 through run_passbook, then drop everything.
     let (n_eth, n_erc20, n_gas, n_unattr, last_block_1) = {
@@ -1159,13 +1216,21 @@ async fn restart_resumes_no_gap_no_dup() {
                 .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(count("eth_transfers"), n_eth, "no duplicate eth rows after restart");
+        assert_eq!(
+            count("eth_transfers"),
+            n_eth,
+            "no duplicate eth rows after restart"
+        );
         assert_eq!(
             count("erc20_transfers"),
             n_erc20,
             "no duplicate erc20 rows after restart"
         );
-        assert_eq!(count("gas_payments"), n_gas, "no duplicate gas rows after restart");
+        assert_eq!(
+            count("gas_payments"),
+            n_gas,
+            "no duplicate gas rows after restart"
+        );
         assert_eq!(
             count("unattributed_deltas"),
             n_unattr,
@@ -1175,7 +1240,10 @@ async fn restart_resumes_no_gap_no_dup() {
             .conn()
             .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(last, "1", "last_block unchanged (no gap, no regression) after restart");
+        assert_eq!(
+            last, "1",
+            "last_block unchanged (no gap, no regression) after restart"
+        );
     }
 }
 
@@ -1195,10 +1263,7 @@ fn token_code(from: Address, to: Address, amount: U256) -> Bytes {
     Bytes::from(c)
 }
 
-async fn wait_finished_height(
-    handle: &mut reth_exex_test_utils::TestExExHandle,
-    n: u64,
-) {
+async fn wait_finished_height(handle: &mut reth_exex_test_utils::TestExExHandle, n: u64) {
     let deadline = std::time::Instant::now() + Duration::from_secs(12);
     loop {
         if let Ok(ev) = handle.events_rx.try_recv() {

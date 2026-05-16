@@ -44,8 +44,13 @@ mod tests {
     fn schema_applies() {
         let c = rusqlite::Connection::open_in_memory().unwrap();
         c.execute_batch(super::SCHEMA_V1).unwrap();
-        let n: i64 = c.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0)).unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 5); // meta + 4 data tables
     }
 }

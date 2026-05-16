@@ -72,83 +72,67 @@ fn main() -> eyre::Result<()> {
     // and our combined `OpExt` arg group. The `--passbook.*` flags appear
     // on the node command's `--help` exactly like native op-reth flags;
     // `--rollup.*` are preserved via the flattened `RollupArgs`.
-    Cli::<OpChainSpecParser, OpExt>::parse().run(
-        async move |builder, ext: OpExt| {
-            let rollup = ext.rollup.clone();
+    Cli::<OpChainSpecParser, OpExt>::parse().run(async move |builder, ext: OpExt| {
+        let rollup = ext.rollup.clone();
 
-            // MALFORMED address ⇒ `from_parts` Err ⇒ `?` propagates ⇒
-            // process exits non-zero before any node starts. (Drop-in
-            // safety #2.)
-            let cfg = PassbookConfig::from_parts(
-                ext.passbook.addresses.clone(),
-                ext.passbook.db_path.clone(),
-            )?;
+        // MALFORMED address ⇒ `from_parts` Err ⇒ `?` propagates ⇒
+        // process exits non-zero before any node starts. (Drop-in
+        // safety #2.)
+        let cfg = PassbookConfig::from_parts(
+            ext.passbook.addresses.clone(),
+            ext.passbook.db_path.clone(),
+        )?;
 
-            // No / empty addresses ⇒ behave EXACTLY like stock op-reth:
-            // a plain `OpNode`, no ExEx, no `passbook` RPC namespace.
-            // (Drop-in safety #1.)
-            if !cfg.enabled() {
-                let handle = builder
-                    .node(OpNode::new(rollup))
-                    .launch()
-                    .await?;
-                return handle.wait_for_node_exit().await;
-            }
+        // No / empty addresses ⇒ behave EXACTLY like stock op-reth:
+        // a plain `OpNode`, no ExEx, no `passbook` RPC namespace.
+        // (Drop-in safety #1.)
+        if !cfg.enabled() {
+            let handle = builder.node(OpNode::new(rollup)).launch().await?;
+            return handle.wait_for_node_exit().await;
+        }
 
-            // Enabled: resolve chain id from the builder's fully
-            // configured OP chain spec (available BEFORE launch;
-            // `OpChainSpec: EthChainSpec` ⇒ `chain_id()`).
-            let chain_id = builder.config().chain.chain_id();
+        // Enabled: resolve chain id from the builder's fully
+        // configured OP chain spec (available BEFORE launch;
+        // `OpChainSpec: EthChainSpec` ⇒ `chain_id()`).
+        let chain_id = builder.config().chain.chain_id();
 
-            // Open the durable ledger ONCE; one shared handle for both
-            // the read-only RPC reader and the sole ExEx writer.
-            let ledger = Arc::new(Mutex::new(Ledger::open(
-                &cfg.db_path,
-                chain_id,
-            )?));
+        // Open the durable ledger ONCE; one shared handle for both
+        // the read-only RPC reader and the sole ExEx writer.
+        let ledger = Arc::new(Mutex::new(Ledger::open(&cfg.db_path, chain_id)?));
 
-            let rpc_ledger = ledger.clone();
-            let exex_cfg = cfg.clone();
-            let exex_ledger = ledger.clone();
+        let rpc_ledger = ledger.clone();
+        let exex_cfg = cfg.clone();
+        let exex_ledger = ledger.clone();
 
-            let handle = builder
-                .node(OpNode::new(rollup))
-                // Read-only `passbook` JSON-RPC namespace (Task 7.1),
-                // sharing the ledger handle. Registered ONLY when
-                // enabled. (Drop-in safety #3.)
-                .extend_rpc_modules(move |ctx| {
-                    ctx.modules.merge_configured(
-                        PassbookApiServer::into_rpc(PassbookRpc {
-                            ledger: rpc_ledger.clone(),
-                            chain_id,
-                        }),
-                    )?;
-                    Ok(())
-                })
-                // The Passbook ExEx writer. The `install_exex` closure
-                // returns `Ok(fut)` where `fut` is the long-running
-                // `run_passbook` future. The chain-specific seam is the
-                // OP arm `OpChainExec` (per-block `OptimismStack` via
-                // `build_block_l1_fee_table` — see
-                // `passbook-stack-optimism`). The SAME generic
-                // `run_passbook` serves both this OP binary and the L1
-                // binary; only the `ChainExec` arm differs.
-                .install_exex("passbook", move |ctx| {
-                    let cfg = exex_cfg.clone();
-                    let ledger = exex_ledger.clone();
-                    async move {
-                        Ok(run_passbook(
-                            ctx,
-                            cfg,
-                            ledger,
-                            OpChainExec,
-                        ))
-                    }
-                })
-                .launch()
-                .await?;
+        let handle = builder
+            .node(OpNode::new(rollup))
+            // Read-only `passbook` JSON-RPC namespace (Task 7.1),
+            // sharing the ledger handle. Registered ONLY when
+            // enabled. (Drop-in safety #3.)
+            .extend_rpc_modules(move |ctx| {
+                ctx.modules
+                    .merge_configured(PassbookApiServer::into_rpc(PassbookRpc {
+                        ledger: rpc_ledger.clone(),
+                        chain_id,
+                    }))?;
+                Ok(())
+            })
+            // The Passbook ExEx writer. The `install_exex` closure
+            // returns `Ok(fut)` where `fut` is the long-running
+            // `run_passbook` future. The chain-specific seam is the
+            // OP arm `OpChainExec` (per-block `OptimismStack` via
+            // `build_block_l1_fee_table` — see
+            // `passbook-stack-optimism`). The SAME generic
+            // `run_passbook` serves both this OP binary and the L1
+            // binary; only the `ChainExec` arm differs.
+            .install_exex("passbook", move |ctx| {
+                let cfg = exex_cfg.clone();
+                let ledger = exex_ledger.clone();
+                async move { Ok(run_passbook(ctx, cfg, ledger, OpChainExec)) }
+            })
+            .launch()
+            .await?;
 
-            handle.wait_for_node_exit().await
-        },
-    )
+        handle.wait_for_node_exit().await
+    })
 }

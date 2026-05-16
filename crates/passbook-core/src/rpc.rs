@@ -158,11 +158,9 @@ mod tests {
     async fn get_transfers_returns_known_row() {
         let (r, _t) = rpc();
         let addr = format!("{:#x}", Address::repeat_byte(0xaa));
-        let page = PassbookApiServer::get_transfers(
-            &r, addr, None, None, None, None,
-        )
-        .await
-        .unwrap();
+        let page = PassbookApiServer::get_transfers(&r, addr, None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(page.rows.len(), 1);
         let row = &page.rows[0];
         assert_eq!(row.category, "eth");

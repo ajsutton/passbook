@@ -8,8 +8,8 @@
 //! (`make_adapter: impl Fn() -> S + Send + Sync + 'static`), so the
 //! type is `Clone`/`Copy`/`Default` to satisfy that consumption trivially.
 
-use passbook_core::stack::StackAdapter;
 use alloy_primitives::U256;
+use passbook_core::stack::StackAdapter;
 
 /// Stateless L1 stack adapter (vanilla Ethereum).
 #[derive(Debug, Clone, Copy, Default)]

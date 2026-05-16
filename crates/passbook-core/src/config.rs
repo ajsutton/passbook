@@ -16,17 +16,24 @@ impl PassbookConfig {
         let mut watched = HashSet::new();
         for a in addrs {
             let a = a.trim();
-            if a.is_empty() { continue; }
+            if a.is_empty() {
+                continue;
+            }
             let addr = Address::from_str(a)
                 .map_err(|e| eyre::eyre!("invalid watched address {a:?}: {e}"))?;
             watched.insert(addr);
         }
         if watched.len() > 10 {
-            tracing::warn!(n = watched.len(), "watched set larger than design target (<10)");
+            tracing::warn!(
+                n = watched.len(),
+                "watched set larger than design target (<10)"
+            );
         }
         Ok(Self { watched, db_path })
     }
-    pub fn enabled(&self) -> bool { !self.watched.is_empty() }
+    pub fn enabled(&self) -> bool {
+        !self.watched.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -36,7 +43,9 @@ mod tests {
     fn parses_valid_addresses() {
         let c = PassbookConfig::from_parts(
             vec!["0x0000000000000000000000000000000000000001".into()],
-            "/tmp/x.db".into()).unwrap();
+            "/tmp/x.db".into(),
+        )
+        .unwrap();
         assert_eq!(c.watched.len(), 1);
     }
     #[test]
@@ -45,6 +54,9 @@ mod tests {
     }
     #[test]
     fn empty_list_is_disabled() {
-        assert!(PassbookConfig::from_parts(vec![], "/tmp/x.db".into()).unwrap().watched.is_empty());
+        assert!(PassbookConfig::from_parts(vec![], "/tmp/x.db".into())
+            .unwrap()
+            .watched
+            .is_empty());
     }
 }

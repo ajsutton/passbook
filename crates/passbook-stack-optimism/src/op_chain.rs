@@ -39,14 +39,10 @@ use alloy_primitives::{B256, U256};
 use passbook_core::attribution::{compute_gas_payment, GasInput};
 use passbook_core::config::PassbookConfig;
 use passbook_core::erc20::RawLog;
-use passbook_core::exex::{
-    process_block, BlockInputs, ChainExec, ProcessingError,
-};
+use passbook_core::exex::{process_block, BlockInputs, ChainExec, ProcessingError};
 use passbook_core::inspector::CapturedFrame;
 use passbook_core::ledger::writer::BlockBatch;
-use passbook_core::reexec::{
-    build_prestate_cache, Captured, TaggedFrame, TaggingInspector,
-};
+use passbook_core::reexec::{build_prestate_cache, Captured, TaggedFrame, TaggingInspector};
 use passbook_core::stack::StackAdapter;
 
 use reth_op::chainspec::OpChainSpec;
@@ -93,9 +89,12 @@ impl ChainExec for OpChainExec {
 
         // Per-block execution outcome (the committed `Chain` bundle is a
         // MULTI-block aggregate; split to THIS block only).
-        let outcome = chain
-            .execution_outcome_at_block(block_number)
-            .ok_or(ProcessingError::Decode { block: block_number })?;
+        let outcome =
+            chain
+                .execution_outcome_at_block(block_number)
+                .ok_or(ProcessingError::Decode {
+                    block: block_number,
+                })?;
 
         // ── (1) ERC20: receipts + logs for THIS block. OP `OpReceipt`
         //    is an enum → use the `TxReceipt` trait accessors.
@@ -127,8 +126,7 @@ impl ChainExec for OpChainExec {
         // ── (2) Gate: per-block BundleState old/new balances for
         //    watched (identical logic to the L1 arm; the `BundleState`
         //    is primitive-agnostic).
-        let mut account_deltas: Vec<(alloy_primitives::Address, i128)> =
-            Vec::new();
+        let mut account_deltas: Vec<(alloy_primitives::Address, i128)> = Vec::new();
         let mut any_watched_changed = false;
         for (addr, acct) in outcome.bundle_accounts_iter() {
             if !watched.contains(&addr) {
@@ -139,20 +137,17 @@ impl ChainExec for OpChainExec {
                 .as_ref()
                 .map(|i| i.balance)
                 .unwrap_or(U256::ZERO);
-            let new_bal =
-                acct.info.as_ref().map(|i| i.balance).unwrap_or(U256::ZERO);
-            let old_nonce =
-                acct.original_info.as_ref().map(|i| i.nonce).unwrap_or(0);
-            let new_nonce =
-                acct.info.as_ref().map(|i| i.nonce).unwrap_or(0);
+            let new_bal = acct.info.as_ref().map(|i| i.balance).unwrap_or(U256::ZERO);
+            let old_nonce = acct.original_info.as_ref().map(|i| i.nonce).unwrap_or(0);
+            let new_nonce = acct.info.as_ref().map(|i| i.nonce).unwrap_or(0);
             if old_bal != new_bal || old_nonce != new_nonce {
                 any_watched_changed = true;
             }
-            let delta = i128::try_from(new_bal)
-                .map_err(|_| ProcessingError::Decode { block: block_number })?
-                - i128::try_from(old_bal).map_err(|_| {
-                    ProcessingError::Decode { block: block_number }
-                })?;
+            let delta = i128::try_from(new_bal).map_err(|_| ProcessingError::Decode {
+                block: block_number,
+            })? - i128::try_from(old_bal).map_err(|_| ProcessingError::Decode {
+                block: block_number,
+            })?;
             account_deltas.push((addr, delta));
         }
 
@@ -160,26 +155,21 @@ impl ChainExec for OpChainExec {
         //    inspector + shared pre-state overlay; OP EVM config).
         let mut frames: Vec<(Option<B256>, bool, CapturedFrame)> = Vec::new();
         if any_watched_changed {
-            let captured = reexecute_op_block_frames(
-                chain_spec.clone(),
-                chain,
-                block,
-                parent_state,
-            )
-            .map_err(|e| {
-                tracing::error!(
-                    error = %e, block = block_number,
-                    "OP re-execution failed"
-                );
-                ProcessingError::Decode { block: block_number }
-            })?;
+            let captured =
+                reexecute_op_block_frames(chain_spec.clone(), chain, block, parent_state).map_err(
+                    |e| {
+                        tracing::error!(
+                            error = %e, block = block_number,
+                            "OP re-execution failed"
+                        );
+                        ProcessingError::Decode {
+                            block: block_number,
+                        }
+                    },
+                )?;
             for (k, tf) in captured.frames.into_iter().enumerate() {
                 let _ = k;
-                let tx_hash = captured
-                    .tx_hashes
-                    .get(tf.tx_index)
-                    .copied()
-                    .flatten();
+                let tx_hash = captured.tx_hashes.get(tf.tx_index).copied().flatten();
                 let reverted = captured
                     .tx_reverted
                     .get(tf.tx_index)
@@ -205,23 +195,13 @@ impl ChainExec for OpChainExec {
                 .map(|t| (t.is_deposit(), t.encoded_2718()))
                 .collect();
             match extract_l1_info(block.body()) {
-                Ok(mut l1_info) => build_block_l1_fee_table(
-                    txs_meta,
-                    |raw: &[u8]| {
-                        l1_info
-                            .l1_tx_data_fee(
-                                chain_spec.as_ref(),
-                                timestamp,
-                                raw,
-                                false,
-                            )
-                            .ok()
-                            .filter(|v| !v.is_zero())
-                    },
-                ),
-                Err(_) => crate::OptimismStack::from_fees(
-                    vec![None; txs_meta.len()],
-                ),
+                Ok(mut l1_info) => build_block_l1_fee_table(txs_meta, |raw: &[u8]| {
+                    l1_info
+                        .l1_tx_data_fee(chain_spec.as_ref(), timestamp, raw, false)
+                        .ok()
+                        .filter(|v| !v.is_zero())
+                }),
+                Err(_) => crate::OptimismStack::from_fees(vec![None; txs_meta.len()]),
             }
         };
 
@@ -230,9 +210,7 @@ impl ChainExec for OpChainExec {
         {
             let receipts = outcome.receipts_by_block(block_number);
             let mut prev_cumulative: u64 = 0;
-            for (tx_idx, (sender, tx)) in
-                block.transactions_with_sender().enumerate()
-            {
+            for (tx_idx, (sender, tx)) in block.transactions_with_sender().enumerate() {
                 let receipt = match receipts.get(tx_idx) {
                     Some(r) => r,
                     None => break,
@@ -325,25 +303,20 @@ fn reexecute_op_block_frames(
     // 3. Per-tx inspector tracer (drives nested-frame inspector hooks).
     let this_outcome = chain
         .execution_outcome_at_block(block_number)
-        .ok_or_else(|| {
-            eyre::eyre!("no execution outcome for block {block_number}")
-        })?;
+        .ok_or_else(|| eyre::eyre!("no execution outcome for block {block_number}"))?;
     let receipts = this_outcome.receipts_by_block(block_number);
     let mut frames: Vec<TaggedFrame> = Vec::new();
     let mut tx_hashes: Vec<Option<B256>> = Vec::new();
     let mut tx_reverted: Vec<bool> = Vec::new();
     for (i, tx) in block.body().transactions.iter().enumerate() {
         tx_hashes.push(Some(B256::from(*tx.tx_hash())));
-        tx_reverted.push(
-            receipts.get(i).map(|r| !r.status()).unwrap_or(false),
-        );
+        tx_reverted.push(receipts.get(i).map(|r| !r.status()).unwrap_or(false));
     }
 
-    let mut tracer = evm_config.evm_factory().create_tracer(
-        &mut state,
-        evm_env,
-        TaggingInspector::default(),
-    );
+    let mut tracer =
+        evm_config
+            .evm_factory()
+            .create_tracer(&mut state, evm_env, TaggingInspector::default());
     let collected: Vec<(usize, Vec<(CapturedFrame, bool)>)> = {
         let mut idx = 0usize;
         tracer
@@ -357,9 +330,7 @@ fn reexecute_op_block_frames(
                         .into_frames()
                         .into_iter()
                         .enumerate()
-                        .map(|(k, f)| {
-                            (f, tags.get(k).copied().unwrap_or(false))
-                        })
+                        .map(|(k, f)| (f, tags.get(k).copied().unwrap_or(false)))
                         .collect();
                     let this = idx;
                     idx += 1;
@@ -372,10 +343,18 @@ fn reexecute_op_block_frames(
 
     for (tx_index, fs) in collected {
         for (frame, top_level) in fs {
-            frames.push(TaggedFrame { frame, tx_index, top_level });
+            frames.push(TaggedFrame {
+                frame,
+                tx_index,
+                top_level,
+            });
         }
     }
-    Ok(Captured { frames, tx_hashes, tx_reverted })
+    Ok(Captured {
+        frames,
+        tx_hashes,
+        tx_reverted,
+    })
 }
 
 #[cfg(test)]
@@ -394,12 +373,8 @@ mod tests {
         assert_chain_exec::<OpChainExec>();
         // Compile-time: the assoc types resolve to the OP set.
         fn same<T>(_: std::marker::PhantomData<T>) {}
-        same::<<OpChainExec as ChainExec>::Primitives>(
-            std::marker::PhantomData::<OpPrimitives>,
-        );
-        same::<<OpChainExec as ChainExec>::ChainSpec>(
-            std::marker::PhantomData::<OpChainSpec>,
-        );
+        same::<<OpChainExec as ChainExec>::Primitives>(std::marker::PhantomData::<OpPrimitives>);
+        same::<<OpChainExec as ChainExec>::ChainSpec>(std::marker::PhantomData::<OpChainSpec>);
     }
 
     /// The OP backend's per-block L1-fee table construction (the
