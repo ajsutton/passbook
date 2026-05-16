@@ -881,3 +881,98 @@ Task 8.5 only supplies `fee_of` as a closure wrapping
 are already filtered to `None` by `build_block_l1_fee_table`). Then
 `OptimismStack::from_fees`/`build_block_l1_fee_table` feeds
 `passbook_core::stack::StackAdapter`. No re-discovery needed for 8.5.
+
+## Task 8.4 binary wiring (L1 `reth-passbook` — load-bearing for Task 8.5)
+
+How `crates/bin/reth-passbook/src/main.rs` was wired against pinned reth
+**v2.2.0** (`paradigmxyz/reth` `88505c7…`, facade `reth-ethereum 2.2.0`).
+Task 8.5 (the OP binary) mirrors this structure with `reth-op`'s CLI / node /
+chainspec-parser — the shape below is the template; only the facade-crate
+paths and the `make_adapter` closure differ.
+
+### Exact reth v2.2.0 CLI / parser / run / hook API used
+
+| Concern | API the binary compiles against | Source |
+|---|---|---|
+| CLI type | `reth_ethereum::cli::Cli::<C, Ext>` (`pub use reth_ethereum_cli::interface::{Cli, ..}` via the facade's `cli` mod, which is `pub use reth_ethereum_cli::*`) | `crates/ethereum/cli/src/lib.rs:18`, `interface.rs:34` |
+| Chain-spec parser | `reth_ethereum::cli::chainspec::EthereumChainSpecParser` (the facade `cli` mod re-exports `reth_ethereum_cli::*`, whose `pub mod chainspec` holds it — **NOT** in `reth_ethereum::chainspec`, which is `reth_chainspec`) | `crates/ethereum/cli/src/chainspec.rs:26` |
+| Parse | `Cli::<EthereumChainSpecParser, PassbookArgs>::parse()` — `Cli` is `#[derive(Parser)]`, so `clap::Parser` must be in scope (`use clap::Parser;`) | `interface.rs:31` |
+| Run | `.run(launcher)` where `launcher: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>, Ext) -> Fut`, `Fut: Future<Output = eyre::Result<()>>`. Used as `.run(async move |builder, args: PassbookArgs| { … })` — an **`async` closure** (edition-2024 `async ||`, exactly the form in reth's own rustdoc example `interface.rs:103`). Requires `C: ChainSpecParser<ChainSpec = ChainSpec>` (the concrete reth `ChainSpec`) — `EthereumChainSpecParser` satisfies it. | `interface.rs:130-138` |
+| Stock node | `builder.node(EthereumNode::default())` → `WithLaunchContext<NodeBuilderWithComponents<…>>`; `.launch().await?` → `NodeHandle`; `handle.wait_for_node_exit().await` | `crates/node/builder/src/builder/mod.rs:388,727`; `handle.rs:23` |
+| chain id | `builder.config()` → `&NodeConfig<ChainSpec>`; field `pub chain: Arc<ChainSpec>` (`node_config.rs:100`); `ChainSpec: EthChainSpec` ⇒ `.chain_id() -> u64`, **requires `use reth_ethereum::chainspec::EthChainSpec;` in scope** (same trait-in-scope rule as Task 6.3/6.4) | `crates/node/core/src/node_config.rs:100`; `crates/chainspec/src/api.rs` |
+| RPC hook | `.extend_rpc_modules(move |ctx| { ctx.modules.merge_configured(PassbookApiServer::into_rpc(PassbookRpc{ ledger, chain_id }))?; Ok(()) })` — `F: FnOnce(RpcContext<…>) -> eyre::Result<()> + Send + 'static`; `RpcRegistry::merge_configured` at `crates/rpc/rpc-builder/src/lib.rs:1794` | `crates/node/builder/src/builder/mod.rs:631` |
+| ExEx hook | `.install_exex("passbook", move |ctx| async move { Ok(run_passbook(ctx, cfg, ledger, \|\| EthereumStack::default())) })` — `F: FnOnce(ExExContext<…>) -> R + Send + 'static`, `R: Future<Output = eyre::Result<E>> + Send`, `E: Future<Output = eyre::Result<()>> + Send`. So the closure body is an `async move` block that returns `Ok(<the run_passbook future>)`; `run_passbook` is **not** `.await`-ed here — its returned future is the inner `E` reth drives. | `crates/node/builder/src/builder/mod.rs:645` |
+
+`make_adapter` is `|| EthereumStack::default()` (the established
+`impl Fn() -> S + Send + Sync + 'static` from `exex.rs`; `EthereumStack` is
+`Default`). `run_passbook`'s `Node::Types: NodeTypes<Primitives =
+EthPrimitives, ChainSpec = ChainSpec>` bound is satisfied by `EthereumNode`.
+
+### Deltas vs the Task 8.4 candidate
+
+- **Only one path correction.** `EthereumChainSpecParser` is **not** under
+  `reth_ethereum::chainspec` (that mod is `reth_chainspec::*`). It is under
+  the facade's `cli` mod: `reth_ethereum::cli::chainspec::EthereumChainSpecParser`
+  (the `cli` mod is `pub use reth_ethereum_cli::*`, and `reth_ethereum_cli`
+  has `pub mod chainspec`). `Cli` itself is reachable as
+  `reth_ethereum::cli::Cli` (re-exported from `interface`). Everything else
+  (the `async move |builder, args|` closure shape, `builder.config().chain
+  .chain_id()`, `builder.node(EthereumNode::default())`,
+  `extend_rpc_modules`/`merge_configured`, `install_exex` returning
+  `Ok(future)`, `wait_for_node_exit`) matched the candidate verbatim.
+- The custom flag lands on the **`node` subcommand** (`reth-passbook node
+  --help` shows `--passbook.addresses` / `--passbook.db-path`), NOT the
+  top-level `--help`. This is correct/by-design: reth's `Cli`'s `Ext` is
+  flattened into `node::NodeCommand<C, Ext>` (`interface.rs:264`), so the
+  closure's second arg is the parsed `PassbookArgs`. The top-level `--help`
+  is the full stock reth CLI (all subcommands: `node`, `init`, `db`, …) —
+  i.e. it is a real reth binary with the flag added, not a reskinned one.
+  Task 8.4's smoke check therefore targets `node --help`.
+
+### chain_id / `Ledger::open` ordering — chosen approach
+
+**Resolve before launch; one shared handle; no `OnceCell`/oneshot.** The
+reth `builder` exposes the fully-configured chain spec at
+`builder.config().chain` (`Arc<ChainSpec>`) **before** `launch()`, and
+`EthChainSpec::chain_id()` yields the `u64`. So on the main task, when
+enabled, the binary: (1) `chain_id = builder.config().chain.chain_id()`;
+(2) `Ledger::open(&cfg.db_path, chain_id)?` once; (3) wraps it in one
+`Arc<Mutex<Ledger>>`; (4) moves a clone into the `extend_rpc_modules` hook
+(`PassbookRpc`) and another clone into the `install_exex` closure
+(`run_passbook` writer). The RPC reader and the ExEx writer hold the **same**
+`Arc<Mutex<Ledger>>`. The deferred-open / `OnceCell` alternative (open inside
+the ExEx where `ctx.config.chain.chain_id()` is available) is unnecessary
+because the chain id is already available pre-launch and there is exactly one
+opener. **Task 8.5 should use the identical pattern** with `reth-op`'s
+`builder.config().chain` (its OP chain spec also implements `EthChainSpec`).
+
+### Drop-in safety — three cases (spec-critical) & how verified
+
+1. **No / empty addresses** (`!cfg.enabled()`): the binary takes the
+   `builder.node(EthereumNode::default()).launch().await?` →
+   `wait_for_node_exit().await` path and **returns early before** any
+   `extend_rpc_modules`/`install_exex` call. The resulting node is the
+   stock reth `EthereumNode` with no `passbook` ExEx and no `passbook` RPC
+   namespace — byte-identical to upstream reth. (`PassbookArgs`'
+   `--passbook.addresses` `default_value = ""` ⇒ `from_parts` yields an
+   empty watched set ⇒ `enabled()` is `false`.)
+2. **Malformed address**: `PassbookConfig::from_parts` returns `Err`; the
+   `?` in the `run` closure propagates it, `Cli::run` returns that `Err`,
+   `main` returns it ⇒ the process exits non-zero **before any node
+   starts**. Loud failure, no silent degradation.
+3. **Valid addresses** (`cfg.enabled()`): ledger opened once, RPC namespace
+   + ExEx installed sharing the one `Arc<Mutex<Ledger>>`, then `launch`.
+
+Verification performed: `cargo build -p reth-passbook --locked` — clean,
+**zero warnings**. `reth-passbook node --help` prints both
+`--passbook.addresses` and `--passbook.db-path` (FLAG-PRESENT);
+`reth-passbook --help` lists the full stock reth subcommand set
+(`node`/`init`/`db`/`stage`/…) confirming it is a genuine reth CLI with the
+flag added. Cases 1 & 2 are realized by the early-return / `?`-propagation
+control flow above (the no-args branch never touches the ExEx/RPC hooks; the
+malformed branch errors out of `from_parts` before `builder` is consumed) —
+verified by source review of the single `run` closure, which has exactly
+these three branches and no other exit. Full workspace still green:
+`cargo test -p passbook-core --locked` = 31 unit + 5 integration passed;
+`cargo build -p spike --locked` green. **Cargo.lock / Cargo.toml unchanged**
+(all deps were pre-wired in Task 0.3 — zero dependency delta).
