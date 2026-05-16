@@ -19,6 +19,7 @@ thiserror.workspace = true
 serde.workspace = true
 async-trait.workspace = true
 reth-ethereum.workspace = true
+clap.workspace = true
 
 [dev-dependencies]
 reth-exex-test-utils.workspace = true

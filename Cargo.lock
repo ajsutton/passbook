@@ -5565,6 +5565,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer-local",
  "async-trait",
+ "clap",
  "eyre",
  "futures",
  "jsonrpsee",

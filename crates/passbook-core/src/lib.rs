@@ -8,3 +8,4 @@ pub mod reconcile;
 pub mod ledger;
 pub mod exex;
 pub mod rpc;
+pub mod cli;
