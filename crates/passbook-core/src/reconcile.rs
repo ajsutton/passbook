@@ -15,21 +15,49 @@ pub struct ReconcileInput {
     pub system_signed: i128,
 }
 
+/// A reconciliation input could not be represented in `i128`, or the
+/// attribution sum overflowed `i128`. This is NOT a balanced account: an
+/// out-of-range magnitude means we cannot prove the address reconciles, so
+/// the caller MUST treat it as a processing failure exactly like an
+/// unexplained residual (do not advance / do not emit FinishedHeight),
+/// never as a silently-clamped "balanced" result.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("reconcile arithmetic out of i128 range")]
+pub struct ReconcileOverflow;
+
 /// attributed = eth_in - eth_out - gas_paid + system_signed.
-/// Returns Some(row) iff |observed - attributed| != 0. A returned row means
-/// the caller MUST treat the block as a processing failure (do not advance,
-/// do not emit FinishedHeight) and persist this row as the diagnostic.
-pub fn reconcile_account(i: ReconcileInput) -> Option<UnattributedDeltaRow> {
-    let to_i = |u: U256| -> i128 { u.try_into().unwrap_or(i128::MAX) };
-    let attributed: i128 = to_i(i.eth_in)
-        .saturating_sub(to_i(i.eth_out))
-        .saturating_sub(to_i(i.gas_paid))
-        .saturating_add(i.system_signed);
-    let residual = i.observed_delta - attributed;
+///
+/// `Ok(None)` iff the address provably balances (`observed - attributed == 0`).
+/// `Ok(Some(row))` iff `|observed - attributed| != 0` — a genuine residual.
+/// `Err(ReconcileOverflow)` iff any input exceeds `i128` or the sum overflows;
+/// previously this path silently clamped to `i128::MAX`, which could mask a
+/// genuine discrepancy by collapsing an out-of-range value into an apparently
+/// balanced (or wrongly-sized) residual. We now refuse to clamp.
+///
+/// A returned row OR an error means the caller MUST treat the block as a
+/// processing failure and persist a diagnostic; only `Ok(None)` may advance.
+pub fn reconcile_account(
+    i: ReconcileInput,
+) -> Result<Option<UnattributedDeltaRow>, ReconcileOverflow> {
+    let to_i = |u: U256| -> Result<i128, ReconcileOverflow> {
+        i128::try_from(u).map_err(|_| ReconcileOverflow)
+    };
+    let eth_in = to_i(i.eth_in)?;
+    let eth_out = to_i(i.eth_out)?;
+    let gas_paid = to_i(i.gas_paid)?;
+    let attributed: i128 = eth_in
+        .checked_sub(eth_out)
+        .and_then(|v| v.checked_sub(gas_paid))
+        .and_then(|v| v.checked_add(i.system_signed))
+        .ok_or(ReconcileOverflow)?;
+    let residual = i
+        .observed_delta
+        .checked_sub(attributed)
+        .ok_or(ReconcileOverflow)?;
     if residual == 0 {
-        return None;
+        return Ok(None);
     }
-    Some(UnattributedDeltaRow {
+    Ok(Some(UnattributedDeltaRow {
         chain_id: i.chain_id,
         block_number: i.block_number,
         block_hash: i.block_hash,
@@ -37,7 +65,7 @@ pub fn reconcile_account(i: ReconcileInput) -> Option<UnattributedDeltaRow> {
         observed_wei: U256::from(i.observed_delta.unsigned_abs()),
         attributed_wei: U256::from(attributed.unsigned_abs()),
         residual_wei: U256::from(residual.unsigned_abs()),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -58,7 +86,8 @@ mod tests {
             eth_out: U256::from(20),
             gas_paid: U256::from(30),
             system_signed: 0i128,
-        });
+        })
+        .expect("in-range inputs must not overflow");
         assert!(r.is_none()); // 150 - 20 - 30 == 100
     }
 
@@ -76,7 +105,57 @@ mod tests {
             gas_paid: U256::ZERO,
             system_signed: 0i128,
         })
-        .unwrap();
+        .expect("in-range inputs must not overflow")
+        .expect("imbalance must yield a row");
         assert_eq!(r.residual_wei, U256::from(90)); // |100 - 10|
+    }
+
+    /// A value exceeding `i128::MAX` must NOT be silently clamped to
+    /// `i128::MAX` (which could collapse a genuine discrepancy into an
+    /// apparently balanced or wrongly-sized residual). It must surface as a
+    /// hard `ReconcileOverflow` so the caller halts the block (issue #10).
+    #[test]
+    fn out_of_range_input_is_a_hard_error_not_a_clamp() {
+        let addr = Address::repeat_byte(0xbb);
+        let huge = U256::from(i128::MAX) + U256::from(1u8); // i128::MAX + 1
+        let err = reconcile_account(ReconcileInput {
+            chain_id: 1,
+            block_number: 7,
+            block_hash: B256::ZERO,
+            address: addr,
+            observed_delta: 0i128,
+            eth_in: huge,
+            eth_out: U256::ZERO,
+            gas_paid: U256::ZERO,
+            system_signed: 0i128,
+        });
+        // The old clamp would have made attributed == i128::MAX and, with
+        // observed_delta 0, wrapped/panicked on the subtraction or produced
+        // a bogus residual — never an honest overflow. It must now be a
+        // hard error, and crucially NOT a (silently-clamped) `Ok(None)`.
+        assert!(
+            matches!(err, Err(ReconcileOverflow)),
+            "out-of-range input must be a hard error, not a silent clamp"
+        );
+    }
+
+    /// The attribution sum itself overflowing `i128` (each input in range,
+    /// but `system_signed` pushes the running total past `i128::MAX`) must
+    /// also be a hard error rather than a saturating mask.
+    #[test]
+    fn attribution_sum_overflow_is_a_hard_error() {
+        let addr = Address::repeat_byte(0xcc);
+        let err = reconcile_account(ReconcileInput {
+            chain_id: 1,
+            block_number: 8,
+            block_hash: B256::ZERO,
+            address: addr,
+            observed_delta: 0i128,
+            eth_in: U256::from(i128::MAX),
+            eth_out: U256::ZERO,
+            gas_paid: U256::ZERO,
+            system_signed: i128::MAX, // i128::MAX + i128::MAX overflows
+        });
+        assert!(matches!(err, Err(ReconcileOverflow)));
     }
 }

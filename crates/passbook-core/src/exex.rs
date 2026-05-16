@@ -53,6 +53,11 @@ pub enum ProcessingError {
         address: Address,
         residual: i128,
     },
+    /// A reconciliation input/sum exceeded `i128`. We refuse to clamp it to
+    /// `i128::MAX` (which could mask a genuine discrepancy — issue #10);
+    /// instead the block is failed exactly like an unexplained residual.
+    #[error("reconcile arithmetic out of i128 range for {address} at block {block}")]
+    ReconcileOverflow { block: u64, address: Address },
 }
 
 /// Pure: deterministic transform of one block's inputs into a durable batch.
@@ -164,7 +169,7 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
         if !i.watched.contains(addr) {
             continue;
         }
-        if let Some(_row) = reconcile_account(ReconcileInput {
+        match reconcile_account(ReconcileInput {
             chain_id: i.chain_id,
             block_number: i.block_number,
             block_hash: i.block_hash,
@@ -175,11 +180,20 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
             gas_paid: gas_paid.get(addr).copied().unwrap_or(U256::ZERO),
             system_signed: sys.get(addr).copied().unwrap_or(0),
         }) {
-            return Err(ProcessingError::UnexplainedResidual {
-                block: i.block_number,
-                address: *addr,
-                residual: *observed,
-            });
+            Ok(None) => {}
+            Ok(Some(_row)) => {
+                return Err(ProcessingError::UnexplainedResidual {
+                    block: i.block_number,
+                    address: *addr,
+                    residual: *observed,
+                });
+            }
+            Err(crate::reconcile::ReconcileOverflow) => {
+                return Err(ProcessingError::ReconcileOverflow {
+                    block: i.block_number,
+                    address: *addr,
+                });
+            }
         }
     }
     Ok(BlockBatch {
@@ -828,5 +842,50 @@ mod tests {
         };
         let err = process_block(inp).unwrap_err();
         assert!(matches!(err, ProcessingError::UnexplainedResidual { .. }));
+    }
+
+    /// Issue #10: an inflow whose magnitude exceeds `i128::MAX` must NOT be
+    /// silently clamped to `i128::MAX` (which could collapse a genuine
+    /// discrepancy into an apparently balanced block and let processing
+    /// advance past an unreconciled state). `process_block` must surface it
+    /// as a hard `ReconcileOverflow` so `run_passbook`'s catch-all arm
+    /// stalls the block (no advance / no FinishedHeight), exactly like an
+    /// unexplained residual.
+    #[test]
+    fn out_of_range_inflow_is_reconcile_overflow_not_silent_clamp() {
+        use crate::inspector::{CapturedFrame, FrameKind};
+        let w = Address::repeat_byte(0xcc);
+        let other = Address::repeat_byte(0x11);
+        // value = i128::MAX + 1: representable in U256, NOT in i128.
+        let huge = U256::from(i128::MAX) + U256::from(1u8);
+        let inp = BlockInputs {
+            chain_id: 1,
+            block_number: 11,
+            block_hash: B256::repeat_byte(4),
+            watched: [w].into_iter().collect(),
+            erc20_logs: vec![],
+            frames: vec![(
+                Some(B256::repeat_byte(7)),
+                false, // not reverted ⇒ counted in reconciliation
+                CapturedFrame {
+                    from: other,
+                    to: w,
+                    value: huge,
+                    kind: FrameKind::Call,
+                    trace_path: "0".to_string(),
+                },
+            )],
+            gas: vec![],
+            // observed delta == the huge inflow; pre-fix the clamp made
+            // attributed == i128::MAX, yielding a bogus residual / wrap
+            // instead of an honest overflow signal.
+            account_deltas: vec![(w, 0i128)],
+            system_signed: vec![],
+        };
+        let err = process_block(inp).unwrap_err();
+        assert!(
+            matches!(err, ProcessingError::ReconcileOverflow { block: 11, address } if address == w),
+            "out-of-range inflow must be a hard ReconcileOverflow, got {err:?}"
+        );
     }
 }
