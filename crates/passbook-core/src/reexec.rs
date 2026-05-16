@@ -66,6 +66,10 @@ pub struct Captured {
 pub struct TaggingInspector {
     pub inner: crate::inspector::ValueInspector,
     /// `top_level` flag parallel to inner-captured frames (this tx).
+    /// Kept in lock-step with `inner`'s captured frames: when a reverted
+    /// call/create subtree is dropped from `inner` (issue #2), the
+    /// corresponding tags are truncated here so the parallel arrays never
+    /// desynchronise.
     pub tags: Vec<bool>,
     depth: i64,
 }
@@ -81,6 +85,19 @@ impl TaggingInspector {
     fn record(&mut self, before: usize, top_level: bool) {
         if self.inner.frame_count() > before {
             self.tags.push(top_level);
+        }
+    }
+    /// Re-establish the `tags[k] ↔ frame[k]` invariant after a frame
+    /// exit. `inner.{call,create}_end` may have dropped a reverted
+    /// subtree's captured frames (issue #2); `tags`/`frames` are both
+    /// append-only between truncations and a revert removes a contiguous
+    /// suffix from `inner.frames`, so truncating `tags` to the surviving
+    /// frame count keeps the parallel arrays aligned.
+    #[inline]
+    fn sync_tags_after_exit(&mut self) {
+        let n = self.inner.frame_count();
+        if self.tags.len() > n {
+            self.tags.truncate(n);
         }
     }
 }
@@ -99,19 +116,24 @@ impl<CTX> revm::Inspector<CTX> for TaggingInspector {
     }
     fn call_end(
         &mut self,
-        _ctx: &mut CTX,
-        _inputs: &revm::interpreter::CallInputs,
-        _outcome: &mut revm::interpreter::CallOutcome,
+        ctx: &mut CTX,
+        inputs: &revm::interpreter::CallInputs,
+        outcome: &mut revm::interpreter::CallOutcome,
     ) {
+        // Forward to inner so a reverted/halted call drops its captured
+        // subtree from reconciliation (issue #2), then mirror onto tags.
+        self.inner.call_end(ctx, inputs, outcome);
+        self.sync_tags_after_exit();
         self.depth -= 1;
     }
     fn create(
         &mut self,
-        _ctx: &mut CTX,
-        _inputs: &mut revm::interpreter::CreateInputs,
+        ctx: &mut CTX,
+        inputs: &mut revm::interpreter::CreateInputs,
     ) -> Option<revm::interpreter::CreateOutcome> {
         self.enter();
-        None
+        // Forward so `inner` snapshots its revert mark for this CREATE.
+        self.inner.create(ctx, inputs)
     }
     fn create_end(
         &mut self,
@@ -123,6 +145,7 @@ impl<CTX> revm::Inspector<CTX> for TaggingInspector {
         let top_level = self.depth == 1;
         self.inner.create_end(ctx, inputs, outcome);
         self.record(before, top_level);
+        self.sync_tags_after_exit();
         self.depth -= 1;
     }
     fn selfdestruct(

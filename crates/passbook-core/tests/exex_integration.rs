@@ -107,6 +107,39 @@ fn call_forwarder_code(dst: Address) -> Bytes {
     Bytes::from(c)
 }
 
+/// REVERT-AFTER-FORWARD runtime (issue #2 fixture): forward the entire
+/// received balance to `dst` via a plain value `CALL`, then `REVERT`. revm
+/// rolls back the whole frame's state on the REVERT, so neither the
+/// inbound value to this contract NOR the `dst` credit ever commit — the
+/// captured `*->dst` value frame is a reverted-subtree frame that MUST NOT
+/// be summed into reconciliation.
+///   PUSH1 0 (retLen);PUSH1 0 (retOff);PUSH1 0 (argLen);PUSH1 0 (argOff);
+///   SELFBALANCE (value);PUSH20 dst (addr);GAS (gas);CALL;
+///   PUSH1 0;PUSH1 0;REVERT
+fn revert_after_forward_code(dst: Address) -> Bytes {
+    let mut c = Vec::new();
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 retLen
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 retOff
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 argsLen
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 argsOff
+    c.push(0x47); // SELFBALANCE -> value
+    c.push(0x73); // PUSH20 dst
+    c.extend_from_slice(dst.as_slice());
+    c.push(0x5a); // GAS
+    c.push(0xf1); // CALL
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 (revert len)
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 (revert off)
+    c.push(0xfd); // REVERT
+    Bytes::from(c)
+}
+
+/// Plain unconditional REVERT runtime: `PUSH1 0;PUSH1 0;REVERT`. Any value
+/// sent to a tx targeting this contract is rolled back (only gas is
+/// charged) — the top-level value frame is a reverted frame.
+fn always_revert_code() -> Bytes {
+    Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd])
+}
+
 /// CREATE init code that returns `runtime` as the deployed contract's
 /// code: copy `runtime` into memory then `RETURN`. Prologue:
 ///   PUSH2 len(3) ; PUSH1 off(2) ; PUSH1 0(2) ; CODECOPY(1) ;
@@ -1574,4 +1607,184 @@ fn genesis_state(
         .with_database(cache)
         .with_bundle_update()
         .build()
+}
+
+/// Issue #2 (C1) regression: reverted value movements MUST NOT be summed
+/// into reconciliation, otherwise an entirely valid block stalls forever.
+///
+/// One genuinely-executed block with two reverted-value scenarios for the
+/// watched address `W`:
+///
+///   * tx0: `W -> RVRT` w/ value — the target contract unconditionally
+///     `REVERT`s. Only gas is actually deducted from `W`; the value never
+///     leaves `W`. The captured top-level `W -> RVRT` value frame is a
+///     reverted frame and must be excluded from `eth_out`.
+///   * tx1: `S -> TRY` w/ value — `TRY` forwards the value to inner `R`
+///     via `CALL`; `R` forwards the whole balance to the codeless watched
+///     EOA `W` and then `REVERT`s. `TRY` ignores the failed sub-call and
+///     `STOP`s, so the *transaction succeeds* while the inner `R -> W`
+///     value transfer is rolled back. The captured internal `R -> W` frame
+///     is a reverted-subtree frame inside a SUCCESSFUL tx and must be
+///     excluded from `eth_in` (the per-tx revert flag alone is `false`
+///     here — only per-frame revert tracking catches it).
+///
+/// Before the fix both reverted frames were summed in, producing a nonzero
+/// residual for `W` ⇒ `process_committed_block_inner` would return
+/// `UnexplainedResidual` (a permanent false stall). After the fix the
+/// residual is zero, no spurious `eth_transfers` rows for `W` are emitted,
+/// and only the genuine gas row for tx0 (W is the sender) remains.
+#[tokio::test(flavor = "multi_thread")]
+async fn reverted_value_transfers_zero_residual() {
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address(); // S
+    let watched = w_signer.address(); // W (codeless EOA)
+    let rvrt = Address::repeat_byte(0xD1); // unconditional REVERT contract
+    let r_inner = Address::repeat_byte(0xD2); // forward-to-W-then-REVERT
+    let try_c = Address::repeat_byte(0xD3); // forwards to R, ignores failure
+
+    let chain_id = 0x2222u64;
+    let gas_price = 1_000_000_000u128;
+    let tx0_value = U256::from(5_000_000_000_000_000u64); // W -> RVRT (reverts)
+    let tx1_value = U256::from(2_000_000_000_000_000u64); // S -> TRY -> R -> W (R reverts)
+
+    let funded = U256::from(10u64).pow(U256::from(18u64)); // 1 ETH each
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    alloc.insert(watched, acct(funded, None));
+    alloc.insert(rvrt, acct(U256::ZERO, Some(always_revert_code())));
+    alloc.insert(
+        r_inner,
+        acct(U256::ZERO, Some(revert_after_forward_code(watched))),
+    );
+    alloc.insert(try_c, acct(U256::ZERO, Some(call_forwarder_code(r_inner))));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    let gas_limit = 200_000u64;
+    // tx0: watched W sends value to a contract that always reverts.
+    let tx0 = sign_legacy(
+        &w_signer,
+        chain_id,
+        0,
+        TxKind::Call(rvrt),
+        tx0_value,
+        gas_limit,
+        gas_price,
+        Bytes::new(),
+    );
+    // tx1: S sends value to TRY; TRY -> R; R -> W then REVERT; TRY STOPs.
+    let tx1 = sign_legacy(
+        &s_signer,
+        chain_id,
+        0,
+        TxKind::Call(try_c),
+        tx1_value,
+        gas_limit,
+        gas_price,
+        Bytes::new(),
+    );
+
+    let recovered = build_block(
+        &chain_spec,
+        1,
+        chain_spec.genesis_hash(),
+        12,
+        vec![tx0, tx1],
+    );
+
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let state_db = genesis_state(&chain_spec);
+    let exec_out = evm_config
+        .executor(state_db)
+        .execute(&recovered)
+        .expect("block execution");
+    let outcome = ExecutionOutcome::single(1, exec_out);
+    let chain = Chain::new(
+        vec![recovered.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
+
+    let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let genesis_hash = handle.genesis.hash();
+    let parent_state: StateProviderBox = handle
+        .provider_factory
+        .history_by_block_hash(genesis_hash)
+        .expect("genesis state provider");
+
+    let res = passbook_core::exex::process_committed_block_inner(
+        chain_id,
+        chain_spec.clone(),
+        &chain,
+        &recovered,
+        &cfg,
+        &L1Adapter,
+        parent_state,
+    );
+    let batch = res.expect(
+        "reverted value transfers must reconcile to ZERO residual (issue #2): \
+         a reverted top-level tx and a reverted internal CALL must not stall a valid block",
+    );
+    assert!(
+        batch.unattributed.is_empty(),
+        "no unattributed residual expected — reverted frames excluded"
+    );
+
+    // No inbound/outbound eth_transfers rows should be COUNTED for W, and
+    // crucially no spurious counted movement at all: any emitted row for W
+    // must carry reverted == true (audit trail) and contribute nothing.
+    let w_eth: Vec<&_> = batch.eth.iter().filter(|r| r.address == watched).collect();
+    for r in &w_eth {
+        assert!(
+            r.reverted,
+            "any eth_transfers row for W here is from a reverted movement"
+        );
+    }
+
+    // The only genuine watched movement is gas: W is the sender of tx0
+    // (gas is charged even on a reverted tx).
+    let w_gas: Vec<&_> = batch.gas.iter().filter(|r| r.address == watched).collect();
+    assert_eq!(w_gas.len(), 1, "exactly one gas row for W (tx0 sender)");
+
+    // End-to-end through run_passbook: the driver must advance (emit
+    // FinishedHeight) — i.e. NOT stall on this valid block.
+    let ledger = Arc::new(Mutex::new(
+        Ledger::open(&db_path, chain_id).expect("ledger open"),
+    ));
+    let driver = tokio::spawn(passbook_core::exex::run_passbook(
+        ctx,
+        cfg,
+        ledger.clone(),
+        || L1Adapter,
+    ));
+    handle
+        .send_notification_chain_committed(chain)
+        .await
+        .expect("send committed");
+    wait_finished_height(&mut handle, 1).await;
+    driver.abort();
+
+    let g = ledger.lock().unwrap();
+    let conn = g.conn();
+    let w_lc = format!("{watched:#x}");
+    let unattributed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM unattributed_deltas WHERE address = ?1",
+            [&w_lc],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        unattributed, 0,
+        "no unattributed_deltas row for W — block reconciled, no false stall"
+    );
 }

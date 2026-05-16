@@ -95,6 +95,18 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
             &i.watched,
         );
         for r in &rows {
+            // Reverted movements never committed to the BundleState
+            // (revm rolls them back) so they MUST NOT be summed into
+            // reconciliation — counting them produces a spurious
+            // residual and a permanent false stall on a valid block
+            // (issue #2). The reverted-subtree inspector drop already
+            // removes these frames at the source; this is a belt-and-
+            // braces guard (issue #2, fix option (b)) for any frame
+            // still flagged `reverted` (the row is still emitted with
+            // `reverted = true` for the audit trail, just not counted).
+            if *reverted {
+                continue;
+            }
             match r.direction {
                 Direction::In => *eth_in.entry(r.address).or_default() += r.amount_wei,
                 Direction::Out => *eth_out.entry(r.address).or_default() += r.amount_wei,
