@@ -5,7 +5,9 @@ toolchain, minimal-checkout mechanism, and verified facade module paths.
 
 **Bump in lockstep** (see "Bump procedure"): the OP monorepo `rev` AND the
 matching `paradigmxyz/reth` `rev` must move together, plus the committed
-`Cargo.lock`.
+`Cargo.lock`. This is fully automated by **`scripts/bump-reth.sh`** (or
+`make bump`) — that script is the primary, one-command path; the manual steps
+below remain for understanding/recovery. Post-bump check: **`make verify-pin`**.
 
 > **Bootstrap (every fresh machine / CI / Docker stage):** run
 > `scripts/seed-vendor.sh` once, then build with `--locked`. The script
@@ -259,7 +261,47 @@ error demands a newer compiler; record the real minimum here if so.
 
 ## Bump procedure
 
-The two revs MUST move together (they share the upstream reth graph):
+The two revs MUST move together (they share the upstream reth graph).
+
+### Automated path (primary) — `scripts/bump-reth.sh`
+
+This SUPERSEDES the old single-`rev` sed draft. One command does the whole
+lockstep bump (rev rewrites in **both** `Cargo.toml` *and* the duplicated
+`OPTIMISM_REV` in `scripts/seed-vendor.sh`, mirror re-seed, `Cargo.lock`
+regen, and the spike co-resolution gate). It NEVER commits — the operator
+reviews then commits.
+
+```sh
+# 1. Pick a new ethereum-optimism/optimism develop SHA, then find the
+#    matching paradigmxyz/reth rev it pins (running the script with only
+#    --optimism-rev prints these exact instructions):
+git clone --depth 1 https://github.com/ethereum-optimism/optimism /tmp/op \
+  && git -C /tmp/op fetch --depth 1 origin <OPT_SHA> \
+  && git -C /tmp/op checkout FETCH_HEAD \
+  && grep -m1 'paradigmxyz/reth' /tmp/op/rust/Cargo.toml   # -> <RETH_SHA>
+
+# 2. Run the lockstep bump (both revs REQUIRED):
+scripts/bump-reth.sh --optimism-rev <OPT_SHA> --reth-rev <RETH_SHA>
+#   or:  make bump ARGS='--optimism-rev <OPT_SHA> --reth-rev <RETH_SHA>'
+
+# 3. Review the working-tree diff, then run the post-bump check:
+make verify-pin
+
+# 4. Update the version/toolchain/facade-path tables below if anything
+#    moved, then commit yourself.
+```
+
+The script is idempotent: re-running with the currently-pinned revs is a
+clean no-op (it reports "already at these revs" and touches no files). On a
+gate failure it exits non-zero and leaves the (uncommitted) working tree for
+review — it never produces a half-broken commit. It also detects pre-existing
+drift between the `Cargo.toml` optimism rev and `seed-vendor.sh`'s
+`OPTIMISM_REV` and refuses to proceed.
+
+### Manual steps (for understanding / recovery)
+
+The script automates exactly the following; do these by hand only if the
+script cannot be used:
 
 1. Pick a new `ethereum-optimism/optimism` `develop` SHA. Read its
    `rust/Cargo.toml` and note the `paradigmxyz/reth` `rev` it pins ALL

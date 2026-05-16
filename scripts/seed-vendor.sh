@@ -26,11 +26,18 @@
 # full multi-GB monorepo (slow). This script is the documented fast path and
 # the required bootstrap for CI / Docker.
 #
-# Bump: to move to a new monorepo rev, set OPTIMISM_REV (or edit the default
-# below to match Cargo.toml), delete .vendor/optimism, and re-run.
+# Bump: do NOT hand-edit the OPTIMISM_REV default below. The lockstep bump is
+# managed by scripts/bump-reth.sh (or `make bump`), which rewrites this
+# OPTIMISM_REV default AND the matching revs in Cargo.toml together, then
+# re-seeds and validates. The duplication of the optimism rev here (vs the
+# `reth-op` rev in Cargo.toml) is INTENTIONAL — seed-vendor.sh must stand alone
+# on a fresh machine without parsing Cargo.toml — and is kept synchronized by
+# bump-reth.sh (which also refuses to run if it detects the two have drifted).
+# To re-seed only (no rev change): delete .vendor/optimism and re-run.
 set -euo pipefail
 
-# --- Pinned rev (keep in lockstep with reth-op `rev` in Cargo.toml) ---------
+# --- Pinned rev (kept in lockstep with reth-op `rev` in Cargo.toml by
+#     scripts/bump-reth.sh — do not hand-edit; see header) -------------------
 OPTIMISM_REV="${OPTIMISM_REV:-27bf9194a08aef70f3fdbff6b3d04bdd70af62ff}"
 OPTIMISM_REMOTE="https://github.com/ethereum-optimism/optimism"
 
