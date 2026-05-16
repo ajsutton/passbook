@@ -77,6 +77,9 @@ jobs:
       - name: Build op-reth-passbook image
         run: docker build --target op-reth-passbook -t op-reth-passbook:ci .
 
+      # Static surface check: the `--passbook.addresses` flag is present on the
+      # node command for both binaries (Task 8.3). Cheap, and a prerequisite
+      # for the runtime smoke below.
       - name: Smoke — reth-passbook node --help exposes passbook.addresses
         run: docker run --rm reth-passbook:ci node --help | grep -q passbook.addresses
 
@@ -85,3 +88,16 @@ jobs:
 
       - name: Smoke — reth-passbook top-level --help preserves reth subcommands
         run: docker run --rm reth-passbook:ci --help | grep -qiE 'init|db|stage'
+
+      # Runtime drop-in-safety smoke (spec validation matrix: "Drop-in safety
+      # (no addresses ⇒ stock node; namespace absent)"). Actually launches each
+      # binary as a `--dev` node and asserts: with no watched addresses the
+      # stock node is alive (`eth_chainId`) but the `passbook` RPC namespace is
+      # ABSENT (`passbook_health` ⇒ method-not-found), and — as a positive
+      # control — that WITH addresses the namespace IS present. This exercises
+      # the actual runtime property the greps above could never cover.
+      - name: Smoke — reth-passbook drop-in safety (runtime)
+        run: bash scripts/smoke-dropin.sh reth-passbook:ci
+
+      - name: Smoke — op-reth-passbook drop-in safety (runtime)
+        run: bash scripts/smoke-dropin.sh op-reth-passbook:ci
