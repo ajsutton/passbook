@@ -1788,3 +1788,148 @@ async fn reverted_value_transfers_zero_residual() {
         "no unattributed_deltas row for W — block reconciled, no false stall"
     );
 }
+
+// ── Issue #3 (C2) — DB-write fault must STALL, not kill the ExEx task ────
+
+/// C2 PROOF: a durable-write failure (disk-full / SQLITE_BUSY past the
+/// busy_timeout / I/O error — modelled here by a `query_only` connection so
+/// every `write_block` transaction fails identically and repeatably) MUST
+/// make `run_passbook` STALL — retry forever with bounded backoff — never
+/// `?` the error out of the loop and terminate indexing.
+///
+/// The committed block is perfectly ordinary and fully reconciled (the real
+/// `|| L1Adapter` pipeline, ZERO residual): the ONLY thing that can fail is
+/// the durable `write_block`. Pre-fix the `write_block(...)?` propagated and
+/// `run_passbook` returned (the explicit anti-requirement). Post-fix the
+/// loop stalls: no `FinishedHeight`, `meta.last_block` never advances, the
+/// driver task is still alive (mirrors
+/// `fault_injected_residual_stalls_without_advancing`).
+#[tokio::test(flavor = "multi_thread")]
+async fn fault_injected_db_write_error_stalls_without_advancing() {
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address();
+    let watched = w_signer.address();
+
+    let chain_id = 0xDB17u64;
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    alloc.insert(watched, acct(U256::ZERO, None));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    // A perfectly ordinary, fully-explainable block (S -> sink): the real
+    // L1 pipeline reconciles it to ZERO residual, so the only possible
+    // failure in run_passbook is the durable write itself.
+    let tx = sign_legacy(
+        &s_signer,
+        chain_id,
+        0,
+        TxKind::Call(Address::repeat_byte(0x51)),
+        U256::from(1u64),
+        100_000,
+        1_000_000_000u128,
+        Bytes::new(),
+    );
+    let recovered = build_block(&chain_spec, 1, chain_spec.genesis_hash(), 12, vec![tx]);
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let exec_out = evm_config
+        .executor(genesis_state(&chain_spec))
+        .execute(&recovered)
+        .expect("block execution");
+    let outcome = ExecutionOutcome::single(1, exec_out);
+    let chain = Chain::new(
+        vec![recovered.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
+
+    // Open the ledger, then INJECT the DB fault: `query_only=ON` makes
+    // every subsequent write (the whole `write_block` transaction) fail
+    // with "attempt to write a readonly database" — a faithful stand-in
+    // for disk-full / persistent SQLITE_BUSY / I/O error.
+    let ledger = Arc::new(Mutex::new(
+        Ledger::open(&db_path, chain_id).expect("ledger open"),
+    ));
+    ledger
+        .lock()
+        .unwrap()
+        .conn()
+        .pragma_update(None, "query_only", "ON")
+        .expect("inject query_only fault");
+
+    let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let driver = tokio::spawn(passbook_core::exex::run_passbook(
+        ctx,
+        cfg.clone(),
+        ledger.clone(),
+        || L1Adapter,
+    ));
+    handle
+        .send_notification_chain_committed(chain)
+        .await
+        .expect("send committed");
+
+    // Several retry iterations (BACKOFF_START=200ms) must elapse with the
+    // loop stalling — NOT exiting.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // (a) NO FinishedHeight was ever emitted (the block is not durable).
+    let mut emitted_finished = false;
+    while let Ok(ev) = handle.events_rx.try_recv() {
+        if matches!(ev, reth_ethereum::exex::ExExEvent::FinishedHeight(_)) {
+            emitted_finished = true;
+        }
+    }
+    assert!(
+        !emitted_finished,
+        "run_passbook MUST NOT emit FinishedHeight when the durable write failed"
+    );
+
+    // (b) the driver is still alive / retrying — it did NOT `?` the DB
+    //     error out of the loop and return (the C2 anti-requirement).
+    assert!(
+        !driver.is_finished(),
+        "run_passbook must STALL on a DB-write error, not exit the task"
+    );
+
+    // (c) nothing was durably written: meta.last_block never advanced and
+    //     no transfer/gas rows exist for the block. Clear query_only so we
+    //     can read (read-only stays consistent; we only relax to assert).
+    {
+        let g = ledger.lock().unwrap();
+        g.conn()
+            .pragma_update(None, "query_only", "OFF")
+            .expect("clear query_only");
+        let last: Option<String> = g
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
+            .ok();
+        assert!(
+            last.is_none() || last.as_deref() != Some("1"),
+            "meta.last_block must NOT advance when the write failed (got {last:?})"
+        );
+        for table in ["eth_transfers", "erc20_transfers", "gas_payments"] {
+            let c: i64 = g
+                .conn()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE block_number=1"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(c, 0, "no {table} rows for the un-written stalled block 1");
+        }
+    }
+
+    driver.abort();
+}

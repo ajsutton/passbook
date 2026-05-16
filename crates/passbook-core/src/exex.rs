@@ -269,9 +269,31 @@ where
 
     while let Some(notification) = ctx.notifications.try_next().await? {
         // Reorg handling FIRST: drop every row for the reverted blocks.
+        // A DB failure here MUST NOT propagate out of the loop: doing so
+        // ends the future AND leaves the reverted block's rows in the
+        // ledger as orphaned/incorrect data (the spec's explicit
+        // anti-requirement). Retry forever with bounded backoff — the
+        // delete is idempotent, so replaying it is always safe.
         if let Some(reverted) = notification.reverted_chain() {
             let hashes: Vec<B256> = reverted.blocks_iter().map(|b| b.hash()).collect();
-            delete_blocks(ledger.lock().unwrap().conn_mut(), chain_id, &hashes)?;
+            let mut backoff = BACKOFF_START;
+            loop {
+                // Scope the MutexGuard so it is dropped BEFORE the await
+                // below (a guard held across `.await` is `!Send` and would
+                // also needlessly hold the ledger lock during the backoff).
+                let res = delete_blocks(ledger.lock().unwrap().conn_mut(), chain_id, &hashes);
+                match res {
+                    Ok(()) => break,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "ExEx reorg delete failed, retrying (not advancing)"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(BACKOFF_CAP);
+                    }
+                }
+            }
         }
 
         if let Some(chain) = notification.committed_chain() {
@@ -308,8 +330,27 @@ where
                         parent_state,
                     ) {
                         Ok(batch) => {
-                            write_block(ledger.lock().unwrap().conn_mut(), &batch)?;
-                            break;
+                            // The durable write is the point of the whole
+                            // loop. A transient SQLITE_BUSY past the 30s
+                            // busy_timeout, disk-full, or an I/O error MUST
+                            // stall (retry forever), never `?` out of the
+                            // loop and terminate indexing. INSERT OR REPLACE
+                            // on natural PKs makes the replay idempotent.
+                            // Scope the MutexGuard so it is dropped BEFORE
+                            // any await below (held-across-await is `!Send`).
+                            let res = write_block(ledger.lock().unwrap().conn_mut(), &batch);
+                            match res {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "ExEx durable block write failed, retrying (not advancing)"
+                                    );
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = (backoff * 2).min(BACKOFF_CAP);
+                                    continue;
+                                }
+                            }
                         }
                         Err(ProcessingError::UnexplainedResidual {
                             block: bn,
@@ -325,7 +366,22 @@ where
                                 attributed_wei: U256::ZERO,
                                 residual_wei: U256::from(residual.unsigned_abs()),
                             };
-                            write_unattributed(ledger.lock().unwrap().conn_mut(), &row)?;
+                            // Best-effort diagnostic row for the health
+                            // query. A failure here must NOT `?` out of the
+                            // loop (that would terminate indexing on the
+                            // very block we are meant to be stalling on);
+                            // just log and fall through to the same stall
+                            // (sleep + retry) as the residual itself.
+                            if let Err(e) =
+                                write_unattributed(ledger.lock().unwrap().conn_mut(), &row)
+                            {
+                                tracing::error!(
+                                    error = %e,
+                                    block = bn,
+                                    %address,
+                                    "ExEx failed to write diagnostic residual row, retrying"
+                                );
+                            }
                             tracing::error!(
                                 block = bn,
                                 %address,
@@ -348,7 +404,12 @@ where
                     }
                 }
             }
-            // Every block durably written ⇒ safe to advance.
+            // Every block durably written ⇒ safe to advance. A send
+            // failure here is NOT a durability concern (the batch is
+            // already committed): per reth's ExEx contract a closed event
+            // channel means the receiver — the node itself — is gone, so
+            // there is nothing left to stall for. Returning ends this
+            // future cleanly as the node shuts down.
             ctx.events
                 .send(ExExEvent::FinishedHeight(chain.tip().num_hash()))?;
         }

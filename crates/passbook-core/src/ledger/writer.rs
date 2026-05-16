@@ -219,6 +219,49 @@ mod tests {
         assert_eq!(n, 1);
     }
 
+    /// Issue #3 (C2): a DB-write fault must surface as `Err` (so the ExEx
+    /// loop can retry/stall), never panic. A `query_only` connection makes
+    /// every write fail with "attempt to write a readonly database" — the
+    /// stand-in for disk-full / persistent SQLITE_BUSY / I/O error.
+    #[test]
+    fn writes_error_not_panic_on_readonly_db() {
+        let (mut l, _tmp) = ledger();
+        l.conn()
+            .pragma_update(None, "query_only", "ON")
+            .expect("inject query_only");
+        let bh = B256::repeat_byte(8);
+        let batch = BlockBatch {
+            chain_id: 1,
+            block_number: 7,
+            block_hash: bh,
+            eth: vec![],
+            erc20: vec![],
+            gas: vec![],
+            unattributed: vec![],
+        };
+        assert!(
+            write_block(l.conn_mut(), &batch).is_err(),
+            "write_block must return Err on a read-only DB, not panic"
+        );
+        let row = UnattributedDeltaRow {
+            chain_id: 1,
+            block_number: 7,
+            block_hash: bh,
+            address: Address::repeat_byte(0xab),
+            observed_wei: U256::from(1),
+            attributed_wei: U256::ZERO,
+            residual_wei: U256::from(1),
+        };
+        assert!(
+            write_unattributed(l.conn_mut(), &row).is_err(),
+            "write_unattributed must return Err on a read-only DB, not panic"
+        );
+        assert!(
+            delete_blocks(l.conn_mut(), 1, &[bh]).is_err(),
+            "delete_blocks must return Err on a read-only DB, not panic"
+        );
+    }
+
     #[test]
     fn delete_by_block_hash_removes_all_categories() {
         let (mut l, _tmp) = ledger();
