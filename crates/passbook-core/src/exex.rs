@@ -706,6 +706,67 @@ mod tests {
         assert_ne!(batch.erc20[0].address, batch.erc20[1].address);
     }
 
+    /// Issue #6 (I2): two recognised system credits to the SAME watched
+    /// address in one block (e.g. two OP deposit-mints) must yield TWO
+    /// `eth_transfers` rows with DISTINCT `trace_path`. The rows share the
+    /// natural PK columns `(chain_id, block_hash, tx_hash=block_hash)`, so
+    /// a non-disambiguated `source` collapsed both into the same
+    /// `trace_path` and `INSERT OR REPLACE` silently dropped one (spec
+    /// line 193: never lose an entry; §(c): system rows queryable). With
+    /// per-occurrence `source` tags the two trace_paths differ and both
+    /// rows persist; reconciliation still nets the summed credit to zero.
+    #[test]
+    fn multiple_system_credits_same_address_distinct_trace_paths() {
+        use crate::system::SystemCredit;
+        let w = Address::repeat_byte(0xD7);
+        let from = Address::repeat_byte(0xFF);
+        let tx_a = B256::repeat_byte(0x01);
+        let tx_b = B256::repeat_byte(0x02);
+        let inp = BlockInputs {
+            chain_id: 1,
+            block_number: 42,
+            block_hash: B256::repeat_byte(0x99),
+            watched: [w].into_iter().collect(),
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            // The watched address observes the summed +3000 credit.
+            account_deltas: vec![(w, 3_000i128)],
+            system_signed: vec![
+                SystemCredit::new(w, 1_000, from, format!("deposit_mint:{tx_a:#x}")),
+                SystemCredit::new(w, 2_000, from, format!("deposit_mint:{tx_b:#x}")),
+            ],
+        };
+        let batch = process_block(inp).expect("recognised system credits net to zero");
+        assert!(
+            batch.unattributed.is_empty(),
+            "summed system credit must reconcile to zero (no residual)"
+        );
+        let sys: Vec<&EthTransferRow> = batch
+            .eth
+            .iter()
+            .filter(|r| matches!(r.kind, EthKind::System) && r.address == w)
+            .collect();
+        assert_eq!(sys.len(), 2, "both deposit-mint rows must be emitted (#6)");
+        // Same PK tx-slot (block_hash), different trace_path — the exact
+        // collision case the bug truncated under INSERT OR REPLACE.
+        assert_eq!(sys[0].tx_hash, sys[1].tx_hash);
+        assert_eq!(sys[0].tx_hash, Some(B256::repeat_byte(0x99)));
+        assert_ne!(
+            sys[0].trace_path, sys[1].trace_path,
+            "distinct trace_path required so neither row is lost"
+        );
+        let mut tps: Vec<&str> = sys.iter().map(|r| r.trace_path.as_str()).collect();
+        tps.sort_unstable();
+        assert_eq!(
+            tps,
+            vec![
+                format!("system:deposit_mint:{tx_a:#x}:{w:#x}"),
+                format!("system:deposit_mint:{tx_b:#x}:{w:#x}"),
+            ]
+        );
+    }
+
     #[test]
     fn unexplained_residual_is_processing_error() {
         let w = Address::repeat_byte(0xcc);

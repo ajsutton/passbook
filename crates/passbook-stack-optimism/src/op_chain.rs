@@ -271,14 +271,20 @@ impl ChainExec for OpChainExec {
             // type alias for it, so no extra op-alloy dependency edge is
             // needed. Extract `(mint, to, from)` per deposit, then run
             // the pure recogniser.
-            let deposits: Vec<(u128, alloy_primitives::TxKind, alloy_primitives::Address)> = block
+            let deposits: Vec<(
+                u128,
+                alloy_primitives::TxKind,
+                alloy_primitives::Address,
+                B256,
+            )> = block
                 .body()
                 .transactions
                 .iter()
                 .filter_map(|tx| {
+                    let h = B256::from(*tx.tx_hash());
                     tx.as_deposit()
                         .map(|d| d.inner())
-                        .map(|d| (d.mint, d.to, d.from))
+                        .map(|d| (d.mint, d.to, d.from, h))
                 })
                 .collect();
             let mut creds = deposit_mint_credits(&deposits, watched);
@@ -344,15 +350,31 @@ impl ChainExec for OpChainExec {
 /// op-alloy dependency edge is needed) and feeds them here. For each
 /// deposit whose recipient ∈ `watched` with a non-zero mint, this yields
 /// a recognised `kind=system` credit so reconciliation nets it (spec
-/// §(b)/(c)) — no residual / stall. Kept type-free
-/// (`&[(mint, TxKind, from)]`) so it is unit-testable without an OP
-/// block, exactly mirroring the L1 `l1_system_credits` design.
+/// §(b)/(c)) — no residual / stall.
+///
+/// The `source` tag embeds the **originating deposit tx hash**
+/// (`deposit_mint:<tx_hash>`) so two deposits minting to the *same*
+/// watched address in one block no longer collide: exex.rs derives the
+/// `eth_transfers` `trace_path` from `(source, address)`, and a bare
+/// `"deposit_mint"` tag would make both rows share the natural PK
+/// `(chain_id, block_hash, tx_hash=block_hash, trace_path)` so
+/// `INSERT OR REPLACE` would silently drop one (issue #6 / I2). The
+/// deposit tx hash is unique per deposit and deterministic across
+/// replays, so the disambiguated `trace_path` stays stable & idempotent.
+/// Kept type-free (`&[(mint, TxKind, from, tx_hash)]`) so it is
+/// unit-testable without an OP block, exactly mirroring the L1
+/// `l1_system_credits` design.
 fn deposit_mint_credits(
-    deposits: &[(u128, alloy_primitives::TxKind, alloy_primitives::Address)],
+    deposits: &[(
+        u128,
+        alloy_primitives::TxKind,
+        alloy_primitives::Address,
+        B256,
+    )],
     watched: &std::collections::HashSet<alloy_primitives::Address>,
 ) -> Vec<SystemCredit> {
     let mut creds: Vec<SystemCredit> = Vec::new();
-    for (mint, to, from) in deposits {
+    for (mint, to, from, tx_hash) in deposits {
         if *mint == 0 {
             continue;
         }
@@ -362,7 +384,7 @@ fn deposit_mint_credits(
                     *to,
                     i128::try_from(*mint).unwrap_or(i128::MAX),
                     *from,
-                    "deposit_mint",
+                    format!("deposit_mint:{tx_hash:#x}"),
                 ));
             }
         }
@@ -570,19 +592,63 @@ mod tests {
         let w = Address::repeat_byte(0xD7);
         let other = Address::repeat_byte(0x11);
         let from = Address::repeat_byte(0xFF);
+        let h0 = B256::repeat_byte(0xA0);
+        let h1 = B256::repeat_byte(0xA1);
+        let h2 = B256::repeat_byte(0xA2);
+        let h3 = B256::repeat_byte(0xA3);
         let watched = [w].into_iter().collect();
         let deposits = vec![
-            (5_000_000_000_000_000u128, TxKind::Call(w), from), // watched ⇒ Some
-            (9_000_000_000_000_000u128, TxKind::Call(other), from), // unwatched ⇒ skip
-            (0u128, TxKind::Call(w), from),                     // zero mint ⇒ skip
-            (1_000u128, TxKind::Create, from),                  // no recipient ⇒ skip
+            (5_000_000_000_000_000u128, TxKind::Call(w), from, h0), // watched ⇒ Some
+            (9_000_000_000_000_000u128, TxKind::Call(other), from, h1), // unwatched ⇒ skip
+            (0u128, TxKind::Call(w), from, h2),                    // zero mint ⇒ skip
+            (1_000u128, TxKind::Create, from, h3),                 // no recipient ⇒ skip
         ];
         let creds = deposit_mint_credits(&deposits, &watched);
         assert_eq!(creds.len(), 1, "only the watched, non-zero, Call mint");
         assert_eq!(creds[0].address, w);
         assert_eq!(creds[0].signed_wei, 5_000_000_000_000_000i128);
         assert_eq!(creds[0].counterparty, from);
-        assert_eq!(creds[0].source, "deposit_mint");
+        assert_eq!(creds[0].source, format!("deposit_mint:{h0:#x}"));
+    }
+
+    /// Issue #6 (I2): two deposit txs minting to the SAME watched address
+    /// in ONE block must yield two DISTINCT `SystemCredit`s whose `source`
+    /// tags differ (by originating deposit tx hash). exex.rs derives the
+    /// `eth_transfers` `trace_path` as `system:<source>:<address>`; with a
+    /// bare `"deposit_mint"` tag both rows shared the natural PK
+    /// `(chain_id, block_hash, tx_hash=block_hash, trace_path)` so
+    /// `INSERT OR REPLACE` silently destroyed one — under-reporting the
+    /// deposit-mint rows (spec line 193: never lose an entry; §(c)
+    /// queryable system rows). Distinct sources ⇒ distinct trace_paths ⇒
+    /// both rows persist.
+    #[test]
+    fn op_multiple_deposit_mints_to_same_watched_addr_dont_collide() {
+        use alloy_primitives::{Address, TxKind};
+        use std::collections::HashSet;
+        let w = Address::repeat_byte(0xD7);
+        let from = Address::repeat_byte(0xFF);
+        let h_a = B256::repeat_byte(0x01);
+        let h_b = B256::repeat_byte(0x02);
+        let watched: HashSet<Address> = [w].into_iter().collect();
+        let deposits = vec![
+            (1_000u128, TxKind::Call(w), from, h_a),
+            (2_000u128, TxKind::Call(w), from, h_b),
+        ];
+        let creds = deposit_mint_credits(&deposits, &watched);
+        assert_eq!(creds.len(), 2, "both same-address mints recognised");
+        // Both credit the same watched address with their own amount …
+        assert_eq!(creds[0].address, w);
+        assert_eq!(creds[1].address, w);
+        assert_eq!(creds[0].signed_wei, 1_000i128);
+        assert_eq!(creds[1].signed_wei, 2_000i128);
+        // … but the per-deposit `source` tags differ, so the derived
+        // `trace_path` (system:<source>:<address>) no longer collides.
+        assert_ne!(
+            creds[0].source, creds[1].source,
+            "per-deposit source must disambiguate same-address mints (#6)"
+        );
+        assert_eq!(creds[0].source, format!("deposit_mint:{h_a:#x}"));
+        assert_eq!(creds[1].source, format!("deposit_mint:{h_b:#x}"));
     }
 
     /// Issue #5 (OP arm): the three OP fee-vault predeploys credited by
