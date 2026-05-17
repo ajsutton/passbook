@@ -41,17 +41,10 @@ permissions:
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_TERM_COLOR: always
-  # ubuntu-latest has two disks: `/` (~21 GB free, where preinstalled tooling
-  # + Docker layers live) and `/mnt` (~70 GB free, ~empty). The reth + op-reth
-  # compile overflows `/` (os error 28). Put cargo's `target/` on `/mnt`
-  # instead of deleting preinstalled tooling — far more space, non-destructive.
-  # (The test job's "Prepare /mnt build dir" step creates this path; only host
-  # cargo reads this var, so the Docker-based images job is unaffected.)
-  CARGO_TARGET_DIR: /mnt/cargo-target
-  # Orthogonal CI hygiene (not a disk workaround): debuginfo dominates a
-  # reth-scale `target/`; `line-tables-only` keeps panic/backtrace line numbers
-  # while cutting size + I/O. Kept because it's a sensible default, not because
-  # space is tight.
+  # Hosted runners have one ~72 GB filesystem, ~17 GB free at start; the
+  # reth+op-reth build needs more, so each job reclaims space in a "Free disk
+  # space" step. line-tables-only keeps panic/backtrace lines while sharply
+  # cutting the reth-scale target/ size + I/O.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
@@ -62,16 +55,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      # Put cargo's target dir (set via CARGO_TARGET_DIR in workflow env) on the
-      # large /mnt scratch disk instead of the cramped /. /mnt is root-owned on
-      # hosted runners, so create + chown to the runner user. Non-destructive:
-      # nothing preinstalled is deleted.
-      - name: Prepare /mnt build dir
+      # Reclaim ~25-35 GB by deleting preinstalled SDKs this build never uses.
+      - name: Free disk space
         run: |
           set -x
-          sudo mkdir -p /mnt/cargo-target
-          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
-          df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/lib/jvm /usr/share/swift \
+            /usr/local/share/powershell "${AGENT_TOOLSDIRECTORY:-}" || true
+          sudo docker image prune --all --force || true
+          df -h /
 
       # Pinned toolchain — matches rust-toolchain.toml channel 1.95.0 and its
       # rustfmt + clippy components (the gates below need both).
@@ -110,49 +103,13 @@ jobs:
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
 
-  # !!! TEMPORARY diagnostic job — get ground truth on the hosted runner's
-  # disk/mem topology instead of guessing. Finishes in seconds. REMOVE once
-  # the images-job disk/OOM strategy is settled (tracked as task #3).
-  runner-info:
-    name: runner-info (TEMP)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dump disk + memory topology
-        run: |
-          set -x
-          uname -a
-          echo "nproc=$(nproc)"
-          free -h
-          echo "===== df -h ====="
-          df -h
-          echo "===== findmnt / and /mnt ====="
-          findmnt / || true
-          findmnt /mnt || true
-          echo "===== lsblk ====="
-          lsblk -f || true
-          echo "===== /mnt listing ====="
-          ls -la /mnt || true
-          echo "===== swap ====="
-          swapon --show || echo "(no swap configured)"
-          echo "===== /var/lib/docker ====="
-          ls -la /var/lib/docker 2>/dev/null || true
-          sudo du -sh /var/lib/docker 2>/dev/null || true
 
   images:
     name: docker images + smokes + publish
-    # !!! TEMPORARY: `needs: test` is intentionally REMOVED so this job runs
-    # in parallel with the ~30-min test job while we iterate on the Docker
-    # /mnt relocation + build. Tests are currently green (run 25976721476:
-    # fmt+clippy+test all passed), so publishing without the gate is an
-    # accepted, time-boxed risk.
-    #
-    # MUST RESTORE before this is considered done — uncomment the line below.
-    # Original rationale: nothing here (build/smoke/publish) should run, and
-    # no image should publish, from a commit whose Rust suite failed. `needs:`
-    # is job-level only (no step-level needs), so gating publish on `test`
-    # means gating the whole job. Cost when restored: images no longer runs
-    # parallel to test, so wall-clock ~= test + images.
-    # needs: test   # <-- TEMPORARILY DISABLED, RE-ENABLE (see task #2)
+    # TEMPORARY: needs:test disabled so this runs parallel to the test job
+    # while iterating on the Docker build. Restore before done (task #2) —
+    # gates build/smoke/publish on a green Rust suite.
+    # needs: test   # <-- RE-ENABLE (task #2)
     runs-on: ubuntu-latest
     # Job-level permissions REPLACE the top-level block, so contents:read must
     # be restated. packages:write lets GITHUB_TOKEN push to this repo's GHCR
@@ -166,65 +123,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      # This job compiles reth twice (both Docker targets); Docker stores all
-      # build layers under its data-root, which defaults to /var/lib/docker on
-      # the cramped / (~21 GB) and overflows. Relocate the data-root to the
-      # large /mnt scratch disk — non-destructive, nothing preinstalled deleted.
-      #
-      # Robust recipe (the prior `systemctl restart docker` was fragile and
-      # took the runner down mid-build): fully STOP docker.service AND
-      # docker.socket, MIGRATE the existing tree, symlink, then start. Finally
-      # ASSERT the daemon's real root is on /mnt and FAIL FAST (seconds) if not
-      # — so a silent relocation miss can never again surface as a 69-minute
-      # runner death with no logs.
-      - name: Relocate Docker storage to /mnt
+      # Reclaim ~25-35 GB of preinstalled SDKs + prune preinstalled Docker
+      # images; this job compiles reth twice in Docker. df logged for headroom.
+      - name: Free disk space
         run: |
-          set -euxo pipefail
-          sudo systemctl stop docker.service docker.socket
-          sudo mkdir -p /mnt/docker
-          # Migrate any existing layers, then replace /var/lib/docker with a
-          # symlink so the data-root move is transparent to everything.
-          if [ -d /var/lib/docker ] && [ ! -L /var/lib/docker ]; then
-            sudo rsync -aqHX --remove-source-files /var/lib/docker/ /mnt/docker/ || true
-            sudo rm -rf /var/lib/docker
-          fi
-          sudo ln -sfn /mnt/docker /var/lib/docker
-          sudo systemctl start docker.service
-          # Wait for the daemon, then hard-assert the real root is on /mnt.
-          for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
-          root="$(docker info --format '{{.DockerRootDir}}')"
-          realroot="$(readlink -f "$root")"
-          echo "Docker root: $root -> $realroot"
-          case "$realroot" in
-            /mnt/*) echo "OK: Docker storage is on /mnt" ;;
-            *) echo "FATAL: Docker root '$realroot' is NOT on /mnt — aborting before the long build"; exit 1 ;;
-          esac
-          df -h / /mnt
-
-      # ubuntu-latest is 4 vCPU / 16 GB RAM with ~no swap. The reth+op-reth
-      # link/codegen peak inside the Docker build exceeds 16 GB, the kernel
-      # OOM-kills, and the runner "loses communication with the server" ~74 min
-      # in with no logs (observed runs 25976721476 / 25978939419). Add a large
-      # swapfile on the spacious /mnt so the peak spills to disk instead of
-      # killing the runner. Slower, but it finishes instead of dying.
-      # Non-destructive; images job only (the test job is green, untouched).
-      - name: Add swap on /mnt (prevent OOM runner loss)
-        run: |
-          set -euxo pipefail
-          sudo fallocate -l 24G /mnt/swapfile
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-          swapon --show
-          free -h
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/lib/jvm /usr/share/swift \
+            /usr/local/share/powershell "${AGENT_TOOLSDIRECTORY:-}" || true
+          sudo docker image prune --all --force || true
+          df -h /
 
       # The Dockerfile self-seeds (its build stage runs scripts/seed-vendor.sh),
       # so no host seed step is needed for this job.
       - name: Build reth-passbook image
-        run: docker build --target reth-passbook -t reth-passbook:ci .
+        run: |
+          docker build --target reth-passbook -t reth-passbook:ci .
+          df -h /
 
       - name: Build op-reth-passbook image
-        run: docker build --target op-reth-passbook -t op-reth-passbook:ci .
+        run: |
+          docker build --target op-reth-passbook -t op-reth-passbook:ci .
+          df -h /
 
       # Static surface check: the `--passbook.addresses` flag is present on the
       # node command for both binaries (Task 8.3). Cheap, and a prerequisite
