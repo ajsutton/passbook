@@ -136,22 +136,37 @@ jobs:
 
       # This job compiles reth twice (both Docker targets); Docker stores all
       # build layers under its data-root, which defaults to /var/lib/docker on
-      # the cramped /. Relocate the data-root to the large /mnt scratch disk
-      # (non-destructive — no preinstalled tooling deleted). Merge into any
-      # existing daemon.json rather than clobbering it.
+      # the cramped / (~21 GB) and overflows. Relocate the data-root to the
+      # large /mnt scratch disk — non-destructive, nothing preinstalled deleted.
+      #
+      # Robust recipe (the prior `systemctl restart docker` was fragile and
+      # took the runner down mid-build): fully STOP docker.service AND
+      # docker.socket, MIGRATE the existing tree, symlink, then start. Finally
+      # ASSERT the daemon's real root is on /mnt and FAIL FAST (seconds) if not
+      # — so a silent relocation miss can never again surface as a 69-minute
+      # runner death with no logs.
       - name: Relocate Docker storage to /mnt
         run: |
-          set -x
+          set -euxo pipefail
+          sudo systemctl stop docker.service docker.socket
           sudo mkdir -p /mnt/docker
-          if [ -s /etc/docker/daemon.json ]; then
-            sudo jq '. + {"data-root":"/mnt/docker"}' /etc/docker/daemon.json \
-              | sudo tee /etc/docker/daemon.json.new
-            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
-          else
-            echo '{"data-root":"/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+          # Migrate any existing layers, then replace /var/lib/docker with a
+          # symlink so the data-root move is transparent to everything.
+          if [ -d /var/lib/docker ] && [ ! -L /var/lib/docker ]; then
+            sudo rsync -aqHX --remove-source-files /var/lib/docker/ /mnt/docker/ || true
+            sudo rm -rf /var/lib/docker
           fi
-          sudo systemctl restart docker
-          docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
+          sudo ln -sfn /mnt/docker /var/lib/docker
+          sudo systemctl start docker.service
+          # Wait for the daemon, then hard-assert the real root is on /mnt.
+          for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          root="$(docker info --format '{{.DockerRootDir}}')"
+          realroot="$(readlink -f "$root")"
+          echo "Docker root: $root -> $realroot"
+          case "$realroot" in
+            /mnt/*) echo "OK: Docker storage is on /mnt" ;;
+            *) echo "FATAL: Docker root '$realroot' is NOT on /mnt — aborting before the long build"; exit 1 ;;
+          esac
           df -h / /mnt
 
       # The Dockerfile self-seeds (its build stage runs scripts/seed-vendor.sh),
