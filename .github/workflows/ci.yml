@@ -41,11 +41,17 @@ permissions:
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_TERM_COLOR: always
-  # The reth + op-reth dependency graph is enormous and debuginfo dominates
-  # `target/` size — full dev debuginfo overflows the ~14-20 GB free disk on
-  # ubuntu-latest hosted runners (os error 28 during `cargo test`).
-  # `line-tables-only` keeps panic/backtrace line numbers (so test failures
-  # are still triageable) while cutting the bulk of the debug sections.
+  # ubuntu-latest has two disks: `/` (~21 GB free, where preinstalled tooling
+  # + Docker layers live) and `/mnt` (~70 GB free, ~empty). The reth + op-reth
+  # compile overflows `/` (os error 28). Put cargo's `target/` on `/mnt`
+  # instead of deleting preinstalled tooling — far more space, non-destructive.
+  # (The test job's "Prepare /mnt build dir" step creates this path; only host
+  # cargo reads this var, so the Docker-based images job is unaffected.)
+  CARGO_TARGET_DIR: /mnt/cargo-target
+  # Orthogonal CI hygiene (not a disk workaround): debuginfo dominates a
+  # reth-scale `target/`; `line-tables-only` keeps panic/backtrace line numbers
+  # while cutting size + I/O. Kept because it's a sensible default, not because
+  # space is tight.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
@@ -56,18 +62,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      # Reclaim ~25-30 GB by deleting preinstalled bulk this build never uses
-      # (.NET, Android SDK, GHC, CodeQL, large toolcache). Without this the
-      # reth/op-reth compile fills the runner disk (os error 28). Plain shell
-      # so no extra action needs SHA-pinning per repo policy.
-      - name: Free disk space
+      # Put cargo's target dir (set via CARGO_TARGET_DIR in workflow env) on the
+      # large /mnt scratch disk instead of the cramped /. /mnt is root-owned on
+      # hosted runners, so create + chown to the runner user. Non-destructive:
+      # nothing preinstalled is deleted.
+      - name: Prepare /mnt build dir
         run: |
           set -x
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-            "${AGENT_TOOLSDIRECTORY:-}" || true
-          sudo docker image prune --all --force || true
-          df -h /
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
+          df -h / /mnt
 
       # Pinned toolchain — matches rust-toolchain.toml channel 1.95.0 and its
       # rustfmt + clippy components (the gates below need both).
@@ -130,16 +134,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      # This job compiles reth twice (both Docker targets) on the same runner
-      # disk; reclaim the preinstalled bulk first for the same reason as the
-      # test job (os error 28).
-      - name: Free disk space
+      # This job compiles reth twice (both Docker targets); Docker stores all
+      # build layers under its data-root, which defaults to /var/lib/docker on
+      # the cramped /. Relocate the data-root to the large /mnt scratch disk
+      # (non-destructive — no preinstalled tooling deleted). Merge into any
+      # existing daemon.json rather than clobbering it.
+      - name: Relocate Docker storage to /mnt
         run: |
           set -x
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-            "${AGENT_TOOLSDIRECTORY:-}" || true
-          df -h /
+          sudo mkdir -p /mnt/docker
+          if [ -s /etc/docker/daemon.json ]; then
+            sudo jq '. + {"data-root":"/mnt/docker"}' /etc/docker/daemon.json \
+              | sudo tee /etc/docker/daemon.json.new
+            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          else
+            echo '{"data-root":"/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+          fi
+          sudo systemctl restart docker
+          docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
+          df -h / /mnt
 
       # The Dockerfile self-seeds (its build stage runs scripts/seed-vendor.sh),
       # so no host seed step is needed for this job.
