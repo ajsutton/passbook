@@ -173,6 +173,23 @@ jobs:
           esac
           df -h / /mnt
 
+      # ubuntu-latest is 4 vCPU / 16 GB RAM with ~no swap. The reth+op-reth
+      # link/codegen peak inside the Docker build exceeds 16 GB, the kernel
+      # OOM-kills, and the runner "loses communication with the server" ~74 min
+      # in with no logs (observed runs 25976721476 / 25978939419). Add a large
+      # swapfile on the spacious /mnt so the peak spills to disk instead of
+      # killing the runner. Slower, but it finishes instead of dying.
+      # Non-destructive; images job only (the test job is green, untouched).
+      - name: Add swap on /mnt (prevent OOM runner loss)
+        run: |
+          set -euxo pipefail
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          swapon --show
+          free -h
+
       # The Dockerfile self-seeds (its build stage runs scripts/seed-vendor.sh),
       # so no host seed step is needed for this job.
       - name: Build reth-passbook image
