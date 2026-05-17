@@ -112,15 +112,19 @@ jobs:
 
   images:
     name: docker images + smokes + publish
-    # Gate on the fmt/clippy/test job: nothing here (build, smoke, OR publish)
-    # runs unless `test` passed first. This means no image is ever published
-    # from a commit whose Rust suite failed. Cost: this job no longer runs in
-    # parallel with `test`, so total CI wall-clock ~= test + images (both
-    # contain the long reth compile). `needs:` is job-level only — there is no
-    # step-level `needs`, so gating publish on `test` requires gating the whole
-    # job. (Build+smoke already gate publish intrinsically: publish steps run
-    # after them in this job and a failed step aborts before publish.)
-    needs: test
+    # !!! TEMPORARY: `needs: test` is intentionally REMOVED so this job runs
+    # in parallel with the ~30-min test job while we iterate on the Docker
+    # /mnt relocation + build. Tests are currently green (run 25976721476:
+    # fmt+clippy+test all passed), so publishing without the gate is an
+    # accepted, time-boxed risk.
+    #
+    # MUST RESTORE before this is considered done — uncomment the line below.
+    # Original rationale: nothing here (build/smoke/publish) should run, and
+    # no image should publish, from a commit whose Rust suite failed. `needs:`
+    # is job-level only (no step-level needs), so gating publish on `test`
+    # means gating the whole job. Cost when restored: images no longer runs
+    # parallel to test, so wall-clock ~= test + images.
+    # needs: test   # <-- TEMPORARILY DISABLED, RE-ENABLE (see task #2)
     runs-on: ubuntu-latest
     # Job-level permissions REPLACE the top-level block, so contents:read must
     # be restated. packages:write lets GITHUB_TOKEN push to this repo's GHCR
