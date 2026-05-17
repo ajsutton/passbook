@@ -14,12 +14,24 @@
 #   make verify-pin     seed + spike co-resolution gate (post-bump check)
 #   make bump ARGS='--optimism-rev <SHA> --reth-rev <SHA>'
 #                       lockstep reth/op-reth rev bump (does NOT commit)
-#   make docker         build the two binary images (needs Dockerfile, Task 9.1)
+#   make docker         build the two binary images locally (tags :dev)
+#   make docker-publish build + push images to GHCR (release profile OOMs
+#                       free CI, so images are built/published locally)
 #   make help           this message
 
 CARGO_ENV := CARGO_NET_GIT_FETCH_WITH_CLI=true
 
-.PHONY: help build test seed verify-pin bump docker
+# Image publishing (override on the command line as needed):
+#   REGISTRY/IMAGE_OWNER → ghcr.io/<owner>/{reth,op-reth}-passbook
+#   VERSION set    → push exactly that tag (release, e.g. VERSION=v1.2.3)
+#   VERSION unset  → push the short commit SHA + a moving `latest`
+# Requires `docker login ghcr.io` first (a token/PAT with write:packages).
+REGISTRY    ?= ghcr.io
+IMAGE_OWNER ?= ajsutton
+GIT_SHA     := $(shell git rev-parse --short HEAD)
+VERSION     ?=
+
+.PHONY: help build test seed verify-pin bump docker docker-publish
 
 help:
 	@echo 'Passbook targets:'
@@ -29,7 +41,8 @@ help:
 	@echo '  make verify-pin     seed + spike co-resolution gate (post-bump check)'
 	@echo "  make bump ARGS='--optimism-rev <SHA> --reth-rev <SHA>'"
 	@echo '                      lockstep reth/op-reth rev bump (does NOT commit)'
-	@echo '  make docker         build the two binary images (needs Dockerfile, Task 9.1)'
+	@echo '  make docker         build the two binary images locally (tags :dev)'
+	@echo '  make docker-publish build + push images to GHCR (local, not CI)'
 	@echo '  make help           this message'
 
 build:
@@ -54,7 +67,22 @@ verify-pin:
 bump:
 	bash scripts/bump-reth.sh $(ARGS)
 
-# The Dockerfile lands in Task 9.1; these targets will not work until then.
 docker:
 	docker build -t reth-passbook:dev --target reth-passbook . && \
 	docker build -t op-reth-passbook:dev --target op-reth-passbook .
+
+# Build (via the `docker` target) then tag + push both images to GHCR.
+# The release profile (codegen-units=1 + thin-LTO) peaks well above free-CI
+# RAM, so publishing is a local operator step, not a CI job.
+docker-publish: docker
+	@set -eu; \
+	owner=$$(printf '%s' '$(IMAGE_OWNER)' | tr 'A-Z' 'a-z'); \
+	if [ -n '$(VERSION)' ]; then tags='$(VERSION)'; else tags='$(GIT_SHA) latest'; fi; \
+	echo "Publishing to $(REGISTRY)/$$owner — tags: $$tags"; \
+	for bin in reth-passbook op-reth-passbook; do \
+	  for t in $$tags; do \
+	    docker tag $$bin:dev $(REGISTRY)/$$owner/$$bin:$$t; \
+	    docker push $(REGISTRY)/$$owner/$$bin:$$t; \
+	    echo "pushed $(REGISTRY)/$$owner/$$bin:$$t"; \
+	  done; \
+	done

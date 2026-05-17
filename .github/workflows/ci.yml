@@ -1,32 +1,19 @@
 name: CI
 
-# Gate `main` and same-repo pull requests on the EXACT commands run locally
-# in Task 9.2:
-#   cargo fmt --all --check
-#   cargo clippy --workspace --all-targets --locked -- -D warnings
-#   cargo test --workspace --locked
-# plus the multi-stage Docker image builds + in-image smokes (Task 9.1).
+# Gates: cargo fmt --all --check / cargo clippy -D warnings / cargo test,
+# all --locked. Docker images are NOT built here — the release profile
+# (codegen-units=1 + thin-LTO) OOMs free CI runners; images are built and
+# published locally via `make docker-publish` (see Makefile).
 #
-# Trigger policy (this repo is public):
-#   * push to `main`  — full CI; images published to GHCR tagged with the
-#                  commit SHA.
-#   * push of a tag   — full CI; images published to GHCR tagged with the
-#                  git tag name (release version).
-#   * other branch pushes — do NOT build; CI starts when a PR is opened.
-#   * pull_request — builds + smokes only, never publishes. Safety against
-#                  untrusted fork PRs is
-#                  enforced OUTSIDE this file by the repository setting
-#                  Settings → Actions → General → "Fork pull request workflows
-#                  from outside collaborators" = "Require approval for all
-#                  outside collaborators". With that set, a fork PR's workflow
-#                  does not run at all until a maintainer approves it, so no
-#                  untrusted code executes and no Actions minutes are spent.
-#                  (Do NOT add per-job `if` fork guards here — a job skipped by
-#                  `if` reports as a PASSING required status check.)
+# Triggers: push to `main`, and same-repo pull requests. Other branch pushes
+# don't build (CI starts when a PR opens). Fork-PR safety is enforced by the
+# repo setting Settings → Actions → General → "Fork pull request workflows
+# from outside collaborators" = "Require approval for all outside
+# collaborators" (do NOT add per-job `if` fork guards — a job skipped by `if`
+# reports as a PASSING required status check).
 on:
   push:
     branches: [main]
-    tags: ['*']
   pull_request:
 
 # Least privilege. Fork-PR tokens are already read-only with no secret access;
@@ -102,114 +89,3 @@ jobs:
 
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
-
-
-  images:
-    name: docker images + smokes + publish
-    # TEMPORARY: needs:test disabled so this runs parallel to the test job
-    # while iterating on the Docker build. Restore before done (task #2) —
-    # gates build/smoke/publish on a green Rust suite.
-    # needs: test   # <-- RE-ENABLE (task #2)
-    runs-on: ubuntu-latest
-    # Job-level permissions REPLACE the top-level block, so contents:read must
-    # be restated. packages:write lets GITHUB_TOKEN push to this repo's GHCR
-    # namespace — no external registry secret needed. (On pull_request the
-    # token is read-only regardless; the publish steps are also `if`-gated to
-    # push events, so PRs never attempt a push.)
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      # Reclaim ~25-35 GB of preinstalled SDKs + prune preinstalled Docker
-      # images; this job compiles reth twice in Docker. df logged for headroom.
-      - name: Free disk space
-        run: |
-          set -x
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
-            /usr/local/share/boost /usr/lib/jvm /usr/share/swift \
-            /usr/local/share/powershell "${AGENT_TOOLSDIRECTORY:-}" || true
-          sudo docker image prune --all --force || true
-          df -h /
-
-      # The Dockerfile self-seeds (its build stage runs scripts/seed-vendor.sh),
-      # so no host seed step is needed for this job.
-      - name: Build reth-passbook image
-        run: |
-          docker build --target reth-passbook -t reth-passbook:ci .
-          df -h /
-
-      - name: Build op-reth-passbook image
-        run: |
-          docker build --target op-reth-passbook -t op-reth-passbook:ci .
-          df -h /
-
-      # Static surface check: the `--passbook.addresses` flag is present on the
-      # node command for both binaries (Task 8.3). Cheap, and a prerequisite
-      # for the runtime smoke below.
-      - name: Smoke — reth-passbook node --help exposes passbook.addresses
-        run: docker run --rm reth-passbook:ci node --help | grep -q passbook.addresses
-
-      - name: Smoke — op-reth-passbook node --help exposes passbook.addresses
-        run: docker run --rm op-reth-passbook:ci node --help | grep -q passbook.addresses
-
-      - name: Smoke — reth-passbook top-level --help preserves reth subcommands
-        run: docker run --rm reth-passbook:ci --help | grep -qiE 'init|db|stage'
-
-      # Runtime drop-in-safety smoke (spec validation matrix: "Drop-in safety
-      # (no addresses ⇒ stock node; namespace absent)"). Actually launches each
-      # binary as a `--dev` node and asserts: with no watched addresses the
-      # stock node is alive (`eth_chainId`) but the `passbook` RPC namespace is
-      # ABSENT (`passbook_health` ⇒ method-not-found), and — as a positive
-      # control — that WITH addresses the namespace IS present. This exercises
-      # the actual runtime property the greps above could never cover.
-      - name: Smoke — reth-passbook drop-in safety (runtime)
-        run: bash scripts/smoke-dropin.sh reth-passbook:ci
-
-      - name: Smoke — op-reth-passbook drop-in safety (runtime)
-        run: bash scripts/smoke-dropin.sh op-reth-passbook:ci
-
-      # --- Publish (only after every build + smoke above has passed) ---------
-      # Runs ONLY on push events (push to `main` or a tag); never on
-      # pull_request. The images were already built+smoked above as
-      # `<bin>:ci`; we just retag and push them — no rebuild.
-      - name: Log in to GitHub Container Registry
-        if: github.event_name == 'push'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Version selection (per spec):
-      #   * tag push       → image tag = the git tag name (release version)
-      #   * push to `main` → image tags = the full commit SHA, plus a moving
-      #                      `latest` that always points at the newest main
-      #                      build. `latest` is NOT applied to release tags so
-      #                      it never silently jumps backward to an old tag.
-      - name: Publish images to GHCR
-        if: github.event_name == 'push'
-        env:
-          OWNER: ${{ github.repository_owner }}
-        run: |
-          set -euo pipefail
-          # GHCR namespaces must be lowercase.
-          owner_lc="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            versions="${{ github.ref_name }}"
-          else
-            versions="${{ github.sha }} latest"
-          fi
-          echo "Publishing tags: ${versions}"
-          for bin in reth-passbook op-reth-passbook; do
-            img="ghcr.io/${owner_lc}/${bin}"
-            for v in ${versions}; do
-              docker tag "${bin}:ci" "${img}:${v}"
-              docker push "${img}:${v}"
-              echo "pushed ${img}:${v}"
-            done
-          done
