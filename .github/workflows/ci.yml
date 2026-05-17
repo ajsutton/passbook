@@ -110,6 +110,34 @@ jobs:
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
 
+  # !!! TEMPORARY diagnostic job — get ground truth on the hosted runner's
+  # disk/mem topology instead of guessing. Finishes in seconds. REMOVE once
+  # the images-job disk/OOM strategy is settled (tracked as task #3).
+  runner-info:
+    name: runner-info (TEMP)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump disk + memory topology
+        run: |
+          set -x
+          uname -a
+          echo "nproc=$(nproc)"
+          free -h
+          echo "===== df -h ====="
+          df -h
+          echo "===== findmnt / and /mnt ====="
+          findmnt / || true
+          findmnt /mnt || true
+          echo "===== lsblk ====="
+          lsblk -f || true
+          echo "===== /mnt listing ====="
+          ls -la /mnt || true
+          echo "===== swap ====="
+          swapon --show || echo "(no swap configured)"
+          echo "===== /var/lib/docker ====="
+          ls -la /var/lib/docker 2>/dev/null || true
+          sudo du -sh /var/lib/docker 2>/dev/null || true
+
   images:
     name: docker images + smokes + publish
     # !!! TEMPORARY: `needs: test` is intentionally REMOVED so this job runs
