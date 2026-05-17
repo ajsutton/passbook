@@ -20,10 +20,10 @@ below remain for understanding/recovery. Post-bump check: **`make verify-pin`**.
 
 | Facade | Source | Rev | Version |
 |--------|--------|-----|---------|
-| `reth-op` (OP) | `https://github.com/ethereum-optimism/optimism` monorepo (declared against this stable remote in `Cargo.toml`; source-replaced onto a gitignored local mirror at `<repo>/.vendor/optimism` by `scripts/seed-vendor.sh` for speed) | `27bf9194a08aef70f3fdbff6b3d04bdd70af62ff` | `reth-op 1.11.3` |
-| `reth-ethereum` (L1) | `https://github.com/paradigmxyz/reth` | `88505c7fcbfdebfd3b56d88c86b62e950043c6c4` | `reth-ethereum 2.2.0` (reth v2.2.0) |
+| `reth-op` (OP) | `https://github.com/ethereum-optimism/optimism` monorepo (declared against this stable remote in `Cargo.toml`; source-replaced onto a gitignored local mirror at `<repo>/.vendor/optimism` by `scripts/seed-vendor.sh` for speed) | `4ddba1610a5d13c1a8c297a91228559d731cc6d5` | `reth-op 1.11.3` (op-reth release tag `op-reth/v2.2.3-rc.1-pr20770.0`; crate-version metadata is still `1.11.3`) |
+| `reth-ethereum` (L1) | `https://github.com/paradigmxyz/reth` | `e8c29c987dd5bb23e95114279c89ce5326fd206d` | `reth-ethereum 2.2.0` (post-v2.2.0 `paradigmxyz/reth` develop SHA — the rev the monorepo at the above optimism rev pins all upstream reth crates to) |
 
-Date locked: 2026-05-16 (monorepo `develop` @ 2026-05-15).
+Date locked: 2026-05-17 (optimism monorepo @ op-reth release tag `op-reth/v2.2.3-rc.1-pr20770.0`).
 Toolchain channel: `1.95.0` (see Toolchain).
 
 > **op-reth is not yet on crates.io.** We get the `reth-op` facade via a git
@@ -41,16 +41,16 @@ identical upstream rev**:
 - The monorepo's `rust/Cargo.toml` pins **every** upstream L1 reth crate
   (`reth-ethereum`, `reth-exex`, `reth-exex-test-utils`, `reth-node-api`,
   `reth-node-ethereum`, `reth-evm`, `reth-revm`, `reth-cli-util`, …) to
-  `git = "https://github.com/paradigmxyz/reth", rev = "88505c7…"` — this is
-  reth **v2.2.0**.
+  `git = "https://github.com/paradigmxyz/reth", rev = "e8c29c98…"` — a
+  post-**v2.2.0** develop SHA (crate version still `reth-ethereum 2.2.0`).
 - In our root `Cargo.toml [workspace.dependencies]` we pin our L1 facade
-  `reth-ethereum` to the **exact same** `paradigmxyz/reth` rev `88505c7…`.
+  `reth-ethereum` to the **exact same** `paradigmxyz/reth` rev `e8c29c98…`.
 - Cargo therefore unifies the shared transitive `reth-*` crates into a
   single dependency graph: the OP crates from the monorepo and our L1 facade
   resolve their common reth dependencies to one rev. Verified in
-  `Cargo.lock`: every `paradigmxyz/reth` entry is at `88505c7…` (one rev),
+  `Cargo.lock`: every `paradigmxyz/reth` entry is at `e8c29c98…` (one rev),
   `reth-op 1.11.3` from the canonical
-  `git+https://github.com/ethereum-optimism/optimism?rev=27bf9194…` source
+  `git+https://github.com/ethereum-optimism/optimism?rev=4ddba161…` source
   (source-replaced onto the local mirror at build time),
   `reth-ethereum 2.2.0`.
 - The shared revm / alloy-evm stack also unifies because we pin
@@ -77,7 +77,7 @@ state.
 
   ```toml
   reth-op = { git = "https://github.com/ethereum-optimism/optimism",
-              rev = "27bf9194a08aef70f3fdbff6b3d04bdd70af62ff",
+              rev = "4ddba1610a5d13c1a8c297a91228559d731cc6d5",
               default-features = false, features = ["node", "cli"] }
   ```
 
@@ -86,7 +86,7 @@ state.
   (slow, but produces an identical, `--locked`-consistent graph).
 
 - **`Cargo.lock`** is committed and records the canonical remote source
-  `git+https://github.com/ethereum-optimism/optimism?rev=27bf9194…` for
+  `git+https://github.com/ethereum-optimism/optimism?rev=4ddba161…` for
   `reth-op` and every sibling monorepo crate. This is the correct, portable
   form: cargo's source replacement keys off this canonical URL, so the same
   lockfile validates with `--locked` whether or not the mirror is present.
@@ -121,14 +121,14 @@ path), and does two things:
    local mirror:
 
    ```toml
-   [source."git+https://github.com/ethereum-optimism/optimism?rev=27bf9194…"]
+   [source."git+https://github.com/ethereum-optimism/optimism?rev=4ddba161…"]
    git = "https://github.com/ethereum-optimism/optimism"
-   rev = "27bf9194…"
+   rev = "4ddba161…"
    replace-with = "optimism-local-mirror"
 
    [source.optimism-local-mirror]
    git = "file://<repo>/.vendor/optimism"
-   rev = "27bf9194…"
+   rev = "4ddba161…"
    ```
 
    The replacement is keyed on the whole git source, so it covers `reth-op`
@@ -225,8 +225,8 @@ locked graph.
 | `serde` | `1` | resolved `1.0.228` |
 | `tempfile` | `3` (dev) | resolved `3.27.0` |
 | `rusqlite` | `0.37` (feature `bundled`) | NOT in `Cargo.lock` yet — no member depends on it until Task 1.x. Adding it to the pin table does not change resolution; it enters the lock when the first member uses it. `0.37` chosen as a conservative stable line. |
-| `reth-optimism-evm` | monorepo `27bf9194…` | already in `Cargo.lock` at `1.11.3` from the optimism git source (needed later by the OP stack adapter, Task 8.2) |
-| `reth-exex-test-utils` | paradigmxyz/reth `88505c7…` | NOT in `Cargo.lock` yet — dev-dep used by passbook-core integration tests (Task 6.5); enters the lock when that member uses it. Pinned to the same rev as `reth-ethereum` so it stays in the unified reth v2.2.0 graph. |
+| `reth-optimism-evm` | monorepo `4ddba161…` | already in `Cargo.lock` at `1.11.3` from the optimism git source (needed later by the OP stack adapter, Task 8.2) |
+| `reth-exex-test-utils` | paradigmxyz/reth `e8c29c98…` | NOT in `Cargo.lock` yet — dev-dep used by passbook-core integration tests (Task 6.5); enters the lock when that member uses it. Pinned to the same rev as `reth-ethereum` so it stays in the unified reth v2.2.0 graph. |
 
 Adding entries to `[workspace.dependencies]` that no current member uses
 does not alter resolution or the lockfile — `cargo build -p spike --locked`

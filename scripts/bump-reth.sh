@@ -153,10 +153,33 @@ if [ "${cur_opt_rev}" != "${cur_seed_rev}" ]; then
 fi
 
 # --- Idempotence: already at the requested revs => clean no-op ---------------
+# A true no-op requires not just Cargo.toml/seed-vendor at the target revs but
+# Cargo.lock ALSO fully retargeted onto them. A prior run that failed/aborted
+# *after* the rev rewrite but *before* the lockfile regen leaves Cargo.toml at
+# the target while Cargo.lock (and the .vendor mirror) are stale — checking
+# only Cargo.toml would then falsely report "nothing to do" and leave the
+# bump half-applied. So gate the no-op on lockfile consistency too.
+lock_fully_at_target() {
+  [ -f "${CARGO_LOCK}" ] || return 1
+  grep -q "ethereum-optimism/optimism?rev=${OPT_REV}" "${CARGO_LOCK}" || return 1
+  grep -q "paradigmxyz/reth?rev=${RETH_REV}"          "${CARGO_LOCK}" || return 1
+  # No optimism/reth source line may still point at any OTHER rev.
+  if grep -oE 'ethereum-optimism/optimism\?rev=[0-9a-f]{40}' "${CARGO_LOCK}" \
+       | grep -qv "rev=${OPT_REV}"; then return 1; fi
+  if grep -oE 'paradigmxyz/reth\?rev=[0-9a-f]{40}' "${CARGO_LOCK}" \
+       | grep -qv "rev=${RETH_REV}"; then return 1; fi
+  return 0
+}
+
 if [ "${cur_opt_rev}" = "${OPT_REV}" ] && [ "${cur_reth_rev}" = "${RETH_REV}" ]; then
-  info "already at these revs (optimism=${OPT_REV}, reth=${RETH_REV}) — nothing to do."
-  info "no files modified. (run 'make verify-pin' if you want to re-validate the build.)"
-  exit 0
+  if lock_fully_at_target; then
+    info "already at these revs (optimism=${OPT_REV}, reth=${RETH_REV}) and Cargo.lock is consistent — nothing to do."
+    info "no files modified. (run 'make verify-pin' if you want to re-validate the build.)"
+    exit 0
+  fi
+  info "Cargo.toml/seed-vendor are already at the requested revs, but Cargo.lock"
+  info "is NOT fully retargeted onto them (likely a prior interrupted run)."
+  info "Continuing: re-seeding the mirror and regenerating Cargo.lock to finish."
 fi
 
 info "bumping: optimism ${cur_opt_rev} -> ${OPT_REV}"
@@ -196,15 +219,24 @@ assert_present() {
   fi
 }
 
-assert_absent  "Cargo.toml reth-op old optimism rev"  "^reth-op = \{.*rev = \"${cur_opt_rev}\"" "${CARGO_TOML}"
+# A lockstep bump may legitimately move only ONE of the two revs (the other
+# stays put so the graph remains unified). assert_absent for an old rev only
+# makes sense when that rev actually changed — if old == new the rev is
+# (correctly) still present. The idempotence guard above guarantees at least
+# one of the two revs differs, so this never silently skips a real rewrite.
+if [ "${cur_opt_rev}" != "${OPT_REV}" ]; then
+  assert_absent "Cargo.toml reth-op old optimism rev"  "^reth-op = \{.*rev = \"${cur_opt_rev}\"" "${CARGO_TOML}"
+  assert_absent "Cargo.toml reth-optimism-evm old rev" "^reth-optimism-evm = \{.*rev = \"${cur_opt_rev}\"" "${CARGO_TOML}"
+  assert_absent "seed-vendor OPTIMISM_REV old"         "OPTIMISM_REV:-${cur_opt_rev}" "${SEED_SCRIPT}"
+fi
+if [ "${cur_reth_rev}" != "${RETH_REV}" ]; then
+  assert_absent "Cargo.toml reth-ethereum old rev"     "^reth-ethereum = \{.*rev = \"${cur_reth_rev}\"" "${CARGO_TOML}"
+  assert_absent "Cargo.toml reth-exex-test-utils old"  "^reth-exex-test-utils = \{.*rev = \"${cur_reth_rev}\"" "${CARGO_TOML}"
+fi
 assert_present "Cargo.toml reth-op new optimism rev"  "^reth-op = \{.*rev = \"${OPT_REV}\""     "${CARGO_TOML}"
-assert_absent  "Cargo.toml reth-optimism-evm old rev" "^reth-optimism-evm = \{.*rev = \"${cur_opt_rev}\"" "${CARGO_TOML}"
 assert_present "Cargo.toml reth-optimism-evm new rev" "^reth-optimism-evm = \{.*rev = \"${OPT_REV}\""     "${CARGO_TOML}"
-assert_absent  "Cargo.toml reth-ethereum old rev"     "^reth-ethereum = \{.*rev = \"${cur_reth_rev}\"" "${CARGO_TOML}"
 assert_present "Cargo.toml reth-ethereum new rev"     "^reth-ethereum = \{.*rev = \"${RETH_REV}\""     "${CARGO_TOML}"
-assert_absent  "Cargo.toml reth-exex-test-utils old"  "^reth-exex-test-utils = \{.*rev = \"${cur_reth_rev}\"" "${CARGO_TOML}"
 assert_present "Cargo.toml reth-exex-test-utils new"  "^reth-exex-test-utils = \{.*rev = \"${RETH_REV}\""     "${CARGO_TOML}"
-assert_absent  "seed-vendor OPTIMISM_REV old"         "OPTIMISM_REV:-${cur_opt_rev}" "${SEED_SCRIPT}"
 assert_present "seed-vendor OPTIMISM_REV new"         "OPTIMISM_REV:-${OPT_REV}"     "${SEED_SCRIPT}"
 
 info "rev rewrites applied + asserted in Cargo.toml and scripts/seed-vendor.sh"
