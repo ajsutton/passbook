@@ -19,7 +19,7 @@ use std::sync::Arc;
 use reth_ethereum::chainspec::ChainSpec;
 use reth_ethereum::primitives::RecoveredBlock;
 use reth_ethereum::provider::Chain;
-use reth_ethereum::storage::StateProviderBox;
+use crate::exex::ParentStateFn;
 use reth_ethereum::{Block, EthPrimitives};
 
 use crate::config::PassbookConfig;
@@ -67,7 +67,7 @@ where
         chain: &Chain<EthPrimitives>,
         block: &RecoveredBlock<Block>,
         cfg: &PassbookConfig,
-        parent_state: StateProviderBox,
+        get_parent_state: &ParentStateFn<'_>,
     ) -> Result<BlockBatch, ProcessingError> {
         // Verbatim Task 6.4 L1 pipeline — behaviour-preserving.
         process_committed_block_inner(
@@ -77,7 +77,7 @@ where
             block,
             cfg,
             &(self.make_adapter)(),
-            parent_state,
+            get_parent_state,
         )
     }
 }
@@ -104,7 +104,7 @@ where
         chain: &Chain<EthPrimitives>,
         block: &RecoveredBlock<Block>,
         cfg: &PassbookConfig,
-        parent_state: StateProviderBox,
+        get_parent_state: &ParentStateFn<'_>,
     ) -> Result<BlockBatch, ProcessingError> {
         process_committed_block_inner(
             chain_id,
@@ -113,7 +113,7 @@ where
             block,
             cfg,
             &self(),
-            parent_state,
+            get_parent_state,
         )
     }
 }
