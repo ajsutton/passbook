@@ -315,6 +315,28 @@ where
 {
     let chain_id = ctx.config.chain.chain_id();
 
+    // Resume from the ledger high-water mark. On a fresh datadir this is
+    // None → run head-less so we consume the pipeline's
+    // `ExExNotificationSource::Pipeline` stream from the first executed
+    // block with NO backfill job (single execution). On restart it is
+    // Some(..) → reth's with-head backfill re-covers only the small
+    // lockstep gap (bounded by the Execution-stage ExEx backpressure
+    // window), not the whole chain.
+    {
+        let head = {
+            let guard = ledger.lock().unwrap_or_else(|e| e.into_inner());
+            crate::ledger::queries::resume_head(guard.conn())?
+        };
+        if let Some((number, hash)) = head {
+            ctx.set_notifications_with_head(reth_ethereum::exex::ExExHead {
+                block: alloy_eips::BlockNumHash { number, hash },
+            });
+            tracing::info!(number, %hash, "passbook ExEx resuming with head");
+        } else {
+            tracing::info!("passbook ExEx starting head-less (fresh datadir)");
+        }
+    }
+
     let mut pending_finished: Option<alloy_eips::BlockNumHash> = None;
 
     while let Some(notification) = ctx.notifications.try_next().await? {

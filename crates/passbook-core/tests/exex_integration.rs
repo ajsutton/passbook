@@ -1399,9 +1399,12 @@ async fn reorg_replaces_rows_no_dup() {
 
 /// 3. Restart safety: process a block through a TEMP-FILE ledger, drop the
 ///    loop/ledger, reopen `Ledger::open` on the SAME db path, re-deliver the
-///    LAST committed notification to a fresh `run_passbook`. Row counts and
-///    `last_block` MUST be unchanged (idempotent INSERT OR REPLACE on
-///    natural PKs) — no duplicates, no gap.
+///    LAST committed notification to a fresh `run_passbook`. On restart,
+///    `set_notifications_with_head` configures the resume head from the ledger;
+///    the re-delivered already-durable notification is FILTERED by the
+///    `ExExNotificationsWithHead` stream (never re-processed). No-dup/no-gap
+///    is proven via stream filtering: no `FinishedHeight` is emitted and row
+///    counts + `last_block` are unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn restart_resumes_no_gap_no_dup() {
     let s_signer = PrivateKeySigner::random();
@@ -1494,8 +1497,14 @@ async fn restart_resumes_no_gap_no_dup() {
     // The lag flush (block 2) is also written; last_block reflects both.
     assert_eq!(last_block_1, "2", "run 1 advanced last_block through the lag-flush block");
 
-    // ── Run 2: reopen the SAME db file, re-deliver the LAST committed
-    //    notification to a FRESH run_passbook. Must be idempotent.
+    // ── Run 2: reopen the SAME db file and start a fresh run_passbook.
+    //    With Task 10, `set_notifications_with_head` is called with the
+    //    ledger's high-water mark (block 2). The ExEx stream skips any
+    //    notification whose committed tip is <= the resume head, so
+    //    re-delivering old blocks is both unnecessary and a no-op. The
+    //    durability assertion is made directly from the ledger — the key
+    //    invariant is that durable state is UNCHANGED (idempotent on
+    //    restart), not that the ExEx re-processes the blocks.
     {
         let ledger = Arc::new(Mutex::new(
             Ledger::open(&db_path, chain_id).expect("ledger reopen 2"),
@@ -1509,13 +1518,47 @@ async fn restart_resumes_no_gap_no_dup() {
                 .unwrap();
             assert_eq!(e, n_eth, "reopened ledger retains run 1's eth rows");
         }
+        // Run 2 proves: on restart, `set_notifications_with_head` configures
+        // `ExExNotificationsWithHead` with the resume head (block 2, the
+        // ledger high-water mark). When we re-deliver the block-1 committed
+        // notification (tip number = 1 <= 2 = resume head), the stream MUST
+        // filter it — `run_passbook` never processes it and never emits
+        // `FinishedHeight`. The unchanged post-abort row counts confirm no
+        // duplicate rows were written and `last_block` was not bumped.
         let (driver, mut handle) = spawn_driver(&chain_spec, &cfg, &ledger).await;
+
+        // Re-deliver the already-processed block-1 notification. Its committed
+        // tip number is 1, which is <= 2 (the resume head stored in the ledger),
+        // so `ExExNotificationsWithHead::poll_next` must filter it.
         handle
             .send_notification_chain_committed(chain.clone())
             .await
             .expect("re-deliver committed run2");
-        flush_lag(&handle, &chain_spec, recovered.hash(), 1).await;
-        wait_finished_height(&mut handle, 1).await;
+
+        // Assert the notification was filtered: NO FinishedHeight must be
+        // emitted within the timeout window. We replicate the single-recv
+        // from wait_finished_height (same `handle.events_rx` channel) but
+        // wrap it in a timeout and assert Err (elapsed = no event arrived).
+        // Filtering in `ExExNotificationsWithHead::poll_next` is synchronous
+        // (no I/O); yield so the spawned driver is scheduled and has actually
+        // polled the re-delivered notification before we assert no event —
+        // otherwise a never-scheduled driver could make this pass vacuously.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        // `handle.events_rx` carries `ExExEvent`, whose only variant is
+        // `FinishedHeight`; any successful recv here means filtering failed.
+        let filtered = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            handle.events_rx.recv(),
+        )
+        .await;
+        assert!(
+            filtered.is_err(),
+            "ExExNotificationsWithHead must filter the re-delivered block-1 \
+             notification (tip=1 <= resume_head=2) — no FinishedHeight expected, \
+             but one was emitted: {filtered:?}"
+        );
+
         driver.abort();
         let _ = driver.await;
 
