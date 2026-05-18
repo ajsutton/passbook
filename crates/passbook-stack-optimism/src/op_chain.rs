@@ -49,7 +49,7 @@ use passbook_core::system::SystemCredit;
 use reth_op::chainspec::OpChainSpec;
 use reth_op::primitives::RecoveredBlock;
 use reth_op::provider::Chain;
-use reth_op::storage::StateProviderBox;
+use passbook_core::exex::ParentStateFn;
 use reth_op::{OpBlock, OpPrimitives};
 
 use reth_optimism_evm::{extract_l1_info, OpEvmConfig, RethL1BlockInfo};
@@ -80,7 +80,7 @@ impl ChainExec for OpChainExec {
         chain: &Chain<OpPrimitives>,
         block: &RecoveredBlock<OpBlock>,
         cfg: &PassbookConfig,
-        parent_state: StateProviderBox,
+        get_parent_state: &ParentStateFn<'_>,
     ) -> Result<BlockBatch, ProcessingError> {
         let block_number = block.header().number();
         let block_hash = block.hash();
@@ -156,6 +156,12 @@ impl ChainExec for OpChainExec {
         //    inspector + shared pre-state overlay; OP EVM config).
         let mut frames: Vec<(Option<B256>, bool, CapturedFrame)> = Vec::new();
         if any_watched_changed {
+            let parent_state = get_parent_state().map_err(|e| {
+                ProcessingError::ParentStateUnavailable {
+                    block: block_number,
+                    msg: e.to_string(),
+                }
+            })?;
             let captured =
                 reexecute_op_block_frames(chain_spec.clone(), chain, block, parent_state).map_err(
                     |e| {
