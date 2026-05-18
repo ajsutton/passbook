@@ -13,10 +13,14 @@ passbook-core = { path = "../../passbook-core" }
 passbook-stack-ethereum = { path = "../../passbook-stack-ethereum" }
 reth-ethereum.workspace = true
 reth-cli-util.workspace = true
+reth-node-core.workspace = true
 clap.workspace = true
 eyre.workspace = true
 tokio.workspace = true
 futures.workspace = true
+
+[build-dependencies]
+vergen = { version = "9.1.0", default-features = false, features = ["cargo"] }
 
 [features]
 jemalloc = ["reth-cli-util/jemalloc"]

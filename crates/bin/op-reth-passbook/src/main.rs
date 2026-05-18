@@ -74,6 +74,17 @@ struct OpExt {
 }
 
 fn main() -> eyre::Result<()> {
+    // Restore reth_info{cargo_features}: start from reth's default
+    // metadata (keeps the correct git_sha/timestamp/profile/etc. baked
+    // into reth-node-core) and override only the features string with
+    // THIS binary's compile-time value (emitted by build.rs/vergen).
+    // Must run before the node builder first calls version_metadata().
+    {
+        let mut vm = reth_node_core::version::default_reth_version_metadata();
+        vm.vergen_cargo_features = std::borrow::Cow::Borrowed(env!("VERGEN_CARGO_FEATURES"));
+        let _ = reth_node_core::version::try_init_version_metadata(vm);
+    }
+
     // The stock op-reth CLI, parameterised with the OP chain-spec parser
     // and our combined `OpExt` arg group. The `--passbook.*` flags appear
     // on the node command's `--help` exactly like native op-reth flags;

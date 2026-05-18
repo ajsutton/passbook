@@ -54,6 +54,17 @@ use reth_ethereum::cli::Cli;
 use reth_ethereum::node::EthereumNode;
 
 fn main() -> eyre::Result<()> {
+    // Restore reth_info{cargo_features}: start from reth's default
+    // metadata (keeps the correct git_sha/timestamp/profile/etc. baked
+    // into reth-node-core) and override only the features string with
+    // THIS binary's compile-time value (emitted by build.rs/vergen).
+    // Must run before the node builder first calls version_metadata().
+    {
+        let mut vm = reth_node_core::version::default_reth_version_metadata();
+        vm.vergen_cargo_features = std::borrow::Cow::Borrowed(env!("VERGEN_CARGO_FEATURES"));
+        let _ = reth_node_core::version::try_init_version_metadata(vm);
+    }
+
     // The stock reth Ethereum CLI, parameterised with the standard
     // Ethereum chain-spec parser and our extra `PassbookArgs` arg group.
     // `PassbookArgs` is `#[derive(clap::Args)]`, so the `--passbook.*`

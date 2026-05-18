@@ -5418,8 +5418,10 @@ dependencies = [
  "passbook-core",
  "passbook-stack-optimism",
  "reth-cli-util",
+ "reth-node-core",
  "reth-op",
  "tokio",
+ "vergen",
 ]
 
 [[package]]
@@ -8689,7 +8691,9 @@ dependencies = [
  "passbook-stack-ethereum",
  "reth-cli-util",
  "reth-ethereum",
+ "reth-node-core",
  "tokio",
+ "vergen",
 ]
 
 [[package]]

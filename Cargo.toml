@@ -59,6 +59,7 @@ reth-optimism-evm = { git = "https://github.com/ethereum-optimism/optimism", rev
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "e8c29c987dd5bb23e95114279c89ce5326fd206d", features = ["full", "cli"] }
 reth-exex-test-utils = { git = "https://github.com/paradigmxyz/reth", rev = "e8c29c987dd5bb23e95114279c89ce5326fd206d" }
 reth-cli-util = { git = "https://github.com/paradigmxyz/reth", rev = "e8c29c987dd5bb23e95114279c89ce5326fd206d", default-features = false }
+reth-node-core = { git = "https://github.com/paradigmxyz/reth", rev = "e8c29c987dd5bb23e95114279c89ce5326fd206d", default-features = false }
 
 # ── revm stack (exact crates.io versions the monorepo uses) ─────────────────
 revm = "38.0.0"
