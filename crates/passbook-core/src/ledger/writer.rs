@@ -98,6 +98,11 @@ pub fn write_block(conn: &mut Connection, b: &BlockBatch) -> eyre::Result<()> {
          ON CONFLICT(k) DO UPDATE SET v=excluded.v",
         [b.block_number.to_string()],
     )?;
+    tx.execute(
+        "INSERT INTO meta(k,v) VALUES('last_block_hash',?1)
+         ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        [format!("{:#x}", b.block_hash)],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -339,6 +344,27 @@ mod tests {
             delete_blocks(l.conn_mut(), 1, &[bh]).is_err(),
             "delete_blocks must return Err on a read-only DB, not panic"
         );
+    }
+
+    #[test]
+    fn write_block_persists_last_block_hash() {
+        let bh = alloy_primitives::B256::repeat_byte(0xab);
+        let (mut led, _tmp) = ledger();
+        let batch = BlockBatch {
+            chain_id: 1,
+            block_number: 777,
+            block_hash: bh,
+            eth: vec![],
+            erc20: vec![],
+            gas: vec![],
+            unattributed: vec![],
+        };
+        write_block(led.conn_mut(), &batch).unwrap();
+        let stored: String = led
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='last_block_hash'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, format!("{bh:#x}"));
     }
 
     #[test]
