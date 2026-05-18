@@ -337,6 +337,9 @@ where
         }
     }
 
+    // One-notification lag: the last pending height is intentionally never
+    // emitted on shutdown (the pruner simply retains slightly more). On
+    // restart, `set_notifications_with_head` re-covers the gap cleanly.
     let mut pending_finished: Option<alloy_eips::BlockNumHash> = None;
 
     while let Some(notification) = ctx.notifications.try_next().await? {

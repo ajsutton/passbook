@@ -2519,3 +2519,222 @@ async fn watched_to_watched_erc20_and_eth_no_row_loss_zero_residual() {
         .unwrap();
     assert_eq!(unattributed, 0, "ZERO unattributed residual expected");
 }
+
+// ── DRY helper ──────────────────────────────────────────────────────────────
+
+/// Build a `get_parent_state` thunk that calls
+/// `handle.provider_factory.history_by_block_hash(hash)` each time it is
+/// invoked. Eliminates the closure boilerplate in new tests; existing six sites
+/// above are left unchanged (they predate this helper) to avoid any risk of
+/// behaviour-altering rewrites in already-reviewed test code.
+///
+/// Note: `ProviderFactory<NodeTypesWithDBAdapter<TestNode, TmpDB>>` (the type
+/// of `TestExExHandle::provider_factory`) has `history_by_block_hash` as an
+/// INHERENT method but does NOT implement the `StateProviderFactory` trait, so
+/// the helper takes the full `TestExExHandle` rather than a generic factory.
+fn genesis_state_thunk(
+    handle: &reth_exex_test_utils::TestExExHandle,
+    hash: B256,
+) -> impl Fn() -> eyre::Result<reth_ethereum::storage::StateProviderBox> + '_
+{
+    move || Ok(handle.provider_factory.history_by_block_hash(hash)?)
+}
+
+// ── Integration test: ParentStateUnavailable retries then succeeds ──────────
+
+/// The `ParentStateUnavailable` retry-then-succeed hot path.
+///
+/// `process_committed_block_inner` invokes `get_parent_state` exactly ONCE
+/// per call. This test drives it K=2 times with a thunk that fails on the
+/// first K calls and succeeds on call K+1, directly exercising the
+/// `ProcessingError::ParentStateUnavailable` return path and confirming that
+/// the (K+1)th call produces the correct, fully-reconciled batch.
+///
+/// **Test level**: `process_committed_block_inner` (not full driver). Rationale:
+/// `run_passbook`'s internal `get_parent_state` closure is built from
+/// `ctx.provider().history_by_block_hash(parent_hash)` which cannot be made to
+/// fail-then-succeed without a mock `StateProviderFactory`. The direct
+/// `process_committed_block_inner` level is exactly where every other
+/// integration test exercises this path (Task 6.4), and the `run_passbook` arm
+/// code is already covered by the unit test in `exex.rs` and the existing
+/// `fault_injected_residual_stalls_without_advancing` + stall-probe structure.
+/// The goal (retry→idempotent-success behaviour covered) is fully met here.
+#[tokio::test(flavor = "multi_thread")]
+async fn parent_state_unavailable_retries_then_succeeds() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ── Actors ──────────────────────────────────────────────────────────
+    let s_signer = PrivateKeySigner::random();
+    let w_signer = PrivateKeySigner::random();
+    let sender = s_signer.address();
+    let watched = w_signer.address(); // W (codeless EOA)
+
+    // SELFDESTRUCT forwarder → W (produces an internal inbound ETH frame for
+    // W, triggering `any_watched_changed = true` and thus the gated
+    // `get_parent_state()` call — the exact path under test).
+    let fwd = Address::repeat_byte(0xF0);
+
+    let chain_id = 0xB4D1u64;
+    let gas_price = 1_000_000_000u128;
+    let fwd_value = U256::from(4_000_000_000_000_000u64); // 0.004 ETH → W via SELFDESTRUCT
+
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(sender, acct(funded, None));
+    alloc.insert(watched, acct(funded, None));
+    alloc.insert(
+        fwd,
+        acct(U256::ZERO, Some(selfdestruct_forwarder_code(watched))),
+    );
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    // ── Build and execute the block ──────────────────────────────────────
+    let tx = sign_legacy(
+        &s_signer,
+        chain_id,
+        0,
+        TxKind::Call(fwd),
+        fwd_value,
+        200_000,
+        gas_price,
+        Bytes::new(),
+    );
+    let recovered = build_block(&chain_spec, 1, chain_spec.genesis_hash(), 12, vec![tx]);
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let exec_out = evm_config
+        .executor(genesis_state(&chain_spec))
+        .execute(&recovered)
+        .expect("block execution");
+    let outcome = ExecutionOutcome::single(1, exec_out);
+    let chain = Chain::new(
+        vec![recovered.clone()],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
+
+    // ── Harness: we need a real parent (= genesis) state provider ────────
+    let (mut ctx, handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let genesis_hash = handle.genesis.hash();
+
+    // ── Fail-then-succeed thunk ──────────────────────────────────────────
+    // The first K=2 calls return Err(ParentStateUnavailable); call K+1
+    // returns Ok with the real genesis-state provider. An AtomicUsize
+    // counter is used for deterministic, thread-safe call counting.
+    const K: usize = 2;
+    let call_count = Arc::new(AtomicUsize::new(0));
+
+    // ── K=2 failing calls must each return ParentStateUnavailable ────────
+    for i in 0..K {
+        let n = call_count.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(n, i, "call count before call {i}");
+
+        let fail_thunk = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
+            eyre::bail!("injected: parent state pruned (call {})", n + 1)
+        };
+        let err = passbook_core::exex::process_committed_block_inner(
+            chain_id,
+            chain_spec.clone(),
+            &chain,
+            &recovered,
+            &cfg,
+            &L1Adapter,
+            &fail_thunk,
+        )
+        .expect_err("failing thunk must produce ProcessingError::ParentStateUnavailable");
+
+        assert!(
+            matches!(
+                err,
+                passbook_core::exex::ProcessingError::ParentStateUnavailable {
+                    block: 1,
+                    ..
+                }
+            ),
+            "expected ParentStateUnavailable for block 1 on call {}, got {err:?}",
+            i + 1,
+        );
+        assert!(
+            format!("{err}").contains("historical parent state unavailable at block 1"),
+            "error message must mention 'historical parent state unavailable at block 1', got: {err}"
+        );
+    }
+
+    // ── K+1-th call: real provider succeeds, batch is correct ────────────
+    let n = call_count.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(n, K, "call count on the success call");
+
+    let succeed_thunk = genesis_state_thunk(&handle, genesis_hash);
+    let batch = passbook_core::exex::process_committed_block_inner(
+        chain_id,
+        chain_spec.clone(),
+        &chain,
+        &recovered,
+        &cfg,
+        &L1Adapter,
+        &succeed_thunk,
+    )
+    .expect("(K+1)-th call with real provider must succeed");
+
+    // Zero residual: no unexplained delta, confirming correct reconciliation.
+    assert!(
+        batch.unattributed.is_empty(),
+        "zero unattributed residual expected after retries succeed"
+    );
+
+    // Exactly one internal inbound ETH row for W (the SELFDESTRUCT forward).
+    let internal_in: Vec<&_> = batch
+        .eth
+        .iter()
+        .filter(|r| {
+            r.address == watched
+                && matches!(r.direction, passbook_core::model::Direction::In)
+                && matches!(r.kind, passbook_core::model::EthKind::Internal)
+        })
+        .collect();
+    assert_eq!(
+        internal_in.len(),
+        1,
+        "exactly one internal inbound ETH row for W after retry success"
+    );
+    assert_eq!(
+        internal_in[0].amount_wei,
+        fwd_value,
+        "inbound amount equals the forwarded value"
+    );
+
+    // No duplication: write the batch to a real ledger and confirm single row.
+    let mut ledger =
+        passbook_core::ledger::Ledger::open(&db_path, chain_id).expect("ledger open");
+    passbook_core::ledger::writer::write_block(ledger.conn_mut(), &batch)
+        .expect("durable write must succeed");
+    let eth_in: i64 = ledger
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM eth_transfers \
+             WHERE address=?1 AND direction='in' AND kind='internal'",
+            [&format!("{watched:#x}")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        eth_in, 1,
+        "exactly one inbound internal eth row durably written (no duplication from retries)"
+    );
+
+    // Total calls: exactly K+1 (K failures + 1 success).
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        K + 1,
+        "expected exactly K+1 = {} total calls to get_parent_state",
+        K + 1
+    );
+}
