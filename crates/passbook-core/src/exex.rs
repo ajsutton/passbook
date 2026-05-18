@@ -26,6 +26,13 @@ use std::time::Duration;
 const BACKOFF_START: Duration = Duration::from_millis(200);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 
+/// Lazily resolves the historical post-state of the committed chain's
+/// parent block (pre-state of the chain's first block). A `ChainExec`
+/// arm calls this ONLY inside the `any_watched_changed` gate — never for
+/// the ~all blocks that touch no watched account — so a `--full` node
+/// mid-pipeline is not stalled on historical state it does not need.
+pub type ParentStateFn<'a> = dyn Fn() -> eyre::Result<StateProviderBox> + 'a;
+
 pub struct BlockInputs {
     pub chain_id: u64,
     pub block_number: u64,
@@ -58,6 +65,13 @@ pub enum ProcessingError {
     /// instead the block is failed exactly like an unexplained residual.
     #[error("reconcile arithmetic out of i128 range for {address} at block {block}")]
     ReconcileOverflow { block: u64, address: Address },
+    /// The gated re-execution needed the parent block's historical
+    /// post-state but the provider could not supply it (e.g. a `--full`
+    /// node has pruned it, or the pipeline has not committed it yet).
+    /// `run_passbook` treats this exactly like a transient write failure:
+    /// stall (retry forever with bounded backoff), never advance.
+    #[error("historical parent state unavailable at block {block}: {msg}")]
+    ParentStateUnavailable { block: u64, msg: String },
 }
 
 /// Pure: deterministic transform of one block's inputs into a durable batch.
@@ -894,5 +908,15 @@ mod tests {
             matches!(err, ProcessingError::ReconcileOverflow { block: 11, address } if address == w),
             "out-of-range inflow must be a hard ReconcileOverflow, got {err:?}"
         );
+    }
+
+    #[test]
+    fn parent_state_unavailable_is_processing_error() {
+        let e = ProcessingError::ParentStateUnavailable {
+            block: 42,
+            msg: "pruned".to_string(),
+        };
+        assert!(matches!(e, ProcessingError::ParentStateUnavailable { block: 42, .. }));
+        assert!(format!("{e}").contains("historical parent state unavailable at block 42"));
     }
 }
