@@ -26,6 +26,50 @@ pub fn health(conn: &Connection) -> eyre::Result<Health> {
     })
 }
 
+/// The ExEx resume point: `(last_block, last_block_hash)` from `meta`.
+///
+/// Returns `None` when the resume point is not usable, which collapses
+/// several cases to the same safe degradation — the ExEx runs *head-less*
+/// and consumes the pipeline notification stream with no backfill job:
+///
+/// - **Fresh datadir:** no blocks written yet (both keys absent). The
+///   ExEx simply starts tracking the pipeline from the current frontier.
+/// - **Pre-Task-8 DB:** `last_block` present but `last_block_hash` absent
+///   (written before the hash was persisted). `write_block` writes both
+///   keys in one transaction, so a *partial* pair cannot occur on a DB
+///   written by current code — only on a legacy one. Idempotent
+///   `INSERT OR REPLACE` replay makes head-less catch-up safe here.
+/// - **Corrupt/unparseable value:** a present but non-parseable
+///   `last_block`/`last_block_hash` also degrades to `None`. This is a
+///   deliberate trade-off: on an ExEx that has already advanced, a
+///   head-less resume from the current frontier could skip blocks
+///   between the last durable write and the frontier. It is accepted
+///   because the write path serialises through a controlled,
+///   round-trip-stable `format!("{:#x}", ..)` / `B256::parse()` pair, so
+///   a parse failure implies external tampering or a writer regression,
+///   not normal operation. (Surfacing corruption as an error instead of
+///   `None` would require a richer return type and is intentionally out
+///   of scope here.)
+pub fn resume_head(conn: &Connection) -> eyre::Result<Option<(u64, alloy_primitives::B256)>> {
+    let n: Option<u64> = conn
+        .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let h: Option<alloy_primitives::B256> = conn
+        .query_row("SELECT v FROM meta WHERE k='last_block_hash'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|s| s.parse().ok());
+    Ok(match (n, h) {
+        (Some(n), Some(h)) => Some((n, h)),
+        // partial (one key only) or absent — all degrade to head-less
+        _ => None,
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferRowOut {
     pub category: &'static str,
@@ -276,6 +320,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let l = crate::ledger::Ledger::open(&dir.path().join("q.db"), 1).unwrap();
         (l, dir)
+    }
+
+    #[test]
+    fn resume_head_none_then_some_after_write() {
+        let (mut led, _tmp) = ledger();
+        assert_eq!(resume_head(led.conn()).unwrap(), None);
+        let bh = alloy_primitives::B256::repeat_byte(0x5e);
+        write_block(
+            led.conn_mut(),
+            &BlockBatch {
+                chain_id: 1,
+                block_number: 12345,
+                block_hash: bh,
+                eth: vec![],
+                erc20: vec![],
+                gas: vec![],
+                unattributed: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(resume_head(led.conn()).unwrap(), Some((12345u64, bh)));
     }
 
     const ADDR: u8 = 0xaa;
