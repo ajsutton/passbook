@@ -272,11 +272,11 @@ pub trait ChainExec: Send + Sync + 'static {
     /// `EthChainSpec` so `run_passbook` can read `chain_id()` generically.
     type ChainSpec: EthChainSpec + Send + Sync + 'static;
 
-    /// Assemble + reconcile ONE committed block. `parent_state` is the
-    /// real historical post-state of the committed chain's parent block
-    /// (obtained generically by [`run_passbook`]); the impl wraps it for
-    /// re-execution exactly as documented on
-    /// [`process_committed_block_inner`].
+    /// Assemble + reconcile ONE committed block. `get_parent_state`
+    /// lazily resolves the real historical post-state of the committed
+    /// chain's parent block; the impl MUST call it only on the gated
+    /// (`any_watched_changed`) re-execution path, never for blocks that
+    /// touch no watched account.
     fn process_committed_block(
         &self,
         chain_id: u64,
@@ -284,7 +284,7 @@ pub trait ChainExec: Send + Sync + 'static {
         chain: &Chain<Self::Primitives>,
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
         cfg: &PassbookConfig,
-        parent_state: StateProviderBox,
+        get_parent_state: &ParentStateFn<'_>,
     ) -> Result<BlockBatch, ProcessingError>;
 }
 
