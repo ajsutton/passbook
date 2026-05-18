@@ -70,7 +70,7 @@ alloy-evm = "0.34.0"
 # Pinned to the exact versions already resolved in Cargo.lock for the reth
 # v2.2.0 graph. A mismatched alloy version causes E0119 trait-coherence
 # breakage — do not float these.
-alloy-primitives = { version = "1.6.0", features = ["asm-keccak"] } # asm-keccak is an additive feature; version unchanged
+alloy-primitives = "1.6.0"
 alloy-consensus = "2.0.4"
 alloy-eips = "2.0.4"
 
