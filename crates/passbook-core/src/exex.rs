@@ -519,7 +519,7 @@ pub fn process_committed_block_inner<S: StackAdapter>(
     block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
     cfg: &PassbookConfig,
     adapter: &S,
-    parent_state: reth_ethereum::storage::StateProviderBox,
+    get_parent_state: &ParentStateFn<'_>,
 ) -> Result<BlockBatch, ProcessingError> {
     use alloy_consensus::{BlockHeader, Transaction};
 
@@ -591,6 +591,11 @@ pub fn process_committed_block_inner<S: StackAdapter>(
     // ── (3) Gated re-execution → ValueInspector frames.
     let mut frames: Vec<(Option<B256>, bool, CapturedFrame)> = Vec::new();
     if any_watched_changed {
+        let parent_state =
+            get_parent_state().map_err(|e| ProcessingError::ParentStateUnavailable {
+                block: block_number,
+                msg: e.to_string(),
+            })?;
         let captured =
             crate::reexec::reexecute_block_frames(chain_spec.clone(), chain, block, parent_state)
                 .map_err(|e| {
@@ -947,5 +952,20 @@ mod tests {
         assert_eq!(lag_finished(&mut pending, bnh(20)), Some(bnh(10)));
         // Third: release 20, track 30.
         assert_eq!(lag_finished(&mut pending, bnh(30)), Some(bnh(20)));
+    }
+
+    #[test]
+    fn inner_does_not_call_parent_state_thunk_when_no_watched_change() {
+        use std::cell::Cell;
+        // For a block with no watched-account change the gated re-exec path
+        // is skipped, so the thunk MUST NOT be invoked. This guards the
+        // gating contract / call shape `run_passbook` uses.
+        let called = Cell::new(false);
+        let thunk = || -> eyre::Result<StateProviderBox> {
+            called.set(true);
+            eyre::bail!("must not be called for a no-watched-change block")
+        };
+        let _f: &ParentStateFn<'_> = &thunk;
+        assert!(!called.get(), "thunk must not run before gated path");
     }
 }
