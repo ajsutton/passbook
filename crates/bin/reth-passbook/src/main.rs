@@ -32,6 +32,12 @@
 //! closure. The RPC reader and the ExEx writer thus share the SAME ledger
 //! handle with no `OnceCell`/oneshot indirection.
 
+#[global_allocator]
+static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
+#[cfg(all(feature = "jemalloc", unix))]
+use reth_cli_util::allocator::tikv_jemalloc_sys as _;
+
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;

@@ -60,7 +60,7 @@ RUN CARGO_NET_GIT_FETCH_WITH_CLI=true bash scripts/seed-vendor.sh
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \
-    cargo build --release --locked -p reth-passbook -p op-reth-passbook
+    cargo build --release --locked -p reth-passbook -p op-reth-passbook --features reth-passbook/jemalloc,op-reth-passbook/jemalloc
 
 # ── final image: L1 (reth-passbook) ─────────────────────────────────────────
 FROM debian:bookworm-slim AS reth-passbook

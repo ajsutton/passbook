@@ -12,7 +12,11 @@ path = "src/main.rs"
 passbook-core = { path = "../../passbook-core" }
 passbook-stack-optimism = { path = "../../passbook-stack-optimism" }
 reth-op.workspace = true
+reth-cli-util.workspace = true
 clap.workspace = true
 eyre.workspace = true
 tokio.workspace = true
 futures.workspace = true
+
+[features]
+jemalloc = ["reth-cli-util/jemalloc"]

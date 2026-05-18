@@ -37,6 +37,12 @@
 //! `chain_id` + `Ledger::open` resolve ONCE up front and one
 //! `Arc<Mutex<Ledger>>` is shared by the RPC reader and the ExEx writer.
 
+#[global_allocator]
+static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
+#[cfg(all(feature = "jemalloc", unix))]
+use reth_cli_util::allocator::tikv_jemalloc_sys as _;
+
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
