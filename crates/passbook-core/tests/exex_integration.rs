@@ -49,7 +49,6 @@ use reth_ethereum::evm::primitives::ConfigureEvm;
 use reth_ethereum::evm::EthEvmConfig;
 use reth_ethereum::primitives::RecoveredBlock;
 use reth_ethereum::provider::{Chain, ExecutionOutcome};
-use reth_ethereum::storage::StateProviderBox;
 use reth_ethereum::TransactionSigned;
 use reth_exex_test_utils::test_exex_context_with_chain_spec;
 
@@ -404,44 +403,48 @@ async fn erc20_internal_gas_capture_zero_residual() {
     // ── Deterministic core check: run the per-block pipeline directly
     //    against the real genesis-state provider so a residual / re-exec
     //    failure surfaces as a concrete error. ──────────────────────────
-    let parent_state: StateProviderBox = handle
-        .provider_factory
-        .history_by_block_hash(genesis_hash)
-        .expect("genesis state provider");
-    let res = passbook_core::exex::process_committed_block_inner(
-        chain_id,
-        chain_spec.clone(),
-        &chain,
-        &recovered,
-        &cfg,
-        &L1Adapter,
-        parent_state,
-    );
-    let batch = res.expect("per-block processing must reconcile to zero residual");
-    assert!(
-        batch.unattributed.is_empty(),
-        "zero unattributed residual expected from the pure orchestrator"
-    );
+    let (batch_erc20_len, batch_internal_in_amounts, batch_gas_len) = {
+        let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
+            Ok(handle.provider_factory.history_by_block_hash(genesis_hash)?)
+        };
+        let batch = passbook_core::exex::process_committed_block_inner(
+            chain_id,
+            chain_spec.clone(),
+            &chain,
+            &recovered,
+            &cfg,
+            &L1Adapter,
+            &gps,
+        )
+        .expect("per-block processing must reconcile to zero residual");
+        assert!(
+            batch.unattributed.is_empty(),
+            "zero unattributed residual expected from the pure orchestrator"
+        );
+        let erc20_len = batch.erc20.iter().filter(|r| r.address == watched).count();
+        let internal_in: Vec<U256> = batch
+            .eth
+            .iter()
+            .filter(|r| {
+                r.address == watched
+                    && matches!(r.direction, passbook_core::model::Direction::In)
+                    && matches!(r.kind, passbook_core::model::EthKind::Internal)
+            })
+            .map(|r| r.amount_wei)
+            .collect();
+        let gas_len = batch.gas.iter().filter(|r| r.address == watched).count();
+        (erc20_len, internal_in, gas_len)
+    };
     assert_eq!(
-        batch.erc20.iter().filter(|r| r.address == watched).count(),
-        1,
+        batch_erc20_len, 1,
         "one ERC20 row for W"
     );
-    let internal_in: Vec<&_> = batch
-        .eth
-        .iter()
-        .filter(|r| {
-            r.address == watched
-                && matches!(r.direction, passbook_core::model::Direction::In)
-                && matches!(r.kind, passbook_core::model::EthKind::Internal)
-        })
-        .collect();
+    let mut got = batch_internal_in_amounts;
     assert_eq!(
-        internal_in.len(),
+        got.len(),
         2,
         "two internal inbound ETH rows for W (SELFDESTRUCT + plain CALL)"
     );
-    let mut got: Vec<U256> = internal_in.iter().map(|r| r.amount_wei).collect();
     got.sort();
     let mut want = [sd_value, call_value];
     want.sort();
@@ -450,8 +453,7 @@ async fn erc20_internal_gas_capture_zero_residual() {
         "internal-in amounts = SELFDESTRUCT + CALL values"
     );
     assert_eq!(
-        batch.gas.iter().filter(|r| r.address == watched).count(),
-        1,
+        batch_gas_len, 1,
         "one gas row for W (tx3)"
     );
 
@@ -466,10 +468,12 @@ async fn erc20_internal_gas_capture_zero_residual() {
         || L1Adapter,
     ));
 
+    let chain_tip_hash = recovered.hash();
     handle
         .send_notification_chain_committed(chain)
         .await
         .expect("send committed");
+    flush_lag(&handle, &chain_spec, chain_tip_hash, 1).await;
 
     wait_finished_height(&mut handle, 1).await;
     driver.abort();
@@ -623,39 +627,41 @@ async fn parent_state_readonly_two_block_chain_zero_residual() {
     // block 1 (in-chain). The chain's parent is genesis; block 2 must
     // re-exec against (genesis provider + block 1 writes). Block 1's
     // BundleState carries the deployed runtime code; block 2 reads it.
-    let parent_state: StateProviderBox = handle
-        .provider_factory
-        .history_by_block_hash(genesis_hash)
-        .expect("genesis state provider");
-    let batch2 = passbook_core::exex::process_committed_block_inner(
-        chain_id,
-        chain_spec.clone(),
-        &chain,
-        &b2,
-        &cfg,
-        &L1Adapter,
-        parent_state,
-    )
-    .expect("block 2 must reconcile against parent-state + in-chain overlay");
-    assert!(
-        batch2.unattributed.is_empty(),
-        "zero residual for block 2 (read-only parent/in-chain state)"
-    );
-    let b2_internal_in: Vec<&_> = batch2
-        .eth
-        .iter()
-        .filter(|r| {
-            r.address == watched
-                && matches!(r.direction, passbook_core::model::Direction::In)
-                && matches!(r.kind, passbook_core::model::EthKind::Internal)
-        })
-        .collect();
+    let (b2_internal_in_len, b2_internal_in_amount) = {
+        let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
+            Ok(handle.provider_factory.history_by_block_hash(genesis_hash)?)
+        };
+        let batch2 = passbook_core::exex::process_committed_block_inner(
+            chain_id,
+            chain_spec.clone(),
+            &chain,
+            &b2,
+            &cfg,
+            &L1Adapter,
+            &gps,
+        )
+        .expect("block 2 must reconcile against parent-state + in-chain overlay");
+        assert!(
+            batch2.unattributed.is_empty(),
+            "zero residual for block 2 (read-only parent/in-chain state)"
+        );
+        let b2_internal_in: Vec<_> = batch2
+            .eth
+            .iter()
+            .filter(|r| {
+                r.address == watched
+                    && matches!(r.direction, passbook_core::model::Direction::In)
+                    && matches!(r.kind, passbook_core::model::EthKind::Internal)
+            })
+            .collect();
+        (b2_internal_in.len(), b2_internal_in.first().map(|r| r.amount_wei))
+    };
     assert_eq!(
-        b2_internal_in.len(),
+        b2_internal_in_len,
         1,
         "block 2: one internal inbound ETH row for W via the block-1-deployed forwarder"
     );
-    assert_eq!(b2_internal_in[0].amount_wei, fwd_value);
+    assert_eq!(b2_internal_in_amount, Some(fwd_value));
 
     // End-to-end: the whole 2-block chain through run_passbook.
     let ledger = Arc::new(Mutex::new(
@@ -667,10 +673,12 @@ async fn parent_state_readonly_two_block_chain_zero_residual() {
         ledger.clone(),
         || L1Adapter,
     ));
+    let b2_hash = b2.hash();
     handle
         .send_notification_chain_committed(chain)
         .await
         .expect("send committed");
+    flush_lag(&handle, &chain_spec, b2_hash, 2).await;
     wait_finished_height(&mut handle, 2).await;
     driver.abort();
 
@@ -833,7 +841,7 @@ impl passbook_core::exex::ChainExec for UnexplainedInjector {
         chain: &Chain,
         block: &RecoveredBlock<reth_ethereum::Block>,
         cfg: &PassbookConfig,
-        parent_state: StateProviderBox,
+        get_parent_state: &passbook_core::exex::ParentStateFn<'_>,
     ) -> Result<passbook_core::ledger::writer::BlockBatch, passbook_core::exex::ProcessingError>
     {
         use alloy_consensus::BlockHeader;
@@ -846,7 +854,7 @@ impl passbook_core::exex::ChainExec for UnexplainedInjector {
             block,
             cfg,
             &L1Adapter,
-            parent_state,
+            get_parent_state,
         )?;
         // Now feed the pure orchestrator a synthetic balance discrepancy
         // for `victim` with NO explaining flow of ANY kind: no frame, no
@@ -938,19 +946,21 @@ async fn fault_injected_residual_stalls_without_advancing() {
         .await
         .expect("test exex ctx");
     ctx.config.chain = chain_spec.clone();
-    let parent_state: StateProviderBox = handle0
-        .provider_factory
-        .history_by_block_hash(handle0.genesis.hash())
-        .expect("genesis state provider");
-    let direct = passbook_core::exex::ChainExec::process_committed_block(
-        &injector,
-        chain_id,
-        chain_spec.clone(),
-        &chain,
-        &recovered,
-        &cfg,
-        parent_state,
-    );
+    let direct = {
+        let genesis_hash0 = handle0.genesis.hash();
+        let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
+            Ok(handle0.provider_factory.history_by_block_hash(genesis_hash0)?)
+        };
+        passbook_core::exex::ChainExec::process_committed_block(
+            &injector,
+            chain_id,
+            chain_spec.clone(),
+            &chain,
+            &recovered,
+            &cfg,
+            &gps,
+        )
+    };
     match direct {
         Err(passbook_core::exex::ProcessingError::UnexplainedResidual { address, .. }) => {
             assert_eq!(address, watched, "residual must be for W")
@@ -1103,20 +1113,22 @@ async fn l1_withdrawal_and_beneficiary_priority_fee_recognized_zero_residual() {
         .await
         .expect("test exex ctx");
     ctx.config.chain = chain_spec.clone();
-    let parent_state: StateProviderBox = handle0
-        .provider_factory
-        .history_by_block_hash(handle0.genesis.hash())
-        .expect("genesis state provider");
-    let batch = passbook_core::exex::process_committed_block_inner(
-        chain_id,
-        chain_spec.clone(),
-        &chain,
-        &recovered,
-        &cfg,
-        &L1Adapter,
-        parent_state,
-    )
-    .expect("withdrawal + beneficiary priority fee MUST now reconcile to zero");
+    let batch = {
+        let handle0_genesis_hash = handle0.genesis.hash();
+        let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
+            Ok(handle0.provider_factory.history_by_block_hash(handle0_genesis_hash)?)
+        };
+        passbook_core::exex::process_committed_block_inner(
+            chain_id,
+            chain_spec.clone(),
+            &chain,
+            &recovered,
+            &cfg,
+            &L1Adapter,
+            &gps,
+        )
+        .expect("withdrawal + beneficiary priority fee MUST now reconcile to zero")
+    };
     assert!(
         batch.unattributed.is_empty(),
         "ZERO residual expected — both credits are recognised system events"
@@ -1151,11 +1163,13 @@ async fn l1_withdrawal_and_beneficiary_priority_fee_recognized_zero_residual() {
         Ledger::open(&db_path, chain_id).expect("ledger open"),
     ));
     let (driver, mut handle) = spawn_driver(&chain_spec, &cfg, &ledger).await;
+    let recovered_hash = recovered.hash();
     handle
         .send_notification_chain_committed(chain)
         .await
         .expect("send committed");
-    wait_finished_height(&mut handle, 1).await; // would hang pre-fix
+    flush_lag(&handle, &chain_spec, recovered_hash, 1).await;
+    wait_finished_height(&mut handle, 1).await; // would hang pre-fix without lag flush
     driver.abort();
 
     let g = ledger.lock().unwrap();
@@ -1183,7 +1197,11 @@ async fn l1_withdrawal_and_beneficiary_priority_fee_recognized_zero_residual() {
     let last: String = conn
         .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(last, "1", "meta.last_block advanced — block completed");
+    // The lag flush (block 2) is also written durably; last_block reflects both blocks.
+    assert!(
+        last == "1" || last == "2",
+        "meta.last_block advanced — block completed (got {last})"
+    );
 }
 
 /// 2. A reorg replaces rows: block at hash A (watched activity → rows,
@@ -1265,6 +1283,7 @@ async fn reorg_replaces_rows_no_dup() {
         .send_notification_chain_committed(chain_a.clone())
         .await
         .expect("send committed A");
+    flush_lag(&handle, &chain_spec, hash_a, 1).await;
     wait_finished_height(&mut handle, 1).await;
 
     let w_lc = format!("{watched:#x}");
@@ -1445,6 +1464,7 @@ async fn restart_resumes_no_gap_no_dup() {
             .send_notification_chain_committed(chain.clone())
             .await
             .expect("send committed run1");
+        flush_lag(&handle, &chain_spec, recovered.hash(), 1).await;
         wait_finished_height(&mut handle, 1).await;
         driver.abort();
         let _ = driver.await;
@@ -1471,7 +1491,8 @@ async fn restart_resumes_no_gap_no_dup() {
         snap
     };
     assert!(n_eth >= 1, "run 1 must have written at least one eth row");
-    assert_eq!(last_block_1, "1", "run 1 advanced last_block to 1");
+    // The lag flush (block 2) is also written; last_block reflects both.
+    assert_eq!(last_block_1, "2", "run 1 advanced last_block through the lag-flush block");
 
     // ── Run 2: reopen the SAME db file, re-deliver the LAST committed
     //    notification to a FRESH run_passbook. Must be idempotent.
@@ -1493,6 +1514,7 @@ async fn restart_resumes_no_gap_no_dup() {
             .send_notification_chain_committed(chain.clone())
             .await
             .expect("re-deliver committed run2");
+        flush_lag(&handle, &chain_spec, recovered.hash(), 1).await;
         wait_finished_height(&mut handle, 1).await;
         driver.abort();
         let _ = driver.await;
@@ -1527,8 +1549,10 @@ async fn restart_resumes_no_gap_no_dup() {
             .conn()
             .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
             .unwrap();
+        // The lag flush (block 2) is written idempotently in both runs;
+        // last_block reflects blocks 1 and 2 — unchanged between runs.
         assert_eq!(
-            last, "1",
+            last, last_block_1,
             "last_block unchanged (no gap, no regression) after restart"
         );
     }
@@ -1601,6 +1625,7 @@ async fn restart_with_different_chain_id_aborts() {
             .send_notification_chain_committed(chain.clone())
             .await
             .expect("send committed run1");
+        flush_lag(&handle, &chain_spec, recovered.hash(), 1).await;
         wait_finished_height(&mut handle, 1).await;
         driver.abort();
         let _ = driver.await;
@@ -1656,20 +1681,29 @@ fn token_code(from: Address, to: Address, amount: U256) -> Bytes {
     Bytes::from(c)
 }
 
+/// Wait until `run_passbook` emits `FinishedHeight(h)` with `h.number >= n`.
+///
+/// The one-notification lag (Task 7) means `FinishedHeight(N)` is not
+/// emitted immediately after the notification with tip = N; it is emitted
+/// when the NEXT notification arrives. Tests call `flush_lag` before this
+/// helper to trigger the lag release, which may produce a `FinishedHeight`
+/// at height N or N+1 (the flush block). Accepting `h.number >= n` lets
+/// us use either the exact tip or the flush block's height as the signal
+/// that tip N is durably committed (the write always precedes the lag emit).
 async fn wait_finished_height(handle: &mut reth_exex_test_utils::TestExExHandle, n: u64) {
     let deadline = std::time::Instant::now() + Duration::from_secs(12);
     loop {
         if let Ok(ev) = handle.events_rx.try_recv() {
             if matches!(
                 ev,
-                reth_ethereum::exex::ExExEvent::FinishedHeight(h) if h.number == n
+                reth_ethereum::exex::ExExEvent::FinishedHeight(h) if h.number >= n
             ) {
                 return;
             }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for run_passbook to emit FinishedHeight({n})"
+            "timed out waiting for run_passbook to emit FinishedHeight(>={n})"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1713,6 +1747,40 @@ fn genesis_state(
         .with_database(cache)
         .with_bundle_update()
         .build()
+}
+
+/// Send a minimal empty committed block to flush the one-notification
+/// `FinishedHeight` lag introduced in Task 7. `run_passbook` holds back
+/// `FinishedHeight(N)` until the NEXT notification arrives; this helper
+/// supplies that next notification (an empty block at height `tip + 1` with
+/// no watched activity) so tests can `wait_finished_height(&mut handle, n)`
+/// immediately after sending the real notification + this flush.
+///
+/// The empty block is genuinely executed against the genesis state (no txs,
+/// no watched-account changes, no re-execution), so the pipeline processes
+/// it in the fast path and emits `FinishedHeight(tip)` as expected.
+async fn flush_lag(
+    handle: &reth_exex_test_utils::TestExExHandle,
+    chain_spec: &Arc<ChainSpec>,
+    tip_hash: B256,
+    tip_number: u64,
+) {
+    let flush_block = build_block(chain_spec, tip_number + 1, tip_hash, tip_number * 12 + 1000, vec![]);
+    let evm_config = reth_ethereum::evm::EthEvmConfig::new(chain_spec.clone());
+    let exec_out = evm_config
+        .executor(genesis_state(chain_spec))
+        .execute(&flush_block)
+        .expect("empty flush block execution");
+    let outcome = reth_ethereum::provider::ExecutionOutcome::single(tip_number + 1, exec_out);
+    let flush_chain = reth_ethereum::provider::Chain::new(
+        vec![flush_block],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+    handle
+        .send_notification_chain_committed(flush_chain)
+        .await
+        .expect("send flush notification");
 }
 
 /// Issue #2 (C1) regression: reverted value movements MUST NOT be summed
@@ -1822,44 +1890,44 @@ async fn reverted_value_transfers_zero_residual() {
         .expect("test exex ctx");
     ctx.config.chain = chain_spec.clone();
     let genesis_hash = handle.genesis.hash();
-    let parent_state: StateProviderBox = handle
-        .provider_factory
-        .history_by_block_hash(genesis_hash)
-        .expect("genesis state provider");
-
-    let res = passbook_core::exex::process_committed_block_inner(
-        chain_id,
-        chain_spec.clone(),
-        &chain,
-        &recovered,
-        &cfg,
-        &L1Adapter,
-        parent_state,
-    );
-    let batch = res.expect(
-        "reverted value transfers must reconcile to ZERO residual (issue #2): \
-         a reverted top-level tx and a reverted internal CALL must not stall a valid block",
-    );
-    assert!(
-        batch.unattributed.is_empty(),
-        "no unattributed residual expected — reverted frames excluded"
-    );
-
-    // No inbound/outbound eth_transfers rows should be COUNTED for W, and
-    // crucially no spurious counted movement at all: any emitted row for W
-    // must carry reverted == true (audit trail) and contribute nothing.
-    let w_eth: Vec<&_> = batch.eth.iter().filter(|r| r.address == watched).collect();
-    for r in &w_eth {
-        assert!(
-            r.reverted,
-            "any eth_transfers row for W here is from a reverted movement"
+    {
+        let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
+            Ok(handle.provider_factory.history_by_block_hash(genesis_hash)?)
+        };
+        let batch = passbook_core::exex::process_committed_block_inner(
+            chain_id,
+            chain_spec.clone(),
+            &chain,
+            &recovered,
+            &cfg,
+            &L1Adapter,
+            &gps,
+        )
+        .expect(
+            "reverted value transfers must reconcile to ZERO residual (issue #2): \
+             a reverted top-level tx and a reverted internal CALL must not stall a valid block",
         );
-    }
+        assert!(
+            batch.unattributed.is_empty(),
+            "no unattributed residual expected — reverted frames excluded"
+        );
 
-    // The only genuine watched movement is gas: W is the sender of tx0
-    // (gas is charged even on a reverted tx).
-    let w_gas: Vec<&_> = batch.gas.iter().filter(|r| r.address == watched).collect();
-    assert_eq!(w_gas.len(), 1, "exactly one gas row for W (tx0 sender)");
+        // No inbound/outbound eth_transfers rows should be COUNTED for W, and
+        // crucially no spurious counted movement at all: any emitted row for W
+        // must carry reverted == true (audit trail) and contribute nothing.
+        let w_eth: Vec<&_> = batch.eth.iter().filter(|r| r.address == watched).collect();
+        for r in &w_eth {
+            assert!(
+                r.reverted,
+                "any eth_transfers row for W here is from a reverted movement"
+            );
+        }
+
+        // The only genuine watched movement is gas: W is the sender of tx0
+        // (gas is charged even on a reverted tx).
+        let w_gas: Vec<&_> = batch.gas.iter().filter(|r| r.address == watched).collect();
+        assert_eq!(w_gas.len(), 1, "exactly one gas row for W (tx0 sender)");
+    }
 
     // End-to-end through run_passbook: the driver must advance (emit
     // FinishedHeight) — i.e. NOT stall on this valid block.
@@ -1872,10 +1940,12 @@ async fn reverted_value_transfers_zero_residual() {
         ledger.clone(),
         || L1Adapter,
     ));
+    let recovered_hash = recovered.hash();
     handle
         .send_notification_chain_committed(chain)
         .await
         .expect("send committed");
+    flush_lag(&handle, &chain_spec, recovered_hash, 1).await;
     wait_finished_height(&mut handle, 1).await;
     driver.abort();
 
@@ -2129,10 +2199,14 @@ async fn poisoned_ledger_mutex_does_not_crash_writer() {
         ledger.clone(),
         || L1Adapter,
     ));
+    let recovered_hash = recovered.hash();
     handle
         .send_notification_chain_committed(chain)
         .await
         .expect("send committed");
+    // Flush the one-notification lag so FinishedHeight(1) is emitted within
+    // the sleep window below (the lag holds it until the next notification).
+    flush_lag(&handle, &chain_spec, recovered_hash, 1).await;
 
     // Give the (poison-recovered) writer time to durably write + advance.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -2166,9 +2240,9 @@ async fn poisoned_ledger_mutex_does_not_crash_writer() {
             .conn()
             .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
             .ok();
-        assert_eq!(
-            last.as_deref(),
-            Some("1"),
+        // The lag flush (block 2) may also be written; last_block is ≥ 1.
+        assert!(
+            matches!(last.as_deref(), Some("1") | Some("2")),
             "meta.last_block must advance to the durably-written block (got {last:?})"
         );
     }
@@ -2280,43 +2354,44 @@ async fn watched_to_watched_erc20_and_eth_no_row_loss_zero_residual() {
     let genesis_hash = handle.genesis.hash();
 
     // Deterministic core check against the real genesis-state provider.
-    let parent_state: StateProviderBox = handle
-        .provider_factory
-        .history_by_block_hash(genesis_hash)
-        .expect("genesis state provider");
-    let batch = passbook_core::exex::process_committed_block_inner(
-        chain_id,
-        chain_spec.clone(),
-        &chain,
-        &recovered,
-        &cfg,
-        &L1Adapter,
-        parent_state,
-    )
-    .expect("per-block processing must reconcile to zero residual");
-    assert!(
-        batch.unattributed.is_empty(),
-        "zero unattributed residual expected"
-    );
-    // BOTH directional ERC20 rows for the single watched→watched log.
-    let erc20_in: Vec<&_> = batch
-        .erc20
-        .iter()
-        .filter(|r| r.address == w2 && matches!(r.direction, passbook_core::model::Direction::In))
-        .collect();
-    let erc20_out: Vec<&_> = batch
-        .erc20
-        .iter()
-        .filter(|r| r.address == w1 && matches!(r.direction, passbook_core::model::Direction::Out))
-        .collect();
-    assert_eq!(erc20_in.len(), 1, "one inbound ERC20 row for W2");
-    assert_eq!(erc20_out.len(), 1, "one outbound ERC20 row for W1");
-    assert_eq!(erc20_in[0].amount, erc20_amount);
-    assert_eq!(erc20_out[0].amount, erc20_amount);
-    // The two rows share the collision PK columns but differ in address.
-    assert_eq!(erc20_in[0].tx_hash, erc20_out[0].tx_hash);
-    assert_eq!(erc20_in[0].log_index, erc20_out[0].log_index);
-    assert_ne!(erc20_in[0].address, erc20_out[0].address);
+    {
+        let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
+            Ok(handle.provider_factory.history_by_block_hash(genesis_hash)?)
+        };
+        let batch = passbook_core::exex::process_committed_block_inner(
+            chain_id,
+            chain_spec.clone(),
+            &chain,
+            &recovered,
+            &cfg,
+            &L1Adapter,
+            &gps,
+        )
+        .expect("per-block processing must reconcile to zero residual");
+        assert!(
+            batch.unattributed.is_empty(),
+            "zero unattributed residual expected"
+        );
+        // BOTH directional ERC20 rows for the single watched→watched log.
+        let erc20_in: Vec<&_> = batch
+            .erc20
+            .iter()
+            .filter(|r| r.address == w2 && matches!(r.direction, passbook_core::model::Direction::In))
+            .collect();
+        let erc20_out: Vec<&_> = batch
+            .erc20
+            .iter()
+            .filter(|r| r.address == w1 && matches!(r.direction, passbook_core::model::Direction::Out))
+            .collect();
+        assert_eq!(erc20_in.len(), 1, "one inbound ERC20 row for W2");
+        assert_eq!(erc20_out.len(), 1, "one outbound ERC20 row for W1");
+        assert_eq!(erc20_in[0].amount, erc20_amount);
+        assert_eq!(erc20_out[0].amount, erc20_amount);
+        // The two rows share the collision PK columns but differ in address.
+        assert_eq!(erc20_in[0].tx_hash, erc20_out[0].tx_hash);
+        assert_eq!(erc20_in[0].log_index, erc20_out[0].log_index);
+        assert_ne!(erc20_in[0].address, erc20_out[0].address);
+    }
 
     // ── End-to-end through run_passbook + the durable ledger ───────────
     let ledger = Arc::new(Mutex::new(
@@ -2328,10 +2403,12 @@ async fn watched_to_watched_erc20_and_eth_no_row_loss_zero_residual() {
         ledger.clone(),
         || L1Adapter,
     ));
+    let recovered_hash = recovered.hash();
     handle
         .send_notification_chain_committed(chain)
         .await
         .expect("send committed");
+    flush_lag(&handle, &chain_spec, recovered_hash, 1).await;
     wait_finished_height(&mut handle, 1).await;
     driver.abort();
 

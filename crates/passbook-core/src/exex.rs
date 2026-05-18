@@ -315,6 +315,8 @@ where
 {
     let chain_id = ctx.config.chain.chain_id();
 
+    let mut pending_finished: Option<alloy_eips::BlockNumHash> = None;
+
     while let Some(notification) = ctx.notifications.try_next().await? {
         // Reorg handling FIRST: drop every row for the reverted blocks.
         // A DB failure here MUST NOT propagate out of the loop: doing so
@@ -363,26 +365,13 @@ where
             for block in chain.blocks_iter() {
                 let mut backoff = BACKOFF_START;
                 loop {
-                    // Real historical post-state of the committed chain's
-                    // parent block = pre-state of the chain's first block.
-                    // Obtained generically (Node::Provider: FullProvider:
-                    // StateProviderFactory for ANY primitive set), then
-                    // handed to the chain-specific seam.
                     let parent_hash = {
                         use alloy_consensus::BlockHeader;
                         chain.first().header().parent_hash()
                     };
-                    let parent_state = match ctx.provider().history_by_block_hash(parent_hash) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e, %parent_hash,
-                                "no historical state at chain parent, retrying"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(BACKOFF_CAP);
-                            continue;
-                        }
+                    let provider = ctx.provider();
+                    let get_parent_state = || -> eyre::Result<StateProviderBox> {
+                        Ok(provider.history_by_block_hash(parent_hash)?)
                     };
                     match chain_exec.process_committed_block(
                         chain_id,
@@ -390,7 +379,7 @@ where
                         chain.as_ref(),
                         block,
                         &cfg,
-                        parent_state,
+                        &get_parent_state,
                     ) {
                         Ok(batch) => {
                             // The durable write is the point of the whole
@@ -462,6 +451,16 @@ where
                             backoff = (backoff * 2).min(BACKOFF_CAP);
                             continue;
                         }
+                        Err(ProcessingError::ParentStateUnavailable { block: bn, msg }) => {
+                            tracing::error!(
+                                block = bn,
+                                error = %msg,
+                                "no historical state at chain parent, retrying"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(BACKOFF_CAP);
+                            continue;
+                        }
                         Err(other) => {
                             tracing::error!(
                                 error = %other,
@@ -480,8 +479,9 @@ where
             // channel means the receiver — the node itself — is gone, so
             // there is nothing left to stall for. Returning ends this
             // future cleanly as the node shuts down.
-            ctx.events
-                .send(ExExEvent::FinishedHeight(chain.tip().num_hash()))?;
+            if let Some(prev) = lag_finished(&mut pending_finished, chain.tip().num_hash()) {
+                ctx.events.send(ExExEvent::FinishedHeight(prev))?;
+            }
         }
     }
     Ok(())

@@ -49,8 +49,10 @@ use passbook_core::system::SystemCredit;
 use reth_op::chainspec::OpChainSpec;
 use reth_op::primitives::RecoveredBlock;
 use reth_op::provider::Chain;
-use passbook_core::exex::ParentStateFn;
+use reth_op::storage::StateProviderBox;
 use reth_op::{OpBlock, OpPrimitives};
+
+use passbook_core::exex::ParentStateFn;
 
 use reth_optimism_evm::{extract_l1_info, OpEvmConfig, RethL1BlockInfo};
 
