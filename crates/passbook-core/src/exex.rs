@@ -225,6 +225,22 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
     })
 }
 
+/// One-notification `FinishedHeight` lag. The pruner is clamped to the
+/// minimum ExEx `FinishedHeight` (reth `pruner.rs`
+/// `adjust_tip_block_number_to_finished_exex_height`). A gated
+/// re-execution for a watched-account change in notification *K* needs
+/// the historical post-state of notification *K-1*'s tip (the parent of
+/// *K*'s first block). Releasing *K-1*'s tip only after *K* is fully
+/// durable guarantees that parent state is never pruned out from under
+/// an in-flight re-exec. Returns the height to emit now (the previously
+/// pending one), and stores `current` as the new pending height.
+pub(crate) fn lag_finished(
+    pending: &mut Option<alloy_eips::BlockNumHash>,
+    current: alloy_eips::BlockNumHash,
+) -> Option<alloy_eips::BlockNumHash> {
+    pending.replace(current)
+}
+
 /// The CHAIN-SPECIFIC seam.
 ///
 /// Everything that differs L1 vs OP — the node primitives / chain-spec
@@ -918,5 +934,18 @@ mod tests {
         };
         assert!(matches!(e, ProcessingError::ParentStateUnavailable { block: 42, .. }));
         assert!(format!("{e}").contains("historical parent state unavailable at block 42"));
+    }
+
+    #[test]
+    fn lag_finished_releases_previous_then_tracks_current() {
+        let bnh = |n: u64| alloy_eips::BlockNumHash { number: n, hash: B256::repeat_byte(n as u8) };
+
+        let mut pending: Option<alloy_eips::BlockNumHash> = None;
+        // First notification: nothing to release yet.
+        assert_eq!(lag_finished(&mut pending, bnh(10)), None);
+        // Second: release the first (10), now tracking 20.
+        assert_eq!(lag_finished(&mut pending, bnh(20)), Some(bnh(10)));
+        // Third: release 20, track 30.
+        assert_eq!(lag_finished(&mut pending, bnh(30)), Some(bnh(20)));
     }
 }
