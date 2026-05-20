@@ -2662,6 +2662,19 @@ async fn parent_state_unavailable_writes_partial_batch_and_marker() {
     );
 }
 
+// TODO(issue #14 follow-up): happy-path integration test. The marker
+// write itself is unit-tested (see `write_gap_block_marker` tests in
+// `ledger::writer::tests`); the gap_range boundary logic is unit-tested
+// (see `exex::tests::gap_range_*`). What is NOT covered end-to-end is
+// the case where `ctx.provider().block_hash(n)` resolves for every gap
+// block: a notification advances high_water, the gap-fill loop writes
+// markers for each missing block, high_water advances per marker, and
+// the per-block processing loop then runs for the live notification.
+// Adding this test requires manually inserting block headers via
+// `provider_factory.provider_rw().insert_block(...)` because the
+// `reth_exex_test_utils` harness only inserts genesis. Out of scope
+// for the initial fix; safety contract is proven by the stall test
+// below + unit-test coverage on the building-block functions.
 /// Issue #14 (C4): when `run_passbook` detects a notification gap
 /// (committed.first() > high_water + 1) and the provider cannot serve
 /// the gap-block headers, the driver MUST NOT silently advance past
