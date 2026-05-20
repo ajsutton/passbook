@@ -2661,3 +2661,162 @@ async fn parent_state_unavailable_writes_partial_batch_and_marker() {
         "marker records non-zero residual = observed BundleState delta"
     );
 }
+
+/// Issue #14 (C4): when `run_passbook` detects a notification gap
+/// (committed.first() > high_water + 1) and the provider cannot serve
+/// the gap-block headers, the driver MUST NOT silently advance past
+/// the gap. It retries the header fetch forever with bounded backoff;
+/// the ledger high-water stays put, no FinishedHeight is emitted, and
+/// no block_not_delivered markers nor block-5 rows are written.
+///
+/// This is the safety contract the fix exists to enforce: never silently
+/// advance across an unprocessed block range. The marker-write happy
+/// path is comprehensively covered by the Task 2 (writer.rs) and Task 3
+/// (gap_range) unit tests.
+///
+/// Test setup (harness-aware):
+///   * The `reth_exex_test_utils` harness only inserts the genesis block
+///     into `provider_factory`. `ctx.provider().block_hash(n)` for any
+///     n > 0 returns `Ok(None)` — there are no headers to fetch.
+///   * We pre-populate the ledger's `meta.last_block = 1` directly via
+///     SQL, simulating a prior crash after writing block 1.
+///   * We send a committed notification for synthetic block 5; the
+///     driver computes gap_range = 2..=4, attempts `block_hash(2)`,
+///     receives `Ok(None)`, and enters the retry-forever loop.
+///   * We wait ~500ms and assert the ledger and event channel are
+///     undisturbed.
+#[tokio::test(flavor = "multi_thread")]
+async fn gap_on_restart_stalls_when_provider_cannot_serve_gap_headers() {
+    // ── Actors and chain spec ──────────────────────────────────────────
+    let watched = Address::repeat_byte(0xCC);
+    let chain_id = 0x1234u64;
+    let funded = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc = std::collections::BTreeMap::new();
+    alloc.insert(watched, acct(funded, None));
+    let chain_spec: Arc<ChainSpec> =
+        Arc::new(ChainSpec::from_genesis(make_genesis(chain_id, alloc)));
+
+    // ── Ledger pre-populated with high-water = block 1 ────────────────
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("passbook.db");
+    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
+        .expect("cfg");
+    let ledger = Arc::new(Mutex::new(
+        Ledger::open(&db_path, chain_id).expect("ledger open"),
+    ));
+    let prior_hash = B256::repeat_byte(0xAA); // any non-genesis hash
+    {
+        let g = ledger.lock().unwrap();
+        let conn = g.conn();
+        conn.execute(
+            "INSERT INTO meta(k,v) VALUES('last_block','1')
+              ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta(k,v) VALUES('last_block_hash',?1)
+              ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            [format!("{prior_hash:#x}")],
+        )
+        .unwrap();
+    }
+
+    // ── Harness ────────────────────────────────────────────────────────
+    let (mut ctx, mut handle) = test_exex_context_with_chain_spec(chain_spec.clone())
+        .await
+        .expect("test exex ctx");
+    ctx.config.chain = chain_spec.clone();
+    let genesis_hash = handle.genesis.hash();
+
+    // ── Build a single synthetic block at height 5 (with parent set to
+    //   the genesis hash; the contents are immaterial — the gap-fill
+    //   stalls before this block is processed). ─────────────────────────
+    let block_5 = build_block(&chain_spec, 5, genesis_hash, 60, vec![]);
+    let evm_config = reth_ethereum::evm::EthEvmConfig::new(chain_spec.clone());
+    let exec_out = evm_config
+        .executor(genesis_state(&chain_spec))
+        .execute(&block_5)
+        .expect("empty block-5 execution");
+    let outcome = reth_ethereum::provider::ExecutionOutcome::single(5, exec_out);
+    let chain_5 = reth_ethereum::provider::Chain::new(
+        vec![block_5],
+        outcome,
+        std::collections::BTreeMap::new(),
+    );
+
+    // ── Spawn run_passbook ─────────────────────────────────────────────
+    let driver = tokio::spawn(passbook_core::exex::run_passbook(
+        ctx,
+        cfg,
+        ledger.clone(),
+        || L1Adapter,
+    ));
+
+    // ── Send the gap-creating notification ─────────────────────────────
+    handle
+        .send_notification_chain_committed(chain_5)
+        .await
+        .expect("send committed");
+
+    // ── Give the driver time to enter the gap-fill loop and attempt
+    //   the first block_hash(2) call. Multiple BACKOFF_START (200ms)
+    //   intervals should be plenty for several retry attempts. ─────────
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // ── Assert: meta.last_block is STILL 1 (no advance). ───────────────
+    let g = ledger.lock().unwrap();
+    let conn = g.conn();
+    let lb: String = conn
+        .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        lb, "1",
+        "ledger high-water must NOT have advanced (gap-fill stalled on missing header)"
+    );
+
+    // ── Assert: zero block_not_delivered markers (header fetch never
+    //   succeeded, so write_gap_block_marker was never called). ─────────
+    let n_markers: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM unattributed_deltas WHERE cause = 'block_not_delivered'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n_markers, 0, "no markers should be written (header fetch failed)");
+
+    // ── Assert: zero rows for block 5 (the per-block loop never ran). ─
+    let n_block_5: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM eth_transfers WHERE block_number = 5)
+                  + (SELECT count(*) FROM erc20_transfers WHERE block_number = 5)
+                  + (SELECT count(*) FROM gas_payments WHERE block_number = 5)
+                  + (SELECT count(*) FROM unattributed_deltas WHERE block_number = 5)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n_block_5, 0, "block 5 must not have been processed (gap-fill blocked the per-block loop)");
+
+    drop(g); // release ledger lock before the channel check
+
+    // ── Assert: no FinishedHeight emitted for any height >= 5 (gap-fill
+    //   stalled before reaching the lag_finished call at the end of the
+    //   committed_chain branch). The channel might contain prior emits
+    //   (none in this test, but be lenient on the lower bound). ─────────
+    let mut saw_advance = false;
+    while let Ok(ev) = handle.events_rx.try_recv() {
+        let reth_ethereum::exex::ExExEvent::FinishedHeight(h) = ev;
+        if h.number >= 5 {
+            saw_advance = true;
+            break;
+        }
+    }
+    assert!(
+        !saw_advance,
+        "FinishedHeight for block 5 or higher must NOT be emitted while gap-fill is stalled"
+    );
+
+    driver.abort();
+}
