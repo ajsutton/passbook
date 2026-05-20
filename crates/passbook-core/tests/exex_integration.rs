@@ -2683,7 +2683,7 @@ async fn parent_state_unavailable_writes_partial_batch_and_marker() {
 ///   * We send a committed notification for synthetic block 5; the
 ///     driver computes gap_range = 2..=4, attempts `block_hash(2)`,
 ///     receives `Ok(None)`, and enters the retry-forever loop.
-///   * We wait ~500ms and assert the ledger and event channel are
+///   * We wait ~3s and assert the ledger and event channel are
 ///     undisturbed.
 #[tokio::test(flavor = "multi_thread")]
 async fn gap_on_restart_stalls_when_provider_cannot_serve_gap_headers() {
@@ -2760,9 +2760,19 @@ async fn gap_on_restart_stalls_when_provider_cannot_serve_gap_headers() {
         .expect("send committed");
 
     // ── Give the driver time to enter the gap-fill loop and attempt
-    //   the first block_hash(2) call. Multiple BACKOFF_START (200ms)
-    //   intervals should be plenty for several retry attempts. ─────────
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    //   the first block_hash(2) call. The 3s window gives the driver task
+    //   ample time to be scheduled, attempt block_hash(2), get Ok(None),
+    //   and re-enter the retry-with-backoff loop several times even on a
+    //   loaded CI runner. ──────────────────────────────────────────────
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // ── Driver MUST still be alive (stalled in the gap-fill retry
+    //   loop). If it has exited, all four assertions below pass
+    //   vacuously and the test gives a false green. ────────────────────
+    assert!(
+        !driver.is_finished(),
+        "run_passbook must be alive and retrying (gap-fill stall), not exited"
+    );
 
     // ── Assert: meta.last_block is STILL 1 (no advance). ───────────────
     let g = ledger.lock().unwrap();
