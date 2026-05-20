@@ -225,6 +225,103 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
     })
 }
 
+/// Skip-mode counterpart to [`process_block`]: when the gated
+/// re-execution could not obtain parent state, build a partial
+/// [`BlockBatch`] that preserves everything the notification gives
+/// us *without* needing the inspector frames — erc20 transfers (from
+/// receipts), gas payments, recognised system credits (`kind=System`
+/// `eth_transfers` rows) — and emits one [`UnattributedDeltaRow`]
+/// marker per watched account whose `BundleState` delta is non-zero.
+/// Reconciliation residual checks are skipped (the residual is by
+/// design here: we couldn't observe the call frames that would
+/// attribute the delta).
+///
+/// The caller MUST pass `inputs.frames` empty (the skip path doesn't
+/// have frames). The natural-PK markers reorg-clean automatically via
+/// the existing `delete_blocks(by block_hash)` path.
+pub fn build_partial_batch_skip_frames(i: BlockInputs) -> BlockBatch {
+    debug_assert!(i.frames.is_empty(), "skip path must be invoked with frames=vec![]");
+
+    // (a) ERC20: identical logic to process_block's section (a).
+    let mut erc20 = Vec::new();
+    for (tx, log_index, log) in &i.erc20_logs {
+        if let Some(d) = decode_transfer(log, &i.watched) {
+            for (addr, dir) in d.matched {
+                erc20.push(Erc20TransferRow {
+                    chain_id: i.chain_id,
+                    block_number: i.block_number,
+                    block_hash: i.block_hash,
+                    tx_hash: tx.expect("erc20 log always in a tx"),
+                    log_index: *log_index,
+                    token: d.token,
+                    from: d.from,
+                    to: d.to,
+                    amount: d.amount,
+                    address: addr,
+                    direction: dir,
+                });
+            }
+        }
+    }
+
+    // (b) System credits → kind=System eth_transfers rows. Mirrors
+    //     process_block's (b2) row-emission (without the per-address
+    //     signed sum — there's no reconciliation here).
+    let mut eth = Vec::new();
+    for sc in &i.system_signed {
+        if !i.watched.contains(&sc.address) {
+            continue;
+        }
+        let (direction, amount) = if sc.signed_wei >= 0 {
+            (Direction::In, sc.signed_wei.unsigned_abs())
+        } else {
+            (Direction::Out, sc.signed_wei.unsigned_abs())
+        };
+        eth.push(EthTransferRow {
+            chain_id: i.chain_id,
+            block_number: i.block_number,
+            block_hash: i.block_hash,
+            tx_hash: Some(i.block_hash),
+            trace_path: format!("system:{}:{:#x}", sc.source, sc.address),
+            address: sc.address,
+            direction,
+            counterparty: sc.counterparty,
+            amount_wei: U256::from(amount),
+            kind: EthKind::System,
+            reverted: false,
+        });
+    }
+
+    // (c) Unattributed markers — one per watched-changed address with a
+    //     non-zero observed delta. Records the gap so it's auditable
+    //     post-sync via the unattributed_deltas table.
+    let mut unattributed = Vec::new();
+    for (addr, observed) in &i.account_deltas {
+        if !i.watched.contains(addr) || *observed == 0 {
+            continue;
+        }
+        unattributed.push(UnattributedDeltaRow {
+            chain_id: i.chain_id,
+            block_number: i.block_number,
+            block_hash: i.block_hash,
+            address: *addr,
+            observed_wei: U256::from(observed.unsigned_abs()),
+            attributed_wei: U256::ZERO,
+            residual_wei: U256::from(observed.unsigned_abs()),
+        });
+    }
+
+    BlockBatch {
+        chain_id: i.chain_id,
+        block_number: i.block_number,
+        block_hash: i.block_hash,
+        eth,
+        erc20,
+        gas: i.gas,
+        unattributed,
+    }
+}
+
 /// One-notification `FinishedHeight` lag. The pruner is clamped to the
 /// minimum ExEx `FinishedHeight` (reth `pruner.rs`
 /// `adjust_tip_block_number_to_finished_exex_height`). A gated
@@ -964,6 +1061,80 @@ mod tests {
         };
         assert!(matches!(e, ProcessingError::ParentStateUnavailable { block: 42, .. }));
         assert!(format!("{e}").contains("historical parent state unavailable at block 42"));
+    }
+
+    /// Skip-mode partial batch: build_partial_batch_skip_frames must
+    /// produce a batch with the erc20/gas/system rows still captured, NO
+    /// frame-derived eth_transfers rows, and one unattributed_deltas
+    /// marker per watched address with a non-zero delta. No reconciliation,
+    /// no error path.
+    #[test]
+    fn build_partial_batch_skip_frames_emits_markers_and_keeps_non_frame_rows() {
+        use crate::erc20::{RawLog, TRANSFER_TOPIC0};
+        use crate::system::SystemCredit;
+        let w = Address::repeat_byte(0xcc);
+        let from = Address::repeat_byte(0xff);
+        let token = Address::repeat_byte(0x99);
+        let topic_addr = |a: Address| {
+            let mut b = [0u8; 32];
+            b[12..].copy_from_slice(a.as_slice());
+            B256::from(b)
+        };
+        let log = RawLog {
+            address: token,
+            topics: vec![TRANSFER_TOPIC0, topic_addr(from), topic_addr(w)],
+            data: U256::from(500u64).to_be_bytes::<32>().to_vec().into(),
+        };
+        let gas_row = GasPaymentRow {
+            chain_id: 1,
+            block_number: 7,
+            block_hash: B256::repeat_byte(0xaa),
+            tx_hash: B256::repeat_byte(0x44),
+            address: w,
+            gas_used: 21_000,
+            effective_gas_price: 1,
+            l2_fee_wei: U256::from(21_000u64),
+            l1_fee_wei: None,
+            total_wei: U256::from(21_000u64),
+        };
+        let inp = BlockInputs {
+            chain_id: 1,
+            block_number: 7,
+            block_hash: B256::repeat_byte(0xaa),
+            watched: [w].into_iter().collect(),
+            erc20_logs: vec![(Some(B256::repeat_byte(0x44)), 0, log)],
+            // skip path: frames MUST be empty; helper builds the partial batch
+            frames: vec![],
+            gas: vec![gas_row.clone()],
+            // watched address observed +500 in BundleState (the inflow we
+            // can't trace without frames).
+            account_deltas: vec![(w, 500i128)],
+            // a recognised system credit to the watched address — should
+            // still emit a kind=system eth_transfers row.
+            system_signed: vec![SystemCredit::new(w, 1, from, "test".to_string())],
+        };
+
+        let batch = build_partial_batch_skip_frames(inp);
+
+        // erc20 row preserved (token transfer FROM -> watched)
+        assert_eq!(batch.erc20.len(), 1, "erc20 row preserved on skip path");
+        assert_eq!(batch.erc20[0].address, w);
+        assert!(matches!(batch.erc20[0].direction, Direction::In));
+        // gas row preserved
+        assert_eq!(batch.gas.len(), 1, "gas row preserved on skip path");
+        assert_eq!(batch.gas[0].tx_hash, gas_row.tx_hash);
+        assert_eq!(batch.gas[0].address, gas_row.address);
+        assert_eq!(batch.gas[0].total_wei, gas_row.total_wei);
+        // system-credit eth_transfers row preserved (kind=System)
+        assert_eq!(batch.eth.len(), 1, "system-credit eth_transfers row preserved");
+        assert!(matches!(batch.eth[0].kind, EthKind::System));
+        assert_eq!(batch.eth[0].address, w);
+        // unattributed marker emitted for the watched non-zero delta
+        assert_eq!(batch.unattributed.len(), 1, "one marker per watched-changed address");
+        assert_eq!(batch.unattributed[0].address, w);
+        assert_eq!(batch.unattributed[0].observed_wei, U256::from(500u64));
+        assert_eq!(batch.unattributed[0].attributed_wei, U256::ZERO);
+        assert_eq!(batch.unattributed[0].residual_wei, U256::from(500u64));
     }
 
     #[test]
