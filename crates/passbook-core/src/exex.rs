@@ -710,37 +710,55 @@ pub fn process_committed_block_inner<S: StackAdapter>(
         account_deltas.push((addr, delta));
     }
 
-    // ── (3) Gated re-execution → ValueInspector frames.
+    // ── (3) Gated re-execution → ValueInspector frames. On
+    //     get_parent_state() Err (e.g. staged-pipeline backfill where
+    //     the provider's best_block is still pinned at the bootstrap
+    //     checkpoint), skip frame capture and fall through to the
+    //     partial-batch path below. Live operation never hits Err
+    //     because Finish advances per-block; the skip is structural
+    //     defence so the exex never wedges on parent-state errors.
     let mut frames: Vec<(Option<B256>, bool, CapturedFrame)> = Vec::new();
+    let mut skip_frames = false;
     if any_watched_changed {
-        let parent_state =
-            get_parent_state().map_err(|e| ProcessingError::ParentStateUnavailable {
-                block: block_number,
-                msg: e.to_string(),
-            })?;
-        let captured =
-            crate::reexec::reexecute_block_frames(chain_spec.clone(), chain, block, parent_state)
+        match get_parent_state() {
+            Ok(parent_state) => {
+                let captured = crate::reexec::reexecute_block_frames(
+                    chain_spec.clone(),
+                    chain,
+                    block,
+                    parent_state,
+                )
                 .map_err(|e| {
-                tracing::error!(error = %e, block = block_number, "re-execution failed");
-                ProcessingError::Decode {
-                    block: block_number,
+                    tracing::error!(error = %e, block = block_number, "re-execution failed");
+                    ProcessingError::Decode {
+                        block: block_number,
+                    }
+                })?;
+                // Tag top-level (depth-0 / call originating from a tx) frames so
+                // attribution records kind=TopLevel; internal frames keep the
+                // inspector's sequence path → kind=Internal.
+                for cf in captured.frames {
+                    let tx_hash = captured.tx_hashes.get(cf.tx_index).copied().flatten();
+                    let reverted = captured
+                        .tx_reverted
+                        .get(cf.tx_index)
+                        .copied()
+                        .unwrap_or(false);
+                    let mut frame = cf.frame;
+                    if cf.top_level {
+                        frame.trace_path = format!("tx:{}", cf.tx_index);
+                    }
+                    frames.push((tx_hash, reverted, frame));
                 }
-            })?;
-        // Tag top-level (depth-0 / call originating from a tx) frames so
-        // attribution records kind=TopLevel; internal frames keep the
-        // inspector's sequence path → kind=Internal.
-        for cf in captured.frames {
-            let tx_hash = captured.tx_hashes.get(cf.tx_index).copied().flatten();
-            let reverted = captured
-                .tx_reverted
-                .get(cf.tx_index)
-                .copied()
-                .unwrap_or(false);
-            let mut frame = cf.frame;
-            if cf.top_level {
-                frame.trace_path = format!("tx:{}", cf.tx_index);
             }
-            frames.push((tx_hash, reverted, frame));
+            Err(e) => {
+                tracing::warn!(
+                    block = block_number,
+                    error = %e,
+                    "parent state unavailable; skipping frame capture and writing unattributed marker"
+                );
+                skip_frames = true;
+            }
         }
     }
 
@@ -821,7 +839,7 @@ pub fn process_committed_block_inner<S: StackAdapter>(
         )
     };
 
-    process_block(BlockInputs {
+    let inputs = BlockInputs {
         chain_id,
         block_number,
         block_hash,
@@ -831,7 +849,12 @@ pub fn process_committed_block_inner<S: StackAdapter>(
         gas,
         account_deltas,
         system_signed,
-    })
+    };
+    if skip_frames {
+        Ok(build_partial_batch_skip_frames(inputs))
+    } else {
+        process_block(inputs)
+    }
 }
 
 #[cfg(test)]
