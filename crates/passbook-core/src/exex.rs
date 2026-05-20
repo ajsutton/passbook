@@ -2,7 +2,7 @@ use crate::config::PassbookConfig;
 use crate::erc20::{decode_transfer, RawLog};
 use crate::inspector::CapturedFrame;
 use crate::ledger::writer::BlockBatch;
-use crate::ledger::writer::{delete_blocks, write_block, write_unattributed};
+use crate::ledger::writer::{delete_blocks, write_block, write_gap_block_marker, write_unattributed};
 use crate::ledger::Ledger;
 use crate::model::{Direction, Erc20TransferRow, EthKind, EthTransferRow, GasPaymentRow};
 use crate::model::{UnattributedDeltaCause, UnattributedDeltaRow};
@@ -17,7 +17,7 @@ use reth_ethereum::node::api::NodePrimitives;
 use reth_ethereum::node::api::{FullNodeComponents, NodeTypes};
 use reth_ethereum::primitives::RecoveredBlock;
 use reth_ethereum::provider::Chain;
-use reth_ethereum::storage::{StateProviderBox, StateProviderFactory};
+use reth_ethereum::storage::{BlockHashReader, StateProviderBox, StateProviderFactory};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -464,7 +464,7 @@ where
     // Some(..) → reth's with-head backfill re-covers only the small
     // lockstep gap (bounded by the Execution-stage ExEx backpressure
     // window), not the whole chain.
-    {
+    let mut high_water: Option<u64> = {
         let head = {
             let guard = ledger.lock().unwrap_or_else(|e| e.into_inner());
             crate::ledger::queries::resume_head(guard.conn())?
@@ -474,10 +474,12 @@ where
                 block: alloy_eips::BlockNumHash { number, hash },
             });
             tracing::info!(number, %hash, "passbook ExEx resuming with head");
+            Some(number)
         } else {
             tracing::info!("passbook ExEx starting head-less (fresh datadir)");
+            None
         }
-    }
+    };
 
     // One-notification lag: the last pending height is intentionally never
     // emitted on shutdown (the pruner simply retains slightly more). On
@@ -529,6 +531,82 @@ where
         }
 
         if let Some(chain) = notification.committed_chain() {
+            // Issue #14: gap detection — if the first committed block
+            // is beyond high_water+1, fill the gap with one
+            // block_not_delivered marker per watched address per
+            // missing block BEFORE processing the live notification.
+            // Header fetches / marker writes retry forever with bounded
+            // backoff on Err; we never advance past a block we cannot
+            // mark.
+            let first_committed = {
+                use alloy_consensus::BlockHeader;
+                chain.first().header().number()
+            };
+            if let Some(range) = gap_range(high_water, first_committed) {
+                let gap_size = range.end() - range.start() + 1;
+                tracing::warn!(
+                    gap_first = *range.start(),
+                    gap_last = *range.end(),
+                    gap_size,
+                    "gap-on-restart: filling block_not_delivered markers"
+                );
+                for n in range.clone() {
+                    let mut backoff = BACKOFF_START;
+                    loop {
+                        let bh = match ctx.provider().block_hash(n) {
+                            Ok(Some(h)) => h,
+                            Ok(None) => {
+                                tracing::error!(
+                                    block = n,
+                                    "gap-fill: header missing (block_hash returned None), retrying (not advancing)"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(BACKOFF_CAP);
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    block = n,
+                                    "gap-fill: block_hash lookup failed, retrying (not advancing)"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(BACKOFF_CAP);
+                                continue;
+                            }
+                        };
+                        let res = write_gap_block_marker(
+                            ledger.lock().unwrap_or_else(|e| e.into_inner()).conn_mut(),
+                            chain_id,
+                            n,
+                            bh,
+                            &cfg.watched,
+                        );
+                        match res {
+                            Ok(()) => {
+                                high_water = Some(n);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    block = n,
+                                    "gap-fill: marker write failed, retrying (not advancing)"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(BACKOFF_CAP);
+                            }
+                        }
+                    }
+                }
+                tracing::warn!(
+                    gap_first = *range.start(),
+                    gap_last = *range.end(),
+                    gap_size,
+                    "gap-on-restart: complete, advanced high_water to gap_last"
+                );
+            }
+
             for block in chain.blocks_iter() {
                 let mut backoff = BACKOFF_START;
                 loop {
@@ -564,7 +642,11 @@ where
                                 &batch,
                             );
                             match res {
-                                Ok(()) => break,
+                                Ok(()) => {
+                                    use alloy_consensus::BlockHeader;
+                                    high_water = Some(block.header().number());
+                                    break;
+                                }
                                 Err(e) => {
                                     tracing::error!(
                                         error = %e,
