@@ -2540,29 +2540,21 @@ fn genesis_state_thunk(
     move || Ok(handle.provider_factory.history_by_block_hash(hash)?)
 }
 
-// ── Integration test: ParentStateUnavailable retries then succeeds ──────────
+// ── Integration test: ParentStateUnavailable writes partial batch and marker ──
 
-/// The `ParentStateUnavailable` retry-then-succeed hot path.
-///
-/// `process_committed_block_inner` invokes `get_parent_state` exactly ONCE
-/// per call. This test drives it K=2 times with a thunk that fails on the
-/// first K calls and succeeds on call K+1, directly exercising the
-/// `ProcessingError::ParentStateUnavailable` return path and confirming that
-/// the (K+1)th call produces the correct, fully-reconciled batch.
-///
-/// **Test level**: `process_committed_block_inner` (not full driver). Rationale:
-/// `run_passbook`'s internal `get_parent_state` closure is built from
-/// `ctx.provider().history_by_block_hash(parent_hash)` which cannot be made to
-/// fail-then-succeed without a mock `StateProviderFactory`. The direct
-/// `process_committed_block_inner` level is exactly where every other
-/// integration test exercises this path (Task 6.4), and the `run_passbook` arm
-/// code is already covered by the unit test in `exex.rs` and the existing
-/// `fault_injected_residual_stalls_without_advancing` + stall-probe structure.
-/// The goal (retry→idempotent-success behaviour covered) is fully met here.
+/// When get_parent_state() fails on a watched-account-change block,
+/// the seam must:
+///  - skip the inspector frame re-execution (no frame-derived
+///    eth_transfers rows for the watched address);
+///  - still capture erc20 transfers, gas payments, and recognised
+///    system credits for the block;
+///  - emit one unattributed_deltas marker per watched-changed address
+///    recording the observed BundleState delta;
+///  - return Ok(batch) — never stall, never error.
+/// Mirrors the live-mode default exercised by every other integration
+/// test (those use a working genesis_state_thunk and capture frames).
 #[tokio::test(flavor = "multi_thread")]
-async fn parent_state_unavailable_retries_then_succeeds() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
+async fn parent_state_unavailable_writes_partial_batch_and_marker() {
     // ── Actors ──────────────────────────────────────────────────────────
     let s_signer = PrivateKeySigner::random();
     let w_signer = PrivateKeySigner::random();
@@ -2618,61 +2610,13 @@ async fn parent_state_unavailable_retries_then_succeeds() {
     let cfg =
         PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
 
-    // ── Harness: we need a real parent (= genesis) state provider ────────
-    let (mut ctx, handle) = test_exex_context_with_chain_spec(chain_spec.clone())
-        .await
-        .expect("test exex ctx");
-    ctx.config.chain = chain_spec.clone();
-    let genesis_hash = handle.genesis.hash();
+    // ── Failing thunk: every call returns Err (never recovers — the
+    //    new design needs no retry; one call is enough).
+    let fail_thunk = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
+        eyre::bail!("injected: parent state unavailable (simulating staged-backfill)")
+    };
 
-    // ── Fail-then-succeed thunk ──────────────────────────────────────────
-    // The first K=2 calls return Err(ParentStateUnavailable); call K+1
-    // returns Ok with the real genesis-state provider. An AtomicUsize
-    // counter is used for deterministic, thread-safe call counting.
-    const K: usize = 2;
-    let call_count = Arc::new(AtomicUsize::new(0));
-
-    // ── K=2 failing calls must each return ParentStateUnavailable ────────
-    for i in 0..K {
-        let n = call_count.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(n, i, "call count before call {i}");
-
-        let fail_thunk = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
-            eyre::bail!("injected: parent state pruned (call {})", n + 1)
-        };
-        let err = passbook_core::exex::process_committed_block_inner(
-            chain_id,
-            chain_spec.clone(),
-            &chain,
-            &recovered,
-            &cfg,
-            &L1Adapter,
-            &fail_thunk,
-        )
-        .expect_err("failing thunk must produce ProcessingError::ParentStateUnavailable");
-
-        assert!(
-            matches!(
-                err,
-                passbook_core::exex::ProcessingError::ParentStateUnavailable {
-                    block: 1,
-                    ..
-                }
-            ),
-            "expected ParentStateUnavailable for block 1 on call {}, got {err:?}",
-            i + 1,
-        );
-        assert!(
-            format!("{err}").contains("historical parent state unavailable at block 1"),
-            "error message must mention 'historical parent state unavailable at block 1', got: {err}"
-        );
-    }
-
-    // ── K+1-th call: real provider succeeds, batch is correct ────────────
-    let n = call_count.fetch_add(1, Ordering::SeqCst);
-    assert_eq!(n, K, "call count on the success call");
-
-    let succeed_thunk = genesis_state_thunk(&handle, genesis_hash);
+    // Single call — under the new design returns Ok(partial batch).
     let batch = passbook_core::exex::process_committed_block_inner(
         chain_id,
         chain_spec.clone(),
@@ -2680,61 +2624,40 @@ async fn parent_state_unavailable_retries_then_succeeds() {
         &recovered,
         &cfg,
         &L1Adapter,
-        &succeed_thunk,
+        &fail_thunk,
     )
-    .expect("(K+1)-th call with real provider must succeed");
+    .expect("skip path must return Ok partial batch, never error");
 
-    // Zero residual: no unexplained delta, confirming correct reconciliation.
-    assert!(
-        batch.unattributed.is_empty(),
-        "zero unattributed residual expected after retries succeed"
-    );
-
-    // Exactly one internal inbound ETH row for W (the SELFDESTRUCT forward).
-    let internal_in: Vec<&_> = batch
+    // Frames-derived eth_transfers rows for the watched address must
+    // be ABSENT (we couldn't capture frames). kind=System rows for the
+    // watched address may still appear if the fixture generates any —
+    // count only non-System kinds.
+    use passbook_core::model::EthKind;
+    let frame_rows_for_watched: usize = batch
         .eth
         .iter()
-        .filter(|r| {
-            r.address == watched
-                && matches!(r.direction, passbook_core::model::Direction::In)
-                && matches!(r.kind, passbook_core::model::EthKind::Internal)
-        })
+        .filter(|r| r.address == watched && !matches!(r.kind, EthKind::System))
+        .count();
+    assert_eq!(
+        frame_rows_for_watched, 0,
+        "no frame-derived rows on skip"
+    );
+
+    // At least one unattributed marker for the watched-changed address.
+    let markers_for_watched: Vec<_> = batch
+        .unattributed
+        .iter()
+        .filter(|m| m.address == watched)
         .collect();
-    assert_eq!(
-        internal_in.len(),
-        1,
-        "exactly one internal inbound ETH row for W after retry success"
+    assert!(
+        !markers_for_watched.is_empty(),
+        "skip path must emit ≥1 unattributed_deltas marker per watched-changed address"
     );
-    assert_eq!(
-        internal_in[0].amount_wei,
-        fwd_value,
-        "inbound amount equals the forwarded value"
-    );
-
-    // No duplication: write the batch to a real ledger and confirm single row.
-    let mut ledger =
-        passbook_core::ledger::Ledger::open(&db_path, chain_id).expect("ledger open");
-    passbook_core::ledger::writer::write_block(ledger.conn_mut(), &batch)
-        .expect("durable write must succeed");
-    let eth_in: i64 = ledger
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM eth_transfers \
-             WHERE address=?1 AND direction='in' AND kind='internal'",
-            [&format!("{watched:#x}")],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        eth_in, 1,
-        "exactly one inbound internal eth row durably written (no duplication from retries)"
-    );
-
-    // Total calls: exactly K+1 (K failures + 1 success).
-    assert_eq!(
-        call_count.load(Ordering::SeqCst),
-        K + 1,
-        "expected exactly K+1 = {} total calls to get_parent_state",
-        K + 1
+    assert_eq!(markers_for_watched[0].block_number, batch.block_number);
+    assert_eq!(markers_for_watched[0].block_hash, batch.block_hash);
+    assert_eq!(markers_for_watched[0].attributed_wei, alloy_primitives::U256::ZERO);
+    assert!(
+        markers_for_watched[0].residual_wei > alloy_primitives::U256::ZERO,
+        "marker records non-zero residual = observed BundleState delta"
     );
 }
