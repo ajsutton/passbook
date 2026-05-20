@@ -16,10 +16,10 @@
 
 use std::sync::Arc;
 
+use crate::exex::ParentStateFn;
 use reth_ethereum::chainspec::ChainSpec;
 use reth_ethereum::primitives::RecoveredBlock;
 use reth_ethereum::provider::Chain;
-use crate::exex::ParentStateFn;
 use reth_ethereum::{Block, EthPrimitives};
 
 use crate::config::PassbookConfig;

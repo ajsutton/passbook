@@ -2,7 +2,9 @@ use crate::config::PassbookConfig;
 use crate::erc20::{decode_transfer, RawLog};
 use crate::inspector::CapturedFrame;
 use crate::ledger::writer::BlockBatch;
-use crate::ledger::writer::{delete_blocks, write_block, write_gap_block_marker, write_unattributed};
+use crate::ledger::writer::{
+    delete_blocks, write_block, write_gap_block_marker, write_unattributed,
+};
 use crate::ledger::Ledger;
 use crate::model::{Direction, Erc20TransferRow, EthKind, EthTransferRow, GasPaymentRow};
 use crate::model::{UnattributedDeltaCause, UnattributedDeltaRow};

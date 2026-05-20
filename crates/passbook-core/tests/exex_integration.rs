@@ -405,7 +405,9 @@ async fn erc20_internal_gas_capture_zero_residual() {
     //    failure surfaces as a concrete error. ──────────────────────────
     let (batch_erc20_len, batch_internal_in_amounts, batch_gas_len) = {
         let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
-            Ok(handle.provider_factory.history_by_block_hash(genesis_hash)?)
+            Ok(handle
+                .provider_factory
+                .history_by_block_hash(genesis_hash)?)
         };
         let batch = passbook_core::exex::process_committed_block_inner(
             chain_id,
@@ -435,10 +437,7 @@ async fn erc20_internal_gas_capture_zero_residual() {
         let gas_len = batch.gas.iter().filter(|r| r.address == watched).count();
         (erc20_len, internal_in, gas_len)
     };
-    assert_eq!(
-        batch_erc20_len, 1,
-        "one ERC20 row for W"
-    );
+    assert_eq!(batch_erc20_len, 1, "one ERC20 row for W");
     let mut got = batch_internal_in_amounts;
     assert_eq!(
         got.len(),
@@ -452,10 +451,7 @@ async fn erc20_internal_gas_capture_zero_residual() {
         got, want,
         "internal-in amounts = SELFDESTRUCT + CALL values"
     );
-    assert_eq!(
-        batch_gas_len, 1,
-        "one gas row for W (tx3)"
-    );
+    assert_eq!(batch_gas_len, 1, "one gas row for W (tx3)");
 
     // ── End-to-end: drive run_passbook via the test ExEx harness ───────
     let ledger = Arc::new(Mutex::new(
@@ -629,7 +625,9 @@ async fn parent_state_readonly_two_block_chain_zero_residual() {
     // BundleState carries the deployed runtime code; block 2 reads it.
     let (b2_internal_in_len, b2_internal_in_amount) = {
         let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
-            Ok(handle.provider_factory.history_by_block_hash(genesis_hash)?)
+            Ok(handle
+                .provider_factory
+                .history_by_block_hash(genesis_hash)?)
         };
         let batch2 = passbook_core::exex::process_committed_block_inner(
             chain_id,
@@ -654,11 +652,13 @@ async fn parent_state_readonly_two_block_chain_zero_residual() {
                     && matches!(r.kind, passbook_core::model::EthKind::Internal)
             })
             .collect();
-        (b2_internal_in.len(), b2_internal_in.first().map(|r| r.amount_wei))
+        (
+            b2_internal_in.len(),
+            b2_internal_in.first().map(|r| r.amount_wei),
+        )
     };
     assert_eq!(
-        b2_internal_in_len,
-        1,
+        b2_internal_in_len, 1,
         "block 2: one internal inbound ETH row for W via the block-1-deployed forwarder"
     );
     assert_eq!(b2_internal_in_amount, Some(fwd_value));
@@ -949,7 +949,9 @@ async fn fault_injected_residual_stalls_without_advancing() {
     let direct = {
         let genesis_hash0 = handle0.genesis.hash();
         let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
-            Ok(handle0.provider_factory.history_by_block_hash(genesis_hash0)?)
+            Ok(handle0
+                .provider_factory
+                .history_by_block_hash(genesis_hash0)?)
         };
         passbook_core::exex::ChainExec::process_committed_block(
             &injector,
@@ -1116,7 +1118,9 @@ async fn l1_withdrawal_and_beneficiary_priority_fee_recognized_zero_residual() {
     let batch = {
         let handle0_genesis_hash = handle0.genesis.hash();
         let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
-            Ok(handle0.provider_factory.history_by_block_hash(handle0_genesis_hash)?)
+            Ok(handle0
+                .provider_factory
+                .history_by_block_hash(handle0_genesis_hash)?)
         };
         passbook_core::exex::process_committed_block_inner(
             chain_id,
@@ -1495,7 +1499,10 @@ async fn restart_resumes_no_gap_no_dup() {
     };
     assert!(n_eth >= 1, "run 1 must have written at least one eth row");
     // The lag flush (block 2) is also written; last_block reflects both.
-    assert_eq!(last_block_1, "2", "run 1 advanced last_block through the lag-flush block");
+    assert_eq!(
+        last_block_1, "2",
+        "run 1 advanced last_block through the lag-flush block"
+    );
 
     // ── Run 2: reopen the SAME db file and start a fresh run_passbook.
     //    With Task 10, `set_notifications_with_head` is called with the
@@ -1808,7 +1815,13 @@ async fn flush_lag(
     tip_hash: B256,
     tip_number: u64,
 ) {
-    let flush_block = build_block(chain_spec, tip_number + 1, tip_hash, tip_number * 12 + 1000, vec![]);
+    let flush_block = build_block(
+        chain_spec,
+        tip_number + 1,
+        tip_hash,
+        tip_number * 12 + 1000,
+        vec![],
+    );
     let evm_config = reth_ethereum::evm::EthEvmConfig::new(chain_spec.clone());
     let exec_out = evm_config
         .executor(genesis_state(chain_spec))
@@ -1935,7 +1948,9 @@ async fn reverted_value_transfers_zero_residual() {
     let genesis_hash = handle.genesis.hash();
     {
         let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
-            Ok(handle.provider_factory.history_by_block_hash(genesis_hash)?)
+            Ok(handle
+                .provider_factory
+                .history_by_block_hash(genesis_hash)?)
         };
         let batch = passbook_core::exex::process_committed_block_inner(
             chain_id,
@@ -2399,7 +2414,9 @@ async fn watched_to_watched_erc20_and_eth_no_row_loss_zero_residual() {
     // Deterministic core check against the real genesis-state provider.
     {
         let gps = || -> eyre::Result<reth_ethereum::storage::StateProviderBox> {
-            Ok(handle.provider_factory.history_by_block_hash(genesis_hash)?)
+            Ok(handle
+                .provider_factory
+                .history_by_block_hash(genesis_hash)?)
         };
         let batch = passbook_core::exex::process_committed_block_inner(
             chain_id,
@@ -2419,12 +2436,16 @@ async fn watched_to_watched_erc20_and_eth_no_row_loss_zero_residual() {
         let erc20_in: Vec<&_> = batch
             .erc20
             .iter()
-            .filter(|r| r.address == w2 && matches!(r.direction, passbook_core::model::Direction::In))
+            .filter(|r| {
+                r.address == w2 && matches!(r.direction, passbook_core::model::Direction::In)
+            })
             .collect();
         let erc20_out: Vec<&_> = batch
             .erc20
             .iter()
-            .filter(|r| r.address == w1 && matches!(r.direction, passbook_core::model::Direction::Out))
+            .filter(|r| {
+                r.address == w1 && matches!(r.direction, passbook_core::model::Direction::Out)
+            })
             .collect();
         assert_eq!(erc20_in.len(), 1, "one inbound ERC20 row for W2");
         assert_eq!(erc20_out.len(), 1, "one outbound ERC20 row for W1");
@@ -2532,11 +2553,11 @@ async fn watched_to_watched_erc20_and_eth_no_row_loss_zero_residual() {
 /// of `TestExExHandle::provider_factory`) has `history_by_block_hash` as an
 /// INHERENT method but does NOT implement the `StateProviderFactory` trait, so
 /// the helper takes the full `TestExExHandle` rather than a generic factory.
+#[allow(dead_code)] // intentional helper for future tests; documented as such
 fn genesis_state_thunk(
     handle: &reth_exex_test_utils::TestExExHandle,
     hash: B256,
-) -> impl Fn() -> eyre::Result<reth_ethereum::storage::StateProviderBox> + '_
-{
+) -> impl Fn() -> eyre::Result<reth_ethereum::storage::StateProviderBox> + '_ {
     move || Ok(handle.provider_factory.history_by_block_hash(hash)?)
 }
 
@@ -2638,10 +2659,7 @@ async fn parent_state_unavailable_writes_partial_batch_and_marker() {
         .iter()
         .filter(|r| r.address == watched && !matches!(r.kind, EthKind::System))
         .count();
-    assert_eq!(
-        frame_rows_for_watched, 0,
-        "no frame-derived rows on skip"
-    );
+    assert_eq!(frame_rows_for_watched, 0, "no frame-derived rows on skip");
 
     // At least one unattributed marker for the watched-changed address.
     let markers_for_watched: Vec<_> = batch
@@ -2655,7 +2673,10 @@ async fn parent_state_unavailable_writes_partial_batch_and_marker() {
     );
     assert_eq!(markers_for_watched[0].block_number, batch.block_number);
     assert_eq!(markers_for_watched[0].block_hash, batch.block_hash);
-    assert_eq!(markers_for_watched[0].attributed_wei, alloy_primitives::U256::ZERO);
+    assert_eq!(
+        markers_for_watched[0].attributed_wei,
+        alloy_primitives::U256::ZERO
+    );
     assert!(
         markers_for_watched[0].residual_wei > alloy_primitives::U256::ZERO,
         "marker records non-zero residual = observed BundleState delta"
@@ -2712,8 +2733,8 @@ async fn gap_on_restart_stalls_when_provider_cannot_serve_gap_headers() {
     // ── Ledger pre-populated with high-water = block 1 ────────────────
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("passbook.db");
-    let cfg = PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone())
-        .expect("cfg");
+    let cfg =
+        PassbookConfig::from_parts(vec![format!("{watched:#x}")], db_path.clone()).expect("cfg");
     let ledger = Arc::new(Mutex::new(
         Ledger::open(&db_path, chain_id).expect("ledger open"),
     ));
@@ -2807,7 +2828,10 @@ async fn gap_on_restart_stalls_when_provider_cannot_serve_gap_headers() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(n_markers, 0, "no markers should be written (header fetch failed)");
+    assert_eq!(
+        n_markers, 0,
+        "no markers should be written (header fetch failed)"
+    );
 
     // ── Assert: zero rows for block 5 (the per-block loop never ran). ─
     let n_block_5: i64 = conn
@@ -2820,7 +2844,10 @@ async fn gap_on_restart_stalls_when_provider_cannot_serve_gap_headers() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(n_block_5, 0, "block 5 must not have been processed (gap-fill blocked the per-block loop)");
+    assert_eq!(
+        n_block_5, 0,
+        "block 5 must not have been processed (gap-fill blocked the per-block loop)"
+    );
 
     drop(g); // release ledger lock before the channel check
 
