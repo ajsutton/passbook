@@ -573,16 +573,7 @@ where
                             backoff = (backoff * 2).min(BACKOFF_CAP);
                             continue;
                         }
-                        Err(ProcessingError::ParentStateUnavailable { block: bn, msg }) => {
-                            tracing::error!(
-                                block = bn,
-                                error = %msg,
-                                "no historical state at chain parent, retrying"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(BACKOFF_CAP);
-                            continue;
-                        }
+
                         Err(other) => {
                             tracing::error!(
                                 error = %other,
