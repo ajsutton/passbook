@@ -129,6 +129,54 @@ pub fn write_unattributed(conn: &mut Connection, r: &UnattributedDeltaRow) -> ey
     Ok(())
 }
 
+/// Gap-on-restart marker write (issue #14). One DB transaction per
+/// gap block: insert one `unattributed_deltas` row per watched address
+/// with `cause = block_not_delivered` and all-zero amounts, then
+/// advance `meta.last_block` / `meta.last_block_hash` to
+/// `(block_number, block_hash)`. Atomic per block; crash-safe via
+/// `INSERT OR REPLACE` idempotency. Mirrors `write_block`'s
+/// per-block-TX shape so a partial gap-fill resumes cleanly from
+/// the durable high-water.
+///
+/// An empty `watched` set is valid: zero marker rows are written, but
+/// `meta` still advances so future gap detection stays correct.
+pub fn write_gap_block_marker(
+    conn: &mut Connection,
+    chain_id: u64,
+    block_number: u64,
+    block_hash: alloy_primitives::B256,
+    watched: &std::collections::HashSet<alloy_primitives::Address>,
+) -> eyre::Result<()> {
+    let tx = conn.transaction()?;
+    for addr in watched {
+        tx.execute(
+            "INSERT OR REPLACE INTO unattributed_deltas VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![
+                chain_id,
+                block_number,
+                h(&block_hash),
+                a(addr),
+                "0",
+                "0",
+                "0",
+                crate::model::UnattributedDeltaCause::BlockNotDelivered.as_str()
+            ],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO meta(k,v) VALUES('last_block',?1)
+         ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        [block_number.to_string()],
+    )?;
+    tx.execute(
+        "INSERT INTO meta(k,v) VALUES('last_block_hash',?1)
+         ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        [format!("{:#x}", block_hash)],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Reorg handling: drop every row for the reverted block hashes.
 pub fn delete_blocks(
     conn: &mut Connection,
@@ -423,6 +471,123 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored, format!("{bh:#x}"));
+    }
+
+    /// Issue #14: gap-on-restart marker writer emits one row per
+    /// watched address with all-zero amounts + `block_not_delivered`
+    /// cause, and atomically advances meta.last_block/last_block_hash
+    /// in the SAME transaction.
+    #[test]
+    fn write_gap_block_marker_emits_per_address_rows_and_advances_meta() {
+        let (mut l, _tmp) = ledger();
+        let bh = B256::repeat_byte(0x77);
+        let a = Address::repeat_byte(0xa1);
+        let b = Address::repeat_byte(0xb2);
+        let watched: std::collections::HashSet<Address> = [a, b].into_iter().collect();
+
+        write_gap_block_marker(l.conn_mut(), 1, 42, bh, &watched).unwrap();
+
+        // One row per watched address.
+        let n: i64 = l
+            .conn()
+            .query_row("SELECT count(*) FROM unattributed_deltas", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+
+        // Every row has all-zero amounts and the new cause.
+        let mut s = l
+            .conn()
+            .prepare(
+                "SELECT address, observed_wei, attributed_wei, residual_wei, cause \
+                   FROM unattributed_deltas WHERE block_number=42 ORDER BY address",
+            )
+            .unwrap();
+        let rows: Vec<(String, String, String, String, String)> = s
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for (_, o, a_, res, cause) in &rows {
+            assert_eq!(o, "0");
+            assert_eq!(a_, "0");
+            assert_eq!(res, "0");
+            assert_eq!(cause, "block_not_delivered");
+        }
+
+        // Meta advanced.
+        let lb: String = l
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
+            .unwrap();
+        let lh: String = l
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='last_block_hash'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(lb, "42");
+        assert_eq!(lh, format!("{bh:#x}"));
+    }
+
+    /// Replay-safety: re-running write_gap_block_marker for the same
+    /// block must not duplicate rows or corrupt meta. The natural PK
+    /// (chain_id, block_hash, address) + INSERT OR REPLACE makes the
+    /// write idempotent — same contract as write_block.
+    #[test]
+    fn write_gap_block_marker_is_idempotent() {
+        let (mut l, _tmp) = ledger();
+        let bh = B256::repeat_byte(0x55);
+        let w = Address::repeat_byte(0xaa);
+        let watched: std::collections::HashSet<Address> = [w].into_iter().collect();
+        write_gap_block_marker(l.conn_mut(), 1, 11, bh, &watched).unwrap();
+        write_gap_block_marker(l.conn_mut(), 1, 11, bh, &watched).unwrap();
+        let n: i64 = l
+            .conn()
+            .query_row("SELECT count(*) FROM unattributed_deltas", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "replay must not duplicate the marker row");
+    }
+
+    /// Edge case: empty watched set must still advance meta (so future
+    /// gap detection remains correct), with zero marker rows written.
+    /// The ExEx with no watched addresses is degenerate but must still
+    /// track high-water gap-free.
+    #[test]
+    fn write_gap_block_marker_empty_watched_advances_meta_with_zero_rows() {
+        let (mut l, _tmp) = ledger();
+        let bh = B256::repeat_byte(0x33);
+        let empty: std::collections::HashSet<Address> = Default::default();
+        write_gap_block_marker(l.conn_mut(), 1, 99, bh, &empty).unwrap();
+        let n: i64 = l
+            .conn()
+            .query_row("SELECT count(*) FROM unattributed_deltas", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "no markers for an empty watched set");
+        let lb: String = l
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='last_block'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lb, "99", "meta still advances on an empty fill");
+    }
+
+    /// Issue #3 / consistency with the other writers: a DB-write fault
+    /// must surface as Err (so the ExEx loop can retry/stall), never
+    /// panic. A `query_only` connection makes every write fail.
+    #[test]
+    fn write_gap_block_marker_errors_not_panics_on_readonly_db() {
+        let (mut l, _tmp) = ledger();
+        l.conn()
+            .pragma_update(None, "query_only", "ON")
+            .expect("inject query_only");
+        let bh = B256::repeat_byte(0x44);
+        let w = Address::repeat_byte(0xab);
+        let watched: std::collections::HashSet<Address> = [w].into_iter().collect();
+        assert!(
+            write_gap_block_marker(l.conn_mut(), 1, 7, bh, &watched).is_err(),
+            "must return Err on a read-only DB, not panic"
+        );
     }
 
     #[test]
