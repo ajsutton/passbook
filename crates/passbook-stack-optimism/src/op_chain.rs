@@ -39,7 +39,9 @@ use alloy_primitives::{B256, U256};
 use passbook_core::attribution::{compute_gas_payment, GasInput};
 use passbook_core::config::PassbookConfig;
 use passbook_core::erc20::RawLog;
-use passbook_core::exex::{process_block, BlockInputs, ChainExec, ProcessingError};
+use passbook_core::exex::{
+    build_partial_batch_skip_frames, process_block, BlockInputs, ChainExec, ProcessingError,
+};
 use passbook_core::inspector::CapturedFrame;
 use passbook_core::ledger::writer::BlockBatch;
 use passbook_core::reexec::{build_prestate_cache, Captured, TaggedFrame, TaggingInspector};
@@ -155,18 +157,25 @@ impl ChainExec for OpChainExec {
         }
 
         // ── (3) Gated re-execution → ValueInspector frames (shared
-        //    inspector + shared pre-state overlay; OP EVM config).
+        //    inspector + shared pre-state overlay; OP EVM config). On
+        //    get_parent_state() Err (staged-pipeline backfill: provider
+        //    best_block pinned at bootstrap checkpoint), skip frame
+        //    capture and fall through to the partial-batch path
+        //    (build_partial_batch_skip_frames). Live operation never
+        //    hits Err because Finish advances per-block; structural
+        //    defence so the exex never wedges.
         let mut frames: Vec<(Option<B256>, bool, CapturedFrame)> = Vec::new();
+        let mut skip_frames = false;
         if any_watched_changed {
-            let parent_state = get_parent_state().map_err(|e| {
-                ProcessingError::ParentStateUnavailable {
-                    block: block_number,
-                    msg: e.to_string(),
-                }
-            })?;
-            let captured =
-                reexecute_op_block_frames(chain_spec.clone(), chain, block, parent_state).map_err(
-                    |e| {
+            match get_parent_state() {
+                Ok(parent_state) => {
+                    let captured = reexecute_op_block_frames(
+                        chain_spec.clone(),
+                        chain,
+                        block,
+                        parent_state,
+                    )
+                    .map_err(|e| {
                         tracing::error!(
                             error = %e, block = block_number,
                             "OP re-execution failed"
@@ -174,21 +183,30 @@ impl ChainExec for OpChainExec {
                         ProcessingError::Decode {
                             block: block_number,
                         }
-                    },
-                )?;
-            for (k, tf) in captured.frames.into_iter().enumerate() {
-                let _ = k;
-                let tx_hash = captured.tx_hashes.get(tf.tx_index).copied().flatten();
-                let reverted = captured
-                    .tx_reverted
-                    .get(tf.tx_index)
-                    .copied()
-                    .unwrap_or(false);
-                let mut frame = tf.frame;
-                if tf.top_level {
-                    frame.trace_path = format!("tx:{}", tf.tx_index);
+                    })?;
+                    for (k, tf) in captured.frames.into_iter().enumerate() {
+                        let _ = k;
+                        let tx_hash = captured.tx_hashes.get(tf.tx_index).copied().flatten();
+                        let reverted = captured
+                            .tx_reverted
+                            .get(tf.tx_index)
+                            .copied()
+                            .unwrap_or(false);
+                        let mut frame = tf.frame;
+                        if tf.top_level {
+                            frame.trace_path = format!("tx:{}", tf.tx_index);
+                        }
+                        frames.push((tx_hash, reverted, frame));
+                    }
                 }
-                frames.push((tx_hash, reverted, frame));
+                Err(e) => {
+                    tracing::warn!(
+                        block = block_number,
+                        error = %e,
+                        "OP: parent state unavailable; skipping frame capture and writing unattributed marker"
+                    );
+                    skip_frames = true;
+                }
             }
         }
 
@@ -334,7 +352,7 @@ impl ChainExec for OpChainExec {
         };
 
         // SHARED pure orchestrator — invoked, never forked.
-        process_block(BlockInputs {
+        let inputs = BlockInputs {
             chain_id,
             block_number,
             block_hash,
@@ -344,7 +362,12 @@ impl ChainExec for OpChainExec {
             gas,
             account_deltas,
             system_signed,
-        })
+        };
+        if skip_frames {
+            Ok(build_partial_batch_skip_frames(inputs))
+        } else {
+            process_block(inputs)
+        }
     }
 }
 
