@@ -565,6 +565,7 @@ mod tests {
                     observed_wei: U256::from(1),
                     attributed_wei: U256::ZERO,
                     residual_wei: U256::from(1),
+                    cause: crate::model::UnattributedDeltaCause::UnexplainedResidual,
                 }],
             };
             write_block(l.conn_mut(), &b).unwrap();

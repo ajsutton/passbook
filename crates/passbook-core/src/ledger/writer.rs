@@ -81,7 +81,7 @@ pub fn write_block(conn: &mut Connection, b: &BlockBatch) -> eyre::Result<()> {
     }
     for r in &b.unattributed {
         tx.execute(
-            "INSERT OR REPLACE INTO unattributed_deltas VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT OR REPLACE INTO unattributed_deltas VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params![
                 r.chain_id,
                 r.block_number,
@@ -89,7 +89,8 @@ pub fn write_block(conn: &mut Connection, b: &BlockBatch) -> eyre::Result<()> {
                 a(&r.address),
                 u(&r.observed_wei),
                 u(&r.attributed_wei),
-                u(&r.residual_wei)
+                u(&r.residual_wei),
+                r.cause.as_str()
             ],
         )?;
     }
@@ -113,7 +114,7 @@ pub fn write_block(conn: &mut Connection, b: &BlockBatch) -> eyre::Result<()> {
 /// query). INSERT OR REPLACE on the natural PK keeps retries idempotent.
 pub fn write_unattributed(conn: &mut Connection, r: &UnattributedDeltaRow) -> eyre::Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO unattributed_deltas VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT OR REPLACE INTO unattributed_deltas VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         rusqlite::params![
             r.chain_id,
             r.block_number,
@@ -121,7 +122,8 @@ pub fn write_unattributed(conn: &mut Connection, r: &UnattributedDeltaRow) -> ey
             a(&r.address),
             u(&r.observed_wei),
             u(&r.attributed_wei),
-            u(&r.residual_wei)
+            u(&r.residual_wei),
+            r.cause.as_str()
         ],
     )?;
     Ok(())
@@ -293,6 +295,7 @@ mod tests {
             observed_wei: U256::from(7),
             attributed_wei: U256::ZERO,
             residual_wei: U256::from(7),
+            cause: UnattributedDeltaCause::UnexplainedResidual,
         };
         write_unattributed(l.conn_mut(), &row).unwrap();
         write_unattributed(l.conn_mut(), &row).unwrap(); // retry -> no dup
@@ -301,6 +304,58 @@ mod tests {
             .query_row("SELECT count(*) FROM unattributed_deltas", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Issue #15: writer must persist the `cause` discriminator so
+    /// operators can SQL-filter skip-path markers apart from reconcile-
+    /// stall residuals. Round-trip both variants through the table.
+    #[test]
+    fn write_unattributed_persists_cause_discriminator() {
+        let (mut l, _tmp) = ledger();
+        let bh1 = B256::repeat_byte(0x11);
+        let bh2 = B256::repeat_byte(0x22);
+        let addr = Address::repeat_byte(0xab);
+        write_unattributed(
+            l.conn_mut(),
+            &UnattributedDeltaRow {
+                chain_id: 1,
+                block_number: 1,
+                block_hash: bh1,
+                address: addr,
+                observed_wei: U256::from(7),
+                attributed_wei: U256::ZERO,
+                residual_wei: U256::from(7),
+                cause: UnattributedDeltaCause::ParentStateUnavailable,
+            },
+        )
+        .unwrap();
+        write_unattributed(
+            l.conn_mut(),
+            &UnattributedDeltaRow {
+                chain_id: 1,
+                block_number: 2,
+                block_hash: bh2,
+                address: addr,
+                observed_wei: U256::from(8),
+                attributed_wei: U256::ZERO,
+                residual_wei: U256::from(8),
+                cause: UnattributedDeltaCause::UnexplainedResidual,
+            },
+        )
+        .unwrap();
+        let mut stmt = l
+            .conn()
+            .prepare("SELECT cause FROM unattributed_deltas ORDER BY block_number")
+            .unwrap();
+        let causes: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            causes,
+            vec!["parent_state_unavailable", "unexplained_residual"]
+        );
     }
 
     /// Issue #3 (C2): a DB-write fault must surface as `Err` (so the ExEx
@@ -335,6 +390,7 @@ mod tests {
             observed_wei: U256::from(1),
             attributed_wei: U256::ZERO,
             residual_wei: U256::from(1),
+            cause: UnattributedDeltaCause::UnexplainedResidual,
         };
         assert!(
             write_unattributed(l.conn_mut(), &row).is_err(),
@@ -362,7 +418,9 @@ mod tests {
         write_block(led.conn_mut(), &batch).unwrap();
         let stored: String = led
             .conn()
-            .query_row("SELECT v FROM meta WHERE k='last_block_hash'", [], |r| r.get(0))
+            .query_row("SELECT v FROM meta WHERE k='last_block_hash'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(stored, format!("{bh:#x}"));
     }

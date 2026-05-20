@@ -4,9 +4,9 @@ use crate::inspector::CapturedFrame;
 use crate::ledger::writer::BlockBatch;
 use crate::ledger::writer::{delete_blocks, write_block, write_unattributed};
 use crate::ledger::Ledger;
-use crate::model::UnattributedDeltaRow;
 use crate::model::{Direction, Erc20TransferRow, EthKind, EthTransferRow, GasPaymentRow};
-use crate::reconcile::{reconcile_account, ReconcileInput};
+use crate::model::{UnattributedDeltaCause, UnattributedDeltaRow};
+use crate::reconcile::{reconcile_account, skip_mode_attribution, ReconcileInput};
 use crate::stack::StackAdapter;
 use crate::system::SystemCredit;
 use alloy_primitives::{Address, B256, U256};
@@ -65,7 +65,6 @@ pub enum ProcessingError {
     /// instead the block is failed exactly like an unexplained residual.
     #[error("reconcile arithmetic out of i128 range for {address} at block {block}")]
     ReconcileOverflow { block: u64, address: Address },
-
 }
 
 /// Pure: deterministic transform of one block's inputs into a durable batch.
@@ -234,7 +233,10 @@ pub fn process_block(i: BlockInputs) -> Result<BlockBatch, ProcessingError> {
 /// have frames). The natural-PK markers reorg-clean automatically via
 /// the existing `delete_blocks(by block_hash)` path.
 pub fn build_partial_batch_skip_frames(i: BlockInputs) -> BlockBatch {
-    debug_assert!(i.frames.is_empty(), "skip path must be invoked with frames=vec![]");
+    debug_assert!(
+        i.frames.is_empty(),
+        "skip path must be invoked with frames=vec![]"
+    );
 
     // (a) ERC20: identical logic to process_block's section (a).
     let mut erc20 = Vec::new();
@@ -287,11 +289,38 @@ pub fn build_partial_batch_skip_frames(i: BlockInputs) -> BlockBatch {
     }
 
     // (c) Unattributed markers — one per watched-changed address with a
-    //     non-zero observed delta. Records the gap so it's auditable
-    //     post-sync via the unattributed_deltas table.
+    //     RESIDUAL after netting the recognised `system_signed` credits
+    //     for that address against the observed BundleState delta
+    //     (issue #15). Without the netting the skip path would emit a
+    //     false "fully unattributed" marker for any block whose watched
+    //     change is in fact entirely covered by a recognised system
+    //     credit (canonical case: OP deposit mints — the `kind = system`
+    //     `eth_transfers` row above ALREADY attributes the delta, and a
+    //     redundant marker pollutes the operator-facing signal).
+    //
+    //     Sign handling uses [`skip_mode_attribution`] rather than naive
+    //     subtraction: when observed and system_signed disagree in
+    //     direction the system credit doesn't actually attribute the
+    //     observed delta, so the full observed becomes residual.
+    //
+    //     Rows are tagged `cause = ParentStateUnavailable` so operators
+    //     can filter skip-path markers apart from live-mode reconcile
+    //     residuals (which share this table).
+    let mut sys_per_addr: std::collections::HashMap<Address, i128> = Default::default();
+    for sc in &i.system_signed {
+        if !i.watched.contains(&sc.address) {
+            continue;
+        }
+        *sys_per_addr.entry(sc.address).or_default() += sc.signed_wei;
+    }
     let mut unattributed = Vec::new();
     for (addr, observed) in &i.account_deltas {
         if !i.watched.contains(addr) || *observed == 0 {
+            continue;
+        }
+        let sys = sys_per_addr.get(addr).copied().unwrap_or(0);
+        let (observed_wei, attributed_wei, residual_wei) = skip_mode_attribution(*observed, sys);
+        if residual_wei == 0 {
             continue;
         }
         unattributed.push(UnattributedDeltaRow {
@@ -299,9 +328,10 @@ pub fn build_partial_batch_skip_frames(i: BlockInputs) -> BlockBatch {
             block_number: i.block_number,
             block_hash: i.block_hash,
             address: *addr,
-            observed_wei: U256::from(observed.unsigned_abs()),
-            attributed_wei: U256::ZERO,
-            residual_wei: U256::from(observed.unsigned_abs()),
+            observed_wei: U256::from(observed_wei),
+            attributed_wei: U256::from(attributed_wei),
+            residual_wei: U256::from(residual_wei),
+            cause: UnattributedDeltaCause::ParentStateUnavailable,
         });
     }
 
@@ -538,6 +568,11 @@ where
                                 observed_wei: U256::from(residual.unsigned_abs()),
                                 attributed_wei: U256::ZERO,
                                 residual_wei: U256::from(residual.unsigned_abs()),
+                                // Live-mode reconcile residual ⇒ the
+                                // worker stalled on this block. Distinct
+                                // operational meaning from skip-path
+                                // markers (issue #15).
+                                cause: UnattributedDeltaCause::UnexplainedResidual,
                             };
                             // Best-effort diagnostic row for the health
                             // query. A failure here must NOT `?` out of the
@@ -1063,9 +1098,14 @@ mod tests {
 
     /// Skip-mode partial batch: build_partial_batch_skip_frames must
     /// produce a batch with the erc20/gas/system rows still captured, NO
-    /// frame-derived eth_transfers rows, and one unattributed_deltas
-    /// marker per watched address with a non-zero delta. No reconciliation,
-    /// no error path.
+    /// frame-derived eth_transfers rows, and (after the issue #15 fix) one
+    /// unattributed_deltas marker per watched address whose observed delta
+    /// EXCEEDS the recognised `system_signed` net for that address. No
+    /// reconciliation, no error path. The fixture below has a recognised
+    /// system credit of 1 wei against an observed +500 wei delta, so the
+    /// marker records `observed=500, attributed=1, residual=499` — the
+    /// pre-fix behaviour (`observed=500, attributed=0, residual=500`) is
+    /// the bug.
     #[test]
     fn build_partial_batch_skip_frames_emits_markers_and_keeps_non_frame_rows() {
         use crate::erc20::{RawLog, TRANSFER_TOPIC0};
@@ -1124,20 +1164,164 @@ mod tests {
         assert_eq!(batch.gas[0].address, gas_row.address);
         assert_eq!(batch.gas[0].total_wei, gas_row.total_wei);
         // system-credit eth_transfers row preserved (kind=System)
-        assert_eq!(batch.eth.len(), 1, "system-credit eth_transfers row preserved");
+        assert_eq!(
+            batch.eth.len(),
+            1,
+            "system-credit eth_transfers row preserved"
+        );
         assert!(matches!(batch.eth[0].kind, EthKind::System));
         assert_eq!(batch.eth[0].address, w);
-        // unattributed marker emitted for the watched non-zero delta
-        assert_eq!(batch.unattributed.len(), 1, "one marker per watched-changed address");
+        // unattributed marker emitted for the residual (observed 500 −
+        // recognised system 1 = 499 unattributed wei). Issue #15: pre-fix
+        // this row would have falsely claimed residual=500 / attributed=0,
+        // double-counting the 1-wei system credit captured by `batch.eth[0]`.
+        assert_eq!(
+            batch.unattributed.len(),
+            1,
+            "one marker per watched-changed address"
+        );
         assert_eq!(batch.unattributed[0].address, w);
         assert_eq!(batch.unattributed[0].observed_wei, U256::from(500u64));
+        assert_eq!(batch.unattributed[0].attributed_wei, U256::from(1u64));
+        assert_eq!(batch.unattributed[0].residual_wei, U256::from(499u64));
+        assert_eq!(
+            batch.unattributed[0].cause,
+            crate::model::UnattributedDeltaCause::ParentStateUnavailable
+        );
+    }
+
+    /// Issue #15: a watched-account delta fully explained by a recognised
+    /// `system_signed` credit (the canonical case being an OP deposit mint)
+    /// must NOT emit a redundant `unattributed_deltas` marker on the skip
+    /// path. Today the skip path emits one marker per non-zero observed
+    /// delta with `attributed = 0`, falsely claiming the deposit-funded
+    /// block is unattributed even though the `kind=System` `eth_transfers`
+    /// row already covers it. Operators relying on `unattributed_deltas` to
+    /// surface blocks with incomplete attribution should see zero rows
+    /// here.
+    #[test]
+    fn skip_path_drops_marker_when_system_credit_covers_observed_delta() {
+        use crate::system::SystemCredit;
+        let w = Address::repeat_byte(0xa4);
+        let from = Address::repeat_byte(0xff);
+        let mint = 89_916_500_000_000_000i128; // OP-mainnet block 114,804,381
+        let inp = BlockInputs {
+            chain_id: 10,
+            block_number: 114_804_381,
+            block_hash: B256::repeat_byte(0xab),
+            watched: [w].into_iter().collect(),
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            // observed BundleState delta = exactly the deposit mint
+            account_deltas: vec![(w, mint)],
+            // recognised deposit-mint credit covering the full delta
+            system_signed: vec![SystemCredit::new(w, mint, from, "deposit_mint:0x2e11")],
+        };
+        let batch = build_partial_batch_skip_frames(inp);
+        // kind=System eth_transfers row is still emitted (attribution preserved)
+        assert_eq!(batch.eth.len(), 1, "system-credit row preserved");
+        assert!(matches!(batch.eth[0].kind, EthKind::System));
+        assert_eq!(batch.eth[0].amount_wei, U256::from(mint as u128));
+        // and NO unattributed marker: the deposit-mint credit covers it
+        assert!(
+            batch.unattributed.is_empty(),
+            "no marker when system credit fully covers observed delta (issue #15)"
+        );
+    }
+
+    /// Issue #15: when a system credit only PARTIALLY covers the observed
+    /// delta (same sign), the marker records the actual residual gap, not
+    /// the full observed amount. `attributed_wei` reflects what the system
+    /// credit attributed; `residual_wei` is the genuine unattributed part.
+    #[test]
+    fn skip_path_marker_records_partial_system_attribution() {
+        use crate::system::SystemCredit;
+        let w = Address::repeat_byte(0xa5);
+        let from = Address::repeat_byte(0xff);
+        let inp = BlockInputs {
+            chain_id: 10,
+            block_number: 7,
+            block_hash: B256::repeat_byte(0xab),
+            watched: [w].into_iter().collect(),
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            account_deltas: vec![(w, 1_000i128)], // observed +1000 wei
+            system_signed: vec![SystemCredit::new(w, 300i128, from, "deposit_mint:0x1")],
+        };
+        let batch = build_partial_batch_skip_frames(inp);
+        assert_eq!(batch.unattributed.len(), 1);
+        assert_eq!(batch.unattributed[0].observed_wei, U256::from(1_000u64));
+        assert_eq!(batch.unattributed[0].attributed_wei, U256::from(300u64));
+        assert_eq!(batch.unattributed[0].residual_wei, U256::from(700u64));
+    }
+
+    /// Issue #15: directionality must agree before netting. If observed is
+    /// positive but system_signed is negative (e.g. a withdrawal we
+    /// recognise as a debit, but the bundle delta is an unaccounted
+    /// inflow), the system credit doesn't actually attribute the observed
+    /// delta — the marker records the full observed as residual with
+    /// `attributed = 0`.
+    #[test]
+    fn skip_path_does_not_net_when_signs_disagree() {
+        use crate::system::SystemCredit;
+        let w = Address::repeat_byte(0xa6);
+        let from = Address::repeat_byte(0xff);
+        let inp = BlockInputs {
+            chain_id: 10,
+            block_number: 7,
+            block_hash: B256::repeat_byte(0xab),
+            watched: [w].into_iter().collect(),
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            account_deltas: vec![(w, 500i128)], // observed +500 wei
+            // system says −200 (a debit) — opposite direction from observed.
+            system_signed: vec![SystemCredit::new(w, -200i128, from, "withdrawal")],
+        };
+        let batch = build_partial_batch_skip_frames(inp);
+        assert_eq!(batch.unattributed.len(), 1);
+        assert_eq!(batch.unattributed[0].observed_wei, U256::from(500u64));
+        // Sign-disagreement ⇒ system credit doesn't attribute the observed
+        // delta; the full observed becomes residual.
         assert_eq!(batch.unattributed[0].attributed_wei, U256::ZERO);
         assert_eq!(batch.unattributed[0].residual_wei, U256::from(500u64));
     }
 
+    /// Issue #15 adjacent: skip-path markers carry
+    /// `cause = ParentStateUnavailable` so operators can filter them apart
+    /// from live-mode reconcile residuals (which carry `UnexplainedResidual`
+    /// at the worker-loop stall site). The two cases mean very different
+    /// things operationally and share one table.
+    #[test]
+    fn skip_path_marker_is_tagged_parent_state_unavailable() {
+        let w = Address::repeat_byte(0xa7);
+        let inp = BlockInputs {
+            chain_id: 10,
+            block_number: 7,
+            block_hash: B256::repeat_byte(0xab),
+            watched: [w].into_iter().collect(),
+            erc20_logs: vec![],
+            frames: vec![],
+            gas: vec![],
+            account_deltas: vec![(w, 500i128)],
+            system_signed: vec![],
+        };
+        let batch = build_partial_batch_skip_frames(inp);
+        assert_eq!(batch.unattributed.len(), 1);
+        assert_eq!(
+            batch.unattributed[0].cause,
+            crate::model::UnattributedDeltaCause::ParentStateUnavailable
+        );
+    }
+
     #[test]
     fn lag_finished_releases_previous_then_tracks_current() {
-        let bnh = |n: u64| alloy_eips::BlockNumHash { number: n, hash: B256::repeat_byte(n as u8) };
+        let bnh = |n: u64| alloy_eips::BlockNumHash {
+            number: n,
+            hash: B256::repeat_byte(n as u8),
+        };
 
         let mut pending: Option<alloy_eips::BlockNumHash> = None;
         // First notification: nothing to release yet.

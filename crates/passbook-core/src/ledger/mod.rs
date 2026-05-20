@@ -43,13 +43,27 @@ impl Ledger {
                     r.get(0)
                 })?;
             // Forward, in-place migrations. v1 → v2 (issue #4 / C3) adds
-            // `address` to the `erc20_transfers` PRIMARY KEY. Wrap the DDL
-            // + version bump in one transaction so an interrupted upgrade
-            // never leaves a half-migrated DB at the wrong version.
+            // `address` to the `erc20_transfers` PRIMARY KEY. v2 → v3
+            // (issue #15) adds the `cause` discriminator column to
+            // `unattributed_deltas` distinguishing skip-path markers from
+            // live-mode reconcile residuals. Wrap each DDL + version bump
+            // in its own transaction so an interrupted upgrade never
+            // leaves a half-migrated DB at the wrong version; the v1 → v3
+            // path runs both in order.
             if v == "1" {
                 let tx = conn.transaction()?;
                 tx.execute_batch(schema::MIGRATE_V1_TO_V2)?;
                 tx.execute("UPDATE meta SET v='2' WHERE k='schema_version'", [])?;
+                tx.commit()?;
+            }
+            let v: String =
+                conn.query_row("SELECT v FROM meta WHERE k='schema_version'", [], |r| {
+                    r.get(0)
+                })?;
+            if v == "2" {
+                let tx = conn.transaction()?;
+                tx.execute_batch(schema::MIGRATE_V2_TO_V3)?;
+                tx.execute("UPDATE meta SET v='3' WHERE k='schema_version'", [])?;
                 tx.commit()?;
             }
             let v: String =
@@ -184,7 +198,8 @@ CREATE TABLE unattributed_deltas (
             )
             .unwrap();
         }
-        // Opening it must migrate to v2 without error.
+        // Opening it must migrate forward to the current schema version
+        // (chains v1 → v2 → v3) without error.
         let l = Ledger::open(&path, 1).unwrap();
         let v: String = l
             .conn()
@@ -192,7 +207,11 @@ CREATE TABLE unattributed_deltas (
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, "2", "v1 DB must be migrated to v2");
+        assert_eq!(
+            v,
+            schema::SCHEMA_VERSION,
+            "v1 DB must be migrated forward to the current version"
+        );
         // The pre-existing row survived the migration.
         let n: i64 = l
             .conn()
@@ -217,7 +236,7 @@ CREATE TABLE unattributed_deltas (
             pk,
             vec!["chain_id", "block_hash", "tx_hash", "log_index", "address"]
         );
-        // Re-opening an already-v2 DB is a no-op (idempotent).
+        // Re-opening an already-current DB is a no-op (idempotent).
         drop(l);
         let l2 = Ledger::open(&path, 1).unwrap();
         let v2: String = l2
@@ -226,6 +245,94 @@ CREATE TABLE unattributed_deltas (
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v2, "2");
+        assert_eq!(v2, schema::SCHEMA_VERSION);
+    }
+
+    /// Issue #15: opening a legacy v2 DB must transparently migrate it
+    /// forward to v3 by adding the `cause` column to
+    /// `unattributed_deltas`. The only producer of marker rows at v2 was
+    /// the worker-loop reconcile-residual stall (the skip path was added
+    /// in the same change set as this column), so existing rows are
+    /// backfilled as `cause = 'unexplained_residual'`; that label may
+    /// over-attribute a small number of pre-fix skip-path markers to
+    /// "reconcile residual" (operator surfaces a needlessly alarming
+    /// row), but the reverse — labelling a real stall as a skip marker —
+    /// is the worse error. We err on the side of "investigate".
+    #[test]
+    fn opening_v2_db_migrates_to_v3_backfills_cause_and_preserves_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_v2.db");
+        // Hand-build a v2 database with the OLD `unattributed_deltas` (no
+        // `cause` column) and a pre-existing marker row.
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                r#"
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE eth_transfers (
+  chain_id INTEGER NOT NULL, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
+  tx_hash TEXT, trace_path TEXT NOT NULL, address TEXT NOT NULL,
+  direction TEXT NOT NULL, counterparty TEXT NOT NULL, amount_wei TEXT NOT NULL,
+  kind TEXT NOT NULL, reverted INTEGER NOT NULL,
+  PRIMARY KEY (chain_id, block_hash, tx_hash, trace_path)
+);
+CREATE TABLE erc20_transfers (
+  chain_id INTEGER NOT NULL, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
+  tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL, token TEXT NOT NULL,
+  from_addr TEXT NOT NULL, to_addr TEXT NOT NULL, amount TEXT NOT NULL,
+  address TEXT NOT NULL, direction TEXT NOT NULL,
+  PRIMARY KEY (chain_id, block_hash, tx_hash, log_index, address)
+);
+CREATE TABLE gas_payments (
+  chain_id INTEGER NOT NULL, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
+  tx_hash TEXT NOT NULL, address TEXT NOT NULL, gas_used INTEGER NOT NULL,
+  effective_gas_price TEXT NOT NULL, l2_fee_wei TEXT NOT NULL,
+  l1_fee_wei TEXT, total_wei TEXT NOT NULL,
+  PRIMARY KEY (chain_id, block_hash, tx_hash, address)
+);
+CREATE TABLE unattributed_deltas (
+  chain_id INTEGER NOT NULL, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
+  address TEXT NOT NULL, observed_wei TEXT NOT NULL,
+  attributed_wei TEXT NOT NULL, residual_wei TEXT NOT NULL,
+  PRIMARY KEY (chain_id, block_hash, address)
+);
+"#,
+            )
+            .unwrap();
+            c.execute("INSERT INTO meta(k,v) VALUES('schema_version','2')", [])
+                .unwrap();
+            c.execute("INSERT INTO meta(k,v) VALUES('chain_id','1')", [])
+                .unwrap();
+            c.execute(
+                "INSERT INTO unattributed_deltas VALUES \
+                 (1,42,'0xbh','0xab','7','0','7')",
+                [],
+            )
+            .unwrap();
+        }
+        // Opening must migrate v2 → v3 transparently.
+        let l = Ledger::open(&path, 1).unwrap();
+        let v: String = l
+            .conn()
+            .query_row("SELECT v FROM meta WHERE k='schema_version'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(v, "3", "v2 DB must be migrated to v3");
+        // The pre-existing row survived and was backfilled with the
+        // conservative `unexplained_residual` cause.
+        let (n, cause): (i64, String) = l
+            .conn()
+            .query_row(
+                "SELECT count(*), MAX(cause) FROM unattributed_deltas",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "pre-existing marker preserved");
+        assert_eq!(
+            cause, "unexplained_residual",
+            "historic rows backfilled as the conservative cause"
+        );
     }
 }

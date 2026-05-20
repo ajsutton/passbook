@@ -1,4 +1,4 @@
-use crate::model::UnattributedDeltaRow;
+use crate::model::{UnattributedDeltaCause, UnattributedDeltaRow};
 use alloy_primitives::{Address, B256, U256};
 
 pub struct ReconcileInput {
@@ -65,7 +65,44 @@ pub fn reconcile_account(
         observed_wei: U256::from(i.observed_delta.unsigned_abs()),
         attributed_wei: U256::from(attributed.unsigned_abs()),
         residual_wei: U256::from(residual.unsigned_abs()),
+        // Live-mode reconcile residual: the ExEx stalls on this block.
+        // Skip-path markers are constructed at the skip-path call site
+        // and tagged `ParentStateUnavailable` there.
+        cause: UnattributedDeltaCause::UnexplainedResidual,
     }))
+}
+
+/// Pure helper for the skip-mode partial batch (issue #15): given the
+/// observed signed BundleState delta for a watched address and the net
+/// recognised `system_signed` for that same address, return
+/// `(observed_wei, attributed_wei, residual_wei)` for the
+/// `unattributed_deltas` marker.
+///
+/// Sign handling — explicit, not naive subtraction:
+/// - If observed and system_signed agree in direction (or system is
+///   zero), the system credit attributes some of the delta; the residual
+///   is the saturating magnitude gap (system over-attribution clamps to
+///   zero residual).
+/// - If they disagree in direction, the system credit does NOT attribute
+///   the observed delta (e.g. observed inflow but the only recognised
+///   system event is a debit); the full observed magnitude is the
+///   residual and `attributed_wei` is zero.
+///
+/// `residual_wei == 0` means the system credit covered the observed
+/// delta; callers SHOULD skip emitting a marker in that case.
+pub fn skip_mode_attribution(observed_signed: i128, system_signed: i128) -> (u128, u128, u128) {
+    let observed_wei = observed_signed.unsigned_abs();
+    let signs_agree = system_signed == 0 || observed_signed.signum() == system_signed.signum();
+    if !signs_agree {
+        return (observed_wei, 0, observed_wei);
+    }
+    let system_mag = system_signed.unsigned_abs();
+    // System fully or over-attributes ⇒ residual is zero. The attributed
+    // amount is clamped to the observed magnitude so the marker (if
+    // emitted) never claims more attribution than there was observed.
+    let attributed_wei = system_mag.min(observed_wei);
+    let residual_wei = observed_wei - attributed_wei;
+    (observed_wei, attributed_wei, residual_wei)
 }
 
 #[cfg(test)]
@@ -137,6 +174,67 @@ mod tests {
             matches!(err, Err(ReconcileOverflow)),
             "out-of-range input must be a hard error, not a silent clamp"
         );
+    }
+
+    /// Issue #15: skip-mode helper for a deposit-mint-funded watched
+    /// block. The system credit and observed delta agree in direction
+    /// and magnitude — residual is zero, marker should be SKIPPED.
+    #[test]
+    fn skip_mode_full_system_attribution_yields_zero_residual() {
+        let (obs, attr, res) =
+            skip_mode_attribution(89_916_500_000_000_000, 89_916_500_000_000_000);
+        assert_eq!(obs, 89_916_500_000_000_000);
+        assert_eq!(attr, 89_916_500_000_000_000);
+        assert_eq!(res, 0);
+    }
+
+    /// Issue #15: partial same-sign attribution — residual is the
+    /// magnitude gap (`observed − attributed`), not the full observed.
+    #[test]
+    fn skip_mode_partial_same_sign_attribution_records_gap() {
+        let (obs, attr, res) = skip_mode_attribution(1_000, 300);
+        assert_eq!(obs, 1_000);
+        assert_eq!(attr, 300);
+        assert_eq!(res, 700);
+    }
+
+    /// Issue #15: same-sign over-attribution (system claims MORE than
+    /// observed) clamps `attributed` to the observed magnitude so the
+    /// row never reports more attribution than there was observed —
+    /// residual saturates at zero.
+    #[test]
+    fn skip_mode_over_attribution_clamps_to_zero_residual() {
+        let (obs, attr, res) = skip_mode_attribution(500, 700);
+        assert_eq!(obs, 500);
+        assert_eq!(attr, 500, "attributed clamps to observed magnitude");
+        assert_eq!(res, 0);
+    }
+
+    /// Issue #15: sign-disagreement — the system credit does NOT
+    /// attribute the observed delta; `attributed = 0` and the full
+    /// observed is residual.
+    #[test]
+    fn skip_mode_sign_disagreement_yields_full_observed_residual() {
+        let (obs, attr, res) = skip_mode_attribution(500, -200);
+        assert_eq!(obs, 500);
+        assert_eq!(attr, 0);
+        assert_eq!(res, 500);
+        // And the reverse — observed debit, system credits inflow.
+        let (obs, attr, res) = skip_mode_attribution(-500, 200);
+        assert_eq!(obs, 500);
+        assert_eq!(attr, 0);
+        assert_eq!(res, 500);
+    }
+
+    /// Issue #15: no system credit ⇒ no attribution ⇒ full observed
+    /// becomes residual (matches the pre-fix skip-path behaviour for
+    /// blocks with no recognised system event).
+    #[test]
+    fn skip_mode_no_system_credit_keeps_full_observed() {
+        let (obs, attr, res) = skip_mode_attribution(500, 0);
+        assert_eq!(obs, 500);
+        assert_eq!(attr, 0);
+        assert_eq!(res, 500);
     }
 
     /// The attribution sum itself overflowing `i128` (each input in range,

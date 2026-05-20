@@ -1,9 +1,15 @@
-/// Current schema version. Bumped to 2 to fix issue #4 (C3): the v1
-/// `erc20_transfers` PRIMARY KEY omitted `address`, so a watched→watched
-/// ERC20 transfer (two directional rows sharing
-/// `(chain_id, block_hash, tx_hash, log_index)`) had one row silently
-/// destroyed by `INSERT OR REPLACE`. v2 adds `address` to the PK.
-pub const SCHEMA_VERSION: &str = "2";
+/// Current schema version.
+///
+/// - v2 fixed issue #4 (C3): the v1 `erc20_transfers` PRIMARY KEY omitted
+///   `address`, so a watched→watched ERC20 transfer (two directional rows
+///   sharing `(chain_id, block_hash, tx_hash, log_index)`) had one row
+///   silently destroyed by `INSERT OR REPLACE`. v2 adds `address` to the PK.
+/// - v3 (issue #15): `unattributed_deltas` gains a `cause TEXT NOT NULL`
+///   column discriminating skip-path markers (`parent_state_unavailable`)
+///   from live-mode reconcile residuals (`unexplained_residual`). The two
+///   cases share one table but mean very different things operationally;
+///   the column lets operators filter them apart.
+pub const SCHEMA_VERSION: &str = "3";
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE meta (
@@ -34,6 +40,7 @@ CREATE TABLE unattributed_deltas (
   chain_id INTEGER NOT NULL, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
   address TEXT NOT NULL, observed_wei TEXT NOT NULL,
   attributed_wei TEXT NOT NULL, residual_wei TEXT NOT NULL,
+  cause TEXT NOT NULL,
   PRIMARY KEY (chain_id, block_hash, address)
 );
 CREATE INDEX ix_eth_addr   ON eth_transfers   (chain_id, address, block_number);
@@ -71,6 +78,18 @@ CREATE INDEX ix_erc20_addr ON erc20_transfers (chain_id, address, block_number);
 CREATE INDEX ix_erc20_bh   ON erc20_transfers (block_hash);
 "#;
 
+/// In-place v2 → v3 migration (issue #15): `unattributed_deltas` gains a
+/// `cause` discriminator. Every existing row is a live-mode reconcile
+/// stall (`unexplained_residual`) — the only producer at v2 was the
+/// worker-loop stall site; the skip path emitted no markers before its
+/// fix landed. Backfill that constant value on existing rows. `ALTER
+/// TABLE ADD COLUMN` with `NOT NULL DEFAULT` lets SQLite fill historic
+/// rows without a table rebuild. Run inside the caller's transaction.
+pub const MIGRATE_V2_TO_V3: &str = r#"
+ALTER TABLE unattributed_deltas
+  ADD COLUMN cause TEXT NOT NULL DEFAULT 'unexplained_residual';
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -85,6 +104,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 5); // meta + 4 data tables
+    }
+
+    /// Issue #15: `unattributed_deltas.cause` column exists and is
+    /// NOT NULL in the current (v3) schema. The PK is unchanged
+    /// (`(chain_id, block_hash, address)`) — the discriminator is
+    /// informational, not part of the row identity.
+    #[test]
+    fn unattributed_deltas_has_cause_column() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(super::SCHEMA).unwrap();
+        let cols: Vec<(String, i64)> = {
+            let mut s = c
+                .prepare("SELECT name, \"notnull\" FROM pragma_table_info('unattributed_deltas')")
+                .unwrap();
+            s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let cause = cols
+            .iter()
+            .find(|(n, _)| n == "cause")
+            .expect("cause column present");
+        assert_eq!(cause.1, 1, "cause column must be NOT NULL");
     }
 
     /// The current schema's `erc20_transfers` PK must include `address` so

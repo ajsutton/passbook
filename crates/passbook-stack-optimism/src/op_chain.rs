@@ -169,21 +169,17 @@ impl ChainExec for OpChainExec {
         if any_watched_changed {
             match get_parent_state() {
                 Ok(parent_state) => {
-                    let captured = reexecute_op_block_frames(
-                        chain_spec.clone(),
-                        chain,
-                        block,
-                        parent_state,
-                    )
-                    .map_err(|e| {
-                        tracing::error!(
-                            error = %e, block = block_number,
-                            "OP re-execution failed"
-                        );
-                        ProcessingError::Decode {
-                            block: block_number,
-                        }
-                    })?;
+                    let captured =
+                        reexecute_op_block_frames(chain_spec.clone(), chain, block, parent_state)
+                            .map_err(|e| {
+                            tracing::error!(
+                                error = %e, block = block_number,
+                                "OP re-execution failed"
+                            );
+                            ProcessingError::Decode {
+                                block: block_number,
+                            }
+                        })?;
                     for (k, tf) in captured.frames.into_iter().enumerate() {
                         let _ = k;
                         let tx_hash = captured.tx_hashes.get(tf.tx_index).copied().flatten();
@@ -808,6 +804,87 @@ mod tests {
         assert!(
             stalled.is_err(),
             "regression guard: an unrecognised fee-vault delta MUST residual-stall"
+        );
+    }
+
+    /// Issue #15 (I6): the **OP-arm repro** for skip-mode + deposit mint.
+    /// Mirrors the L1 integration test
+    /// `parent_state_unavailable_writes_partial_batch_and_marker` in
+    /// shape — except the watched-account change source is an OP
+    /// deposit-mint (the canonical case the issue calls out) rather
+    /// than a SELFDESTRUCT inbound. A live OP `Chain<OpPrimitives>`
+    /// harness remains infeasible at the pinned revs (no
+    /// `reth-exex-test-utils` OP support — see
+    /// `op_deposit_mint_to_watched_is_recognized_system_credit`), so we
+    /// exercise the same wire-up by:
+    ///   (1) running `deposit_mint_credits` on a synthetic deposit list
+    ///       (the OP arm's actual call site) to get the recognised
+    ///       `system_signed`,
+    ///   (2) feeding it + the matching `account_deltas` through the
+    ///       SHARED `build_partial_batch_skip_frames` (the actual
+    ///       skip-path target).
+    ///
+    /// Assertions, per the issue's repro spec:
+    ///   - exactly one `eth_transfers` row, `kind=System`, `wei=mint`;
+    ///   - ZERO `unattributed_deltas` rows (pre-fix: one false marker
+    ///     with `residual = mint`, the bug this issue tracks).
+    ///
+    /// Concrete fixture: OP-mainnet block 114,804,381's deposit to
+    /// `0xa4B5…4d60` (0.0899 ETH), the exact case named in the issue.
+    #[test]
+    fn skip_mode_with_deposit_mint_to_watched_emits_no_unattributed_marker() {
+        use alloy_primitives::{Address, TxKind};
+        use passbook_core::exex::{build_partial_batch_skip_frames, BlockInputs};
+        use passbook_core::model::EthKind;
+        use std::collections::HashSet;
+
+        let w = Address::repeat_byte(0xa4);
+        let from = Address::repeat_byte(0xff);
+        let dep_tx_hash = B256::repeat_byte(0x2e);
+        let mint = 89_916_500_000_000_000u128; // 0.08991650 ETH
+        let chain_id = 10u64; // OP Mainnet
+        let block_number = 114_804_381u64;
+        let block_hash = B256::repeat_byte(0xb1);
+
+        let watched: HashSet<Address> = [w].into_iter().collect();
+
+        // (1) The OP arm's actual recogniser call.
+        let creds = deposit_mint_credits(&[(mint, TxKind::Call(w), from, dep_tx_hash)], &watched);
+        assert_eq!(creds.len(), 1, "deposit mint recognised");
+
+        // (2) Feed it through the SHARED skip-path helper exactly as the
+        //     OP arm does at `op_chain.rs:367`.
+        let inputs = BlockInputs {
+            chain_id,
+            block_number,
+            block_hash,
+            watched: watched.clone(),
+            erc20_logs: vec![],
+            frames: vec![], // skip path
+            gas: vec![],
+            // Observed BundleState delta = exactly the mint (the watched
+            // address received 0.0899 ETH via the deposit).
+            account_deltas: vec![(w, mint as i128)],
+            system_signed: creds,
+        };
+        let batch = build_partial_batch_skip_frames(inputs);
+
+        // Exactly one `eth_transfers` row, kind=System, wei = mint.
+        assert_eq!(
+            batch.eth.len(),
+            1,
+            "one queryable system row for the deposit mint"
+        );
+        assert!(matches!(batch.eth[0].kind, EthKind::System));
+        assert_eq!(batch.eth[0].address, w);
+        assert_eq!(batch.eth[0].amount_wei, U256::from(mint));
+
+        // ZERO unattributed rows — the deposit mint covers the observed
+        // delta exactly. Pre-fix this would have been ONE row with
+        // residual=mint (the bug).
+        assert!(
+            batch.unattributed.is_empty(),
+            "deposit-mint-only watched block must emit ZERO unattributed markers (issue #15)"
         );
     }
 
