@@ -103,6 +103,15 @@ pub struct GasPaymentRow {
 ///   block (no advance). The row records the stall for the health
 ///   query; the ExEx retries the SAME block forever. This is a hard
 ///   processing failure that must be investigated.
+/// - [`UnattributedDeltaCause::BlockNotDelivered`] — gap-on-restart
+///   marker (issue #14): a committed-chain notification arrived
+///   with `first_block > last_durable_block + 1`, so the driver
+///   filled the missing range with one marker row per watched address
+///   per gap block. `observed`/`attributed`/`residual` are all zero
+///   — the row records that the block was canonical but never
+///   processed through the per-block pipeline. Expected briefly on
+///   restart in staged-sync mode; outside that, a cluster of these
+///   rows is itself a fault signal worth investigating.
 ///
 /// Stored as the SQLite-side `cause` column (TEXT NOT NULL); the
 /// `as_str` / `from_str` pair is the single source for the on-disk
@@ -113,6 +122,12 @@ pub enum UnattributedDeltaCause {
     ParentStateUnavailable,
     /// Live-mode reconcile residual (block STALLED).
     UnexplainedResidual,
+    /// Gap-on-restart marker (issue #14): this block was canonical
+    /// (header in node DB) but was NOT delivered as part of any
+    /// committed-chain notification we processed; the per-block
+    /// processing path did not run. `observed`/`attributed`/`residual`
+    /// are all zero — the row records block existence only.
+    BlockNotDelivered,
 }
 
 impl UnattributedDeltaCause {
@@ -120,6 +135,7 @@ impl UnattributedDeltaCause {
         match self {
             Self::ParentStateUnavailable => "parent_state_unavailable",
             Self::UnexplainedResidual => "unexplained_residual",
+            Self::BlockNotDelivered => "block_not_delivered",
         }
     }
 }
@@ -130,6 +146,7 @@ impl std::str::FromStr for UnattributedDeltaCause {
         match s {
             "parent_state_unavailable" => Ok(Self::ParentStateUnavailable),
             "unexplained_residual" => Ok(Self::UnexplainedResidual),
+            "block_not_delivered" => Ok(Self::BlockNotDelivered),
             other => Err(format!("unknown unattributed_deltas cause: {other}")),
         }
     }
@@ -172,6 +189,11 @@ mod tests {
             UnattributedDeltaCause::UnexplainedResidual.as_str(),
             "unexplained_residual"
         );
+        // Issue #14: gap-on-restart marker discriminator.
+        assert_eq!(
+            UnattributedDeltaCause::BlockNotDelivered.as_str(),
+            "block_not_delivered"
+        );
         assert_eq!(
             UnattributedDeltaCause::from_str("parent_state_unavailable").unwrap(),
             UnattributedDeltaCause::ParentStateUnavailable
@@ -179,6 +201,10 @@ mod tests {
         assert_eq!(
             UnattributedDeltaCause::from_str("unexplained_residual").unwrap(),
             UnattributedDeltaCause::UnexplainedResidual
+        );
+        assert_eq!(
+            UnattributedDeltaCause::from_str("block_not_delivered").unwrap(),
+            UnattributedDeltaCause::BlockNotDelivered
         );
         assert!(UnattributedDeltaCause::from_str("nope").is_err());
     }
