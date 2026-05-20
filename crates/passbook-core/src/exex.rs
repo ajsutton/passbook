@@ -362,6 +362,27 @@ pub(crate) fn lag_finished(
     pending.replace(current)
 }
 
+/// Issue #14: gap-on-restart detection. Returns `Some(range)` if a
+/// committed-chain notification's first block is beyond
+/// `high_water + 1` — i.e. the ExEx missed delivery of every block in
+/// `[high_water + 1 ..= first_committed - 1]`. Returns `None` for
+/// fresh-datadir (no prior high-water), in-order (`first_committed ==
+/// high_water + 1`), and reorg-redelivery (`first_committed <=
+/// high_water`) cases. The strict `>` is essential: `<=` is the
+/// reorg-redelivery path and must stay on the existing per-block
+/// INSERT-OR-REPLACE writer.
+pub(crate) fn gap_range(
+    high_water: Option<u64>,
+    first_committed: u64,
+) -> Option<std::ops::RangeInclusive<u64>> {
+    let hw = high_water?;
+    if first_committed > hw + 1 {
+        Some((hw + 1)..=(first_committed - 1))
+    } else {
+        None
+    }
+}
+
 /// The CHAIN-SPECIFIC seam.
 ///
 /// Everything that differs L1 vs OP — the node primitives / chain-spec
@@ -1345,5 +1366,38 @@ mod tests {
         };
         let _f: &ParentStateFn<'_> = &thunk;
         assert!(!called.get(), "thunk must not run before gated path");
+    }
+
+    /// Issue #14: gap detection — strict `>` so reorg re-delivery
+    /// (committed.first() <= high_water) stays on the existing
+    /// idempotent path; only true gaps trigger the fill.
+    #[test]
+    fn gap_range_strict_inequality() {
+        // No prior high-water: no gap (first notification establishes it).
+        assert_eq!(gap_range(None, 100), None);
+        // In-order: committed.first() == high_water + 1 ⇒ no gap.
+        assert_eq!(gap_range(Some(10), 11), None);
+        // Reorg redelivery: committed.first() == high_water ⇒ no gap.
+        assert_eq!(gap_range(Some(10), 10), None);
+        // Reorg redelivery deeper: committed.first() < high_water ⇒ no gap.
+        assert_eq!(gap_range(Some(10), 5), None);
+    }
+
+    #[test]
+    fn gap_range_one_block_gap() {
+        // committed.first() = 12, high_water = 10 ⇒ gap [11..=11].
+        assert_eq!(gap_range(Some(10), 12), Some(11..=11));
+    }
+
+    #[test]
+    fn gap_range_multi_block_gap() {
+        // committed.first() = 30, high_water = 10 ⇒ gap [11..=29].
+        assert_eq!(gap_range(Some(10), 30), Some(11..=29));
+    }
+
+    #[test]
+    fn gap_range_high_water_zero() {
+        // Genesis (block 0) durable, next committed is 5 ⇒ gap [1..=4].
+        assert_eq!(gap_range(Some(0), 5), Some(1..=4));
     }
 }
