@@ -180,11 +180,25 @@ lock_fully_at_target() {
   [ -f "${CARGO_LOCK}" ] || return 1
   grep -q "ethereum-optimism/optimism?rev=${OPT_REV}" "${CARGO_LOCK}" || return 1
   grep -q "paradigmxyz/reth?rev=${RETH_REV}"          "${CARGO_LOCK}" || return 1
-  # No optimism/reth source line may still point at any OTHER rev.
-  if grep -oE 'ethereum-optimism/optimism\?rev=[0-9a-f]{40}' "${CARGO_LOCK}" \
-       | grep -qv "rev=${OPT_REV}"; then return 1; fi
-  if grep -oE 'paradigmxyz/reth\?rev=[0-9a-f]{40}' "${CARGO_LOCK}" \
-       | grep -qv "rev=${RETH_REV}"; then return 1; fi
+  # No optimism/reth source line may still point at any OTHER rev. Two
+  # portability traps avoided here:
+  #   (1) BSD grep (macOS default) silently ignores `-v` when combined with
+  #       `-q` (`grep -qv PATTERN` behaves like `grep -q PATTERN`), so an
+  #       earlier `... | grep -qv "rev=${REV}"` version of this check passed
+  #       even when stale-rev orphan lines were present.
+  #   (2) Piping into `grep -q .` early-exits on first match and SIGPIPEs the
+  #       upstream `grep -v`; under `set -o pipefail` the pipe then exits 141
+  #       and `set -e` aborts the whole script (or, in `if pipe; then`, the
+  #       conditional silently sees "false" — the same masking failure).
+  # Sidestep both by capturing the non-matching lines into a variable (no
+  # `-q`, no SIGPIPE) and testing for non-empty.
+  local other
+  other="$(grep -oE 'ethereum-optimism/optimism\?rev=[0-9a-f]{40}' "${CARGO_LOCK}" \
+             | grep -v "rev=${OPT_REV}" || true)"
+  [ -z "${other}" ] || return 1
+  other="$(grep -oE 'paradigmxyz/reth\?rev=[0-9a-f]{40}' "${CARGO_LOCK}" \
+             | grep -v "rev=${RETH_REV}" || true)"
+  [ -z "${other}" ] || return 1
   return 0
 }
 
