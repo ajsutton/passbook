@@ -54,10 +54,10 @@ license = "MIT OR Apache-2.0"
 # when it exists (drop the local mirror + `.vendor/` machinery then).
 [workspace.dependencies]
 # ── reth / op-reth facades + monorepo crates ────────────────────────────────
-reth-op = { git = "https://github.com/ethereum-optimism/optimism", rev = "4ddba1610a5d13c1a8c297a91228559d731cc6d5", default-features = false, features = ["node", "cli"] }
-reth-optimism-evm = { git = "https://github.com/ethereum-optimism/optimism", rev = "4ddba1610a5d13c1a8c297a91228559d731cc6d5", default-features = false }
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "e8c29c987dd5bb23e95114279c89ce5326fd206d", features = ["full", "cli"] }
-reth-exex-test-utils = { git = "https://github.com/paradigmxyz/reth", rev = "e8c29c987dd5bb23e95114279c89ce5326fd206d" }
+reth-op = { git = "https://github.com/ethereum-optimism/optimism", rev = "8592d00d32afb4a0da959a2f14260c1d572e3a12", default-features = false, features = ["node", "cli"] }
+reth-optimism-evm = { git = "https://github.com/ethereum-optimism/optimism", rev = "8592d00d32afb4a0da959a2f14260c1d572e3a12", default-features = false }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "81c026181e96ef33a823f3ef4d2a28940e9fa4fe", features = ["full", "cli"] }
+reth-exex-test-utils = { git = "https://github.com/paradigmxyz/reth", rev = "81c026181e96ef33a823f3ef4d2a28940e9fa4fe" }
 reth-cli-util = { git = "https://github.com/paradigmxyz/reth", rev = "e8c29c987dd5bb23e95114279c89ce5326fd206d", default-features = false }
 reth-node-core = { git = "https://github.com/paradigmxyz/reth", rev = "e8c29c987dd5bb23e95114279c89ce5326fd206d", default-features = false }
 

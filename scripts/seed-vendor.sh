@@ -38,7 +38,7 @@ set -euo pipefail
 
 # --- Pinned rev (kept in lockstep with reth-op `rev` in Cargo.toml by
 #     scripts/bump-reth.sh — do not hand-edit; see header) -------------------
-OPTIMISM_REV="${OPTIMISM_REV:-4ddba1610a5d13c1a8c297a91228559d731cc6d5}"
+OPTIMISM_REV="${OPTIMISM_REV:-8592d00d32afb4a0da959a2f14260c1d572e3a12}"
 OPTIMISM_REMOTE="https://github.com/ethereum-optimism/optimism"
 
 # --- Derive repo root from this script's location ---------------------------

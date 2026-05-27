@@ -20,10 +20,10 @@ below remain for understanding/recovery. Post-bump check: **`make verify-pin`**.
 
 | Facade | Source | Rev | Version |
 |--------|--------|-----|---------|
-| `reth-op` (OP) | `https://github.com/ethereum-optimism/optimism` monorepo (declared against this stable remote in `Cargo.toml`; source-replaced onto a gitignored local mirror at `<repo>/.vendor/optimism` by `scripts/seed-vendor.sh` for speed) | `4ddba1610a5d13c1a8c297a91228559d731cc6d5` | `reth-op 1.11.3` (op-reth release tag `op-reth/v2.2.3-rc.1-pr20770.0`; crate-version metadata is still `1.11.3`) |
-| `reth-ethereum` (L1) | `https://github.com/paradigmxyz/reth` | `e8c29c987dd5bb23e95114279c89ce5326fd206d` | `reth-ethereum 2.2.0` (post-v2.2.0 `paradigmxyz/reth` develop SHA — the rev the monorepo at the above optimism rev pins all upstream reth crates to) |
+| `reth-op` (OP) | `https://github.com/ethereum-optimism/optimism` monorepo (declared against this stable remote in `Cargo.toml`; source-replaced onto a gitignored local mirror at `<repo>/.vendor/optimism` by `scripts/seed-vendor.sh` for speed) | `8592d00d32afb4a0da959a2f14260c1d572e3a12` | `reth-op 1.11.3` (op-reth release tag `op-reth/v2.2.5`; crate-version metadata is still `1.11.3`) |
+| `reth-ethereum` (L1) | `https://github.com/paradigmxyz/reth` | `81c026181e96ef33a823f3ef4d2a28940e9fa4fe` | `reth-ethereum 2.2.0` (post-v2.2.0 `paradigmxyz/reth` develop SHA — the rev the monorepo at the above optimism rev pins all upstream reth crates to) |
 
-Date locked: 2026-05-17 (optimism monorepo @ op-reth release tag `op-reth/v2.2.3-rc.1-pr20770.0`).
+Date locked: 2026-05-27 (optimism monorepo @ op-reth release tag `op-reth/v2.2.5`).
 Toolchain channel: `1.95.0` (see Toolchain).
 
 > **op-reth is not yet on crates.io.** We get the `reth-op` facade via a git
