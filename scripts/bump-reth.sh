@@ -8,20 +8,23 @@
 #   * ethereum-optimism/optimism monorepo rev  → used by `reth-op` and
 #     `reth-optimism-evm` in the root Cargo.toml, AND duplicated as the
 #     default `OPTIMISM_REV` in scripts/seed-vendor.sh.
-#   * paradigmxyz/reth rev → used by `reth-ethereum` and
-#     `reth-exex-test-utils` in the root Cargo.toml. This MUST equal the
-#     `paradigmxyz/reth` rev the chosen optimism monorepo pins all of its
-#     upstream reth crates to (read the monorepo's `rust/Cargo.toml`). If the
-#     two drift, co-resolution breaks (duplicate, incompatible reth types).
+#   * paradigmxyz/reth rev → used by `reth-ethereum`, `reth-exex-test-utils`,
+#     `reth-cli-util`, and `reth-node-core` in the root Cargo.toml. This MUST
+#     equal the `paradigmxyz/reth` rev the chosen optimism monorepo pins all
+#     of its upstream reth crates to (read the monorepo's `rust/Cargo.toml`).
+#     If the two drift, co-resolution breaks (duplicate, incompatible reth
+#     types).
 #
 # What this script does (it AUTOMATES exactly the "Bump procedure" in
 # docs/reth-pin.md):
 #   1. Validate args; detect a no-op (already at these revs) and exit clean.
-#   2. Update BOTH revs in every committed file: root Cargo.toml (the four
-#      dependency lines) and the `OPTIMISM_REV=` default in seed-vendor.sh.
-#      Uses precise per-line sed — it does NOT blindly replace every 40-hex
-#      string. Asserts (via grep) that the old revs are gone and the new ones
-#      present; fails loudly otherwise.
+#   2. Update BOTH revs in every committed file: root Cargo.toml (the six
+#      dependency lines — two on the optimism rev, four on the reth rev) and
+#      the `OPTIMISM_REV=` default in seed-vendor.sh. Uses precise per-line
+#      sed — it does NOT blindly replace every 40-hex string. Asserts (via
+#      grep) that the old revs are gone and the new ones present; fails
+#      loudly otherwise. The four reth-rev lines must all share the same rev
+#      going in (pre-existing drift between them aborts before any rewrite).
 #   3. Re-seed the local mirror for the NEW optimism rev (rm + seed-vendor.sh).
 #   4. Regenerate / retarget Cargo.lock for the new revs following the
 #      documented mechanism, validating with the spike co-resolution gate.
@@ -142,6 +145,20 @@ cur_seed_rev="$(grep -E '^OPTIMISM_REV=' "${SEED_SCRIPT}" \
 [ -n "${cur_reth_rev}" ] || die "could not find current reth rev (reth-ethereum line) in Cargo.toml"
 [ -n "${cur_seed_rev}" ] || die "could not find current OPTIMISM_REV in scripts/seed-vendor.sh"
 
+# All four reth-rev-tracking Cargo.toml lines MUST share one rev going in.
+# Discover each separately and assert they agree; a stale dep (e.g. an
+# earlier bump script version missed it) would otherwise be silently left
+# behind on a no-op or partially rewritten on a real bump.
+RETH_DEPS=("reth-ethereum" "reth-exex-test-utils" "reth-cli-util" "reth-node-core")
+for dep in "${RETH_DEPS[@]}"; do
+  dep_rev="$(grep -E "^${dep} = \{" "${CARGO_TOML}" \
+    | grep -oE 'rev = "[0-9a-f]{40}"' | head -1 | grep -oE '[0-9a-f]{40}' || true)"
+  [ -n "${dep_rev}" ] || die "could not find current reth rev (${dep} line) in Cargo.toml"
+  if [ "${dep_rev}" != "${cur_reth_rev}" ]; then
+    die "PRE-EXISTING DRIFT: Cargo.toml ${dep} rev (${dep_rev}) != reth-ethereum rev (${cur_reth_rev}). All four reth-rev lines must agree. Fix manually before bumping."
+  fi
+done
+
 info "current optimism rev (Cargo.toml reth-op)       = ${cur_opt_rev}"
 info "current optimism rev (seed-vendor OPTIMISM_REV)  = ${cur_seed_rev}"
 info "current reth     rev (Cargo.toml reth-ethereum)  = ${cur_reth_rev}"
@@ -193,13 +210,15 @@ sed_inplace() {
   rm -f "${file}.bumpbak"
 }
 
-# Cargo.toml: only the four specific dependency lines, keyed by crate name at
+# Cargo.toml: only the six specific dependency lines, keyed by crate name at
 # line start, replacing just the rev string on that line.
 sed_inplace "${CARGO_TOML}" \
   -e "/^reth-op = {/s/rev = \"${cur_opt_rev}\"/rev = \"${OPT_REV}\"/" \
   -e "/^reth-optimism-evm = {/s/rev = \"${cur_opt_rev}\"/rev = \"${OPT_REV}\"/" \
   -e "/^reth-ethereum = {/s/rev = \"${cur_reth_rev}\"/rev = \"${RETH_REV}\"/" \
-  -e "/^reth-exex-test-utils = {/s/rev = \"${cur_reth_rev}\"/rev = \"${RETH_REV}\"/"
+  -e "/^reth-exex-test-utils = {/s/rev = \"${cur_reth_rev}\"/rev = \"${RETH_REV}\"/" \
+  -e "/^reth-cli-util = {/s/rev = \"${cur_reth_rev}\"/rev = \"${RETH_REV}\"/" \
+  -e "/^reth-node-core = {/s/rev = \"${cur_reth_rev}\"/rev = \"${RETH_REV}\"/"
 
 # seed-vendor.sh: only the OPTIMISM_REV= default assignment.
 sed_inplace "${SEED_SCRIPT}" \
@@ -232,11 +251,15 @@ fi
 if [ "${cur_reth_rev}" != "${RETH_REV}" ]; then
   assert_absent "Cargo.toml reth-ethereum old rev"     "^reth-ethereum = \{.*rev = \"${cur_reth_rev}\"" "${CARGO_TOML}"
   assert_absent "Cargo.toml reth-exex-test-utils old"  "^reth-exex-test-utils = \{.*rev = \"${cur_reth_rev}\"" "${CARGO_TOML}"
+  assert_absent "Cargo.toml reth-cli-util old rev"     "^reth-cli-util = \{.*rev = \"${cur_reth_rev}\"" "${CARGO_TOML}"
+  assert_absent "Cargo.toml reth-node-core old rev"    "^reth-node-core = \{.*rev = \"${cur_reth_rev}\"" "${CARGO_TOML}"
 fi
 assert_present "Cargo.toml reth-op new optimism rev"  "^reth-op = \{.*rev = \"${OPT_REV}\""     "${CARGO_TOML}"
 assert_present "Cargo.toml reth-optimism-evm new rev" "^reth-optimism-evm = \{.*rev = \"${OPT_REV}\""     "${CARGO_TOML}"
 assert_present "Cargo.toml reth-ethereum new rev"     "^reth-ethereum = \{.*rev = \"${RETH_REV}\""     "${CARGO_TOML}"
 assert_present "Cargo.toml reth-exex-test-utils new"  "^reth-exex-test-utils = \{.*rev = \"${RETH_REV}\""     "${CARGO_TOML}"
+assert_present "Cargo.toml reth-cli-util new rev"     "^reth-cli-util = \{.*rev = \"${RETH_REV}\""     "${CARGO_TOML}"
+assert_present "Cargo.toml reth-node-core new rev"    "^reth-node-core = \{.*rev = \"${RETH_REV}\""     "${CARGO_TOML}"
 assert_present "seed-vendor OPTIMISM_REV new"         "OPTIMISM_REV:-${OPT_REV}"     "${SEED_SCRIPT}"
 
 info "rev rewrites applied + asserted in Cargo.toml and scripts/seed-vendor.sh"
